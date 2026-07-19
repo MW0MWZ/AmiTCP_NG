@@ -1,0 +1,37 @@
+# AmiTCP_NG .gitignore
+#
+# Golden rules:
+#   * NEVER commit compiled artifacts (source only; binaries belong in releases).
+#   * NEVER commit anything we do not own (Kickstart ROMs, AmigaOS files,
+#     licensed SANA-II drivers, the Commodore NDK, third-party SDKs).
+
+# --- Compiled output -------------------------------------------------------
+build/
+*.o
+*.a
+*.lib
+*.obj
+*.exe
+*.elf
+
+# Local-only scratch/test programs and their compiled binaries -- never shipped.
+tmp/
+
+# --- Licensed / not-ours material (LOCAL ONLY) -----------------------------
+# Emulator setup: Kickstart ROMs, AmigaOS 3.2 install, a2065.device, etc.
+emu/
+# Reference material: Commodore NDK, AmiTCP distribution binaries, full
+# libpcap/tcpdump/ipfilter sources, licensed headers. Not needed to build.
+ref/
+# Roadshow SDK sample sources are Olaf Barthel's, "All Rights Reserved" -- we
+# credit the SDK (see README) but do not redistribute it.
+roadshow-ref/
+
+# --- Editor / OS cruft -----------------------------------------------------
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Scratch / session working files ---------------------------------------
+scratchpad/

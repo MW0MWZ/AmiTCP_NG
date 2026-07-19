@@ -1,0 +1,599 @@
+; =============================================================================
+;  Install-AmiTCP_NG  --  Commodore/Amiga Installer script for the AmiTCP_NG
+;                         open TCP/IP stack (a drop-in bsdsocket.library).
+;
+;  AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
+;  $VER: Install-AmiTCP_NG 2.0
+;
+;  At startup you choose one of three actions:
+;
+;    * Install ....... put AmiTCP_NG on this machine. Two methods are chosen
+;                      automatically from what is already present:
+;                        - UPGRADE: an existing bsdsocket.library (e.g. a Roadshow
+;                          demo) is backed up and replaced by AmiTCP_NG, and our own
+;                          Roadshow-compatible commands (Online, AddNetInterface,
+;                          ShowNetStatus, ...) are installed over the existing ones
+;                          (originals backed up to C:<name>.orig). This is required:
+;                          Roadshow's own config tools drive AmiTCP_NG down a path
+;                          that hangs, so the command set must be ours too. No time
+;                          limit; your interface configuration is left untouched.
+;                        - FULL INSTALL: no stack is present, so we install the
+;                          library AND our complete set of Roadshow-compatible
+;                          commands, a Network-Startup script and example configs.
+;    * Uninstall ..... roll back: restore the library and commands we backed up,
+;                      or -- for a full install -- remove what we added.
+;    * Preview ....... show exactly what an install would do, changing nothing.
+;
+;  You also choose WHERE the AmiTCP drawer (its configuration + host database) is
+;  created; it need not live on the boot disk.
+; =============================================================================
+
+(set @app-name "AmiTCP_NG")
+
+(set #lib-source    "data/Libs/bsdsocket.library")
+(set #nstart-source "data/S/Network-Startup")
+(set #db-source     "data/db")
+(set #tools-source  "data/C")
+
+; Project version + our-own-install marker. The marker lives in LIBS: (always assigned,
+; so it is detectable before any AmiTCP: assign exists), is written by EVERY install
+; path, and removed by Uninstall. Its presence means "an AmiTCP_NG install is already
+; here" (vs a foreign stack such as Roadshow); its content records the installed
+; version. build-release.sh injects the real version into #ng-version.
+(set #ng-version "0.0.0")
+(set #ng-marker  "LIBS:AmiTCP_NG.version")
+
+; A sentinel that ONLY a full install writes (and uninstall removes). Uninstall uses it
+; to positively identify a full install of ours before deleting the library + commands,
+; so it never mistakes an upgrade's restored originals (which never create this file) for
+; our install. The name is unmistakably ours, so it cannot pre-exist from another source.
+(set #fullinstall-marker "SYS:Storage/AmiTCP_NG-fullinstall")
+
+; Filled in by the destination question (P_AskDest); the AmiTCP drawer path.
+(set #amitcp-dir "SYS:AmiTCP")
+
+; ---------------------------------------------------------------------------
+;  Ask where the AmiTCP drawer should live. The stack keeps its configuration and
+;  host/service database in <chosen>/AmiTCP/db and reaches it through the AmiTCP:
+;  assign. Default SYS: (the boot disk), but any volume/drawer works.
+; ---------------------------------------------------------------------------
+(procedure P_AskDest
+(
+	; Default to the standard programs drawer (SYS:Programs) when it exists, else the
+	; boot-disk root (SYS:). Either way the user can pick anywhere.
+	(if (= (exists "SYS:Programs" (noreq)) 2)
+		(set #dest-default "SYS:Programs")
+		(set #dest-default "SYS:")
+	)
+	(set #dest-parent
+		(askdir
+			(prompt "Where should the 'AmiTCP' drawer be created?\n\n"
+				"Its configuration and host database live inside it. "
+				"The suggested location is fine, but you may keep it on any "
+				"volume or drawer.")
+			(help "The installer creates a drawer called 'AmiTCP' inside the "
+				"location you pick here, and sets up an 'AmiTCP:' assign that "
+				"points to it so the stack can find its configuration.\n\n"
+				"The default is 'SYS:Programs' (the standard programs drawer) when "
+				"it exists, otherwise the boot disk 'SYS:'.\n\n"
+				@askdir-help)
+			(default #dest-default)
+		)
+	)
+	(set #amitcp-dir (tackon #dest-parent "AmiTCP"))
+))
+
+; ---------------------------------------------------------------------------
+;  Network database + AmiTCP: assign. The stack reads its config and host/service/
+;  protocol database from AmiTCP:db/... ; without it an app opening a socket hits
+;  "AmiTCP:db/netdb device not mounted". We create <amitcp-dir>/db, make the AmiTCP:
+;  assign point there for this session, and add that assign to the boot startup so it
+;  survives a reboot. An existing database is left untouched.
+; ---------------------------------------------------------------------------
+(procedure P_SetupConfig
+(
+	(makedir (tackon #amitcp-dir "db")
+		(prompt "Creating " #amitcp-dir "/db for the network database")
+		(help @makedir-help)
+		(infos)
+	)
+	(if (= (exists (tackon #amitcp-dir "db/netdb") (noreq)) 0)
+		(copyfiles
+			(prompt "Installing the network database into " #amitcp-dir "/db")
+			(help @copyfiles-help)
+			(source #db-source)
+			(dest (tackon #amitcp-dir "db"))
+			(all)
+		)
+	)
+
+	; Make AmiTCP: resolve now (before a reboot) so anything run this session finds
+	; the database. (The library also self-assigns AmiTCP: -> SYS:AmiTCP as a fallback
+	; when nothing has set it, but our chosen location must win.)
+	(makeassign "AmiTCP" #amitcp-dir (safe))
+))
+
+; ---------------------------------------------------------------------------
+;  Add the boot-time hook to S:User-Startup: ONLY the AmiTCP: assign. We deliberately
+;  do NOT bring any network interface up at boot. That matters especially for WiFi
+;  (e.g. wifipi.device), which must be told to connect and associate BEFORE TCP/IP is
+;  started -- firing AddNetInterface at boot hits a not-yet-ready device and fails.
+;  Bring the interface up yourself once the link is ready (Execute S:Network-Startup,
+;  or straight from your WiFi-connect script). The loopback interface (lo0) comes up on
+;  its own when the stack first starts. Replaces the tagged @app-name block in place.
+; ---------------------------------------------------------------------------
+(procedure P_InstallStartup
+(
+	(startup @app-name
+		(prompt "These lines will be added to 'S:User-Startup':\n\n"
+			"  Assign AmiTCP: " #amitcp-dir "\n"
+			"  (and a background touch that brings the loopback interface lo0 up)\n\n"
+			"NO hardware interface is brought up at boot -- for WiFi the link must "
+			"associate first. Bring your interface up yourself when ready with "
+			"'Execute S:Network-Startup' (or 'AddNetInterface').")
+		(help @startup-help)
+		(command (cat
+			"Assign >NIL: AmiTCP: " #amitcp-dir "\n"
+			"; Start the stack in the background so the loopback interface (lo0) is up.\n"
+			"; Run detaches it -- if the stack ever stalled, the boot is NOT held up.\n"
+			"; No hardware NIC is touched here (that is done manually, once the link\n"
+			"; is ready). GetNetStatus just opens the library, which self-starts.\n"
+			"If EXISTS C:GetNetStatus\n"
+			"  Run >NIL: <NIL: C:GetNetStatus >NIL:\n"
+			"EndIf"
+		))
+	)
+))
+
+; Write the AmiTCP_NG install marker (LIBS:AmiTCP_NG.version): identifies our own
+; install and records the project version. Called by every install path; Uninstall
+; removes it.
+(procedure P_WriteMarker
+(
+	; Rewrite fresh (not append), so repeated upgrades leave a single clean line.
+	(if (>= (exists #ng-marker (noreq)) 1)
+		(delete #ng-marker (prompt "Refreshing the AmiTCP_NG version marker") (help @delete-help)))
+	(textfile
+		(dest #ng-marker)
+		(append (cat "$VER: AmiTCP_NG " #ng-version "\n"))
+	)
+))
+
+; ===========================================================================
+;  UPGRADE (foreign stack, e.g. Roadshow): back up its library + commands and install
+;  ours over them. Upgrading an existing AmiTCP_NG is P_UpgradeOurs instead.
+; ===========================================================================
+(procedure P_Upgrade
+(
+	(set #backup-note "")
+
+	(P_SetupConfig)
+
+	; Back up the existing library once (never clobber an earlier backup), and only if a
+	; library is actually there to back up -- #existing can be true off S:Network-Startup
+	; alone (e.g. after a full-install Uninstall removed the library but left the startup),
+	; and copyfiles on a missing source would abort the whole install.
+	(if (and (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+		 (= (exists "LIBS:bsdsocket.library.orig" (noreq)) 0))
+	(
+		(copyfiles
+			(prompt "Backing up your existing bsdsocket.library")
+			(help @copyfiles-help)
+			(source "LIBS:bsdsocket.library")
+			(dest "LIBS:")
+			(newname "bsdsocket.library.orig")
+		)
+		(set #backup-note (cat
+			"\nYour original library was backed up as "
+			"'LIBS:bsdsocket.library.orig'.\n"
+		))
+	))
+
+	(complete 40)
+
+	; Drop AmiTCP_NG in place. copyfiles (not copylib) because we deliberately replace
+	; whatever is there regardless of its version number.
+	(copyfiles
+		(prompt "Installing the AmiTCP_NG bsdsocket.library")
+		(help @copyfiles-help)
+		(source #lib-source)
+		(dest "LIBS:")
+		(newname "bsdsocket.library")
+		(confirm "expert")
+	)
+
+	(complete 75)
+
+	; Install our own Roadshow-compatible commands OVER the existing stack's tools.
+	; A library-only swap is not enough: Roadshow's own AddNetInterface (and the other
+	; config tools) drive AmiTCP_NG down an interface-configuration path that hangs --
+	; its BeginInterfaceConfig wait never completes against our library -- leaving the
+	; machine unable to bring an interface up. We therefore replace the command set too.
+	; Each original command is backed up once (to C:<name>.orig, never clobbering an
+	; earlier backup) so an Uninstall can restore it. Our commands are validated to
+	; bring a DHCP interface up on a machine that previously ran Roadshow.
+	(foreach #tools-source "#?"
+		(if (and (>= (exists (tackon "C:" @each-name) (noreq)) 1)
+			 (= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 0))
+			(copyfiles
+				(prompt "Backing up your existing " @each-name)
+				(help @copyfiles-help)
+				(source (tackon "C:" @each-name))
+				(dest "C:")
+				(newname (cat @each-name ".orig"))
+			)
+		)
+	)
+	(copyfiles
+		(prompt "Installing the AmiTCP_NG network commands into C:")
+		(help @copyfiles-help)
+		(source #tools-source)
+		(dest "C:")
+		(all)
+	)
+
+	(makedir "DEVS:NetInterfaces" (infos))
+	(P_InstallStartup)
+	(P_WriteMarker)
+
+	(complete 100)
+
+	(message (cat
+		"AmiTCP_NG has replaced your existing bsdsocket.library and network commands.\n"
+		#backup-note
+		"\nYour interface configuration (DEVS:NetInterfaces) is untouched and now drives "
+		"AmiTCP_NG -- with no time limit. Your previous network commands were backed up "
+		"as 'C:<name>.orig' and are restored if you Uninstall.\n\n"
+		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir "\n\n"
+		"Please reboot your Amiga to start using AmiTCP_NG."
+	))
+))
+
+; ===========================================================================
+;  FULL INSTALL: no existing stack -- install the library AND our full tool set.
+; ===========================================================================
+(procedure P_FullInstall
+(
+	(P_SetupConfig)
+
+	; Insurance: this path is only meant for a clean machine, but if a
+	; bsdsocket.library is somehow present, never overwrite it without a backup.
+	(if (and (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+		 (= (exists "LIBS:bsdsocket.library.orig" (noreq)) 0))
+		(copyfiles
+			(prompt "Backing up the existing bsdsocket.library")
+			(help @copyfiles-help)
+			(source "LIBS:bsdsocket.library")
+			(dest "LIBS:")
+			(newname "bsdsocket.library.orig")
+		)
+	)
+
+	; The library.
+	(copyfiles
+		(prompt "Installing bsdsocket.library into LIBS:")
+		(help @copyfiles-help)
+		(source #lib-source)
+		(dest "LIBS:")
+	)
+	(complete 25)
+
+	; Our complete set of Roadshow-compatible commands (Online, Offline,
+	; AddNetInterface, ConfigureNetInterface, AddNetRoute, DeleteNetRoute,
+	; RemoveNetInterface, NetShutdown, GetNetStatus, ShowNetStatus, ping) -- so
+	; Roadie, NetMon and existing scripts drive the stack unchanged.
+	(copyfiles
+		(prompt "Installing the AmiTCP_NG network commands into C:")
+		(help @copyfiles-help)
+		(source #tools-source)
+		(dest "C:")
+		(all)
+	)
+	(complete 45)
+
+	; Network startup script.
+	(copyfiles
+		(prompt "Installing S:Network-Startup")
+		(help @copyfiles-help)
+		(source #nstart-source)
+		(dest "S:")
+	)
+	(complete 60)
+
+	; DEVS:NetInterfaces (where the user drops interface config files) and a
+	; localhost hosts file under DEVS:Internet.
+	(makedir "DEVS:NetInterfaces"
+		(prompt "Creating DEVS:NetInterfaces")
+		(help @makedir-help)
+		(infos)
+	)
+	(if (= (exists "data/Devs/Internet/hosts" (noreq)) 1)
+	(
+		(makedir "DEVS:Internet" (infos))
+		(copyfiles
+			(prompt "Installing example DEVS:Internet/hosts")
+			(help @copyfiles-help)
+			(source "data/Devs/Internet/hosts")
+			(dest "DEVS:Internet")
+			(optional "force" "askuser")
+		)
+	))
+	(complete 75)
+
+	; Example interface configurations into SYS:Storage/NetInterfaces for the user to
+	; copy into DEVS:NetInterfaces and edit.
+	(makedir "SYS:Storage/NetInterfaces"
+		(prompt "Creating SYS:Storage/NetInterfaces")
+		(help @makedir-help)
+		(infos)
+	)
+	(copyfiles
+		(prompt "Installing example interface configurations")
+		(help @copyfiles-help)
+		(source "data/Storage/NetInterfaces")
+		(dest "SYS:Storage/NetInterfaces")
+		(all)
+	)
+
+	; Drop the full-install sentinel so Uninstall can safely tell this apart from an
+	; upgrade (see #fullinstall-marker). Written last, once the full install has succeeded.
+	(textfile
+		(dest #fullinstall-marker)
+		(append (cat "AmiTCP_NG full-install marker. Created by the AmiTCP_NG installer "
+			"so its Uninstall can tell a full install from an upgrade. Safe to delete "
+			"only if you will not use Uninstall.\n"))
+	)
+	(complete 90)
+
+	(P_InstallStartup)
+	(P_WriteMarker)
+
+	(complete 100)
+
+	(message (cat
+		"AmiTCP_NG is installed, with its full set of network commands.\n\n"
+		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir "\n\n"
+		"The network is NOT brought up automatically at boot -- for WiFi the link "
+		"must associate first, so bringing interfaces up at boot is left to you.\n\n"
+		"To configure an interface:\n\n"
+		"  1. Copy an example from 'SYS:Storage/NetInterfaces' into "
+		"'DEVS:NetInterfaces', named after the interface you want "
+		"(for example 'wifipi' or 'eth0').\n\n"
+		"  2. Edit it for your hardware (network card 'device', and either "
+		"'configure=dhcp' or a static 'address'/'netmask'/'gateway').\n\n"
+		"  3. Once your link is ready (WiFi associated, cable in), bring it up with\n"
+		"     'Execute S:Network-Startup' (all interfaces) or\n"
+		"     'AddNetInterface DEVS:NetInterfaces/<name>' -- from a Shell or your own\n"
+		"     WiFi-connect script.\n\n"
+		"Reboot to activate the AmiTCP: assign."
+	))
+))
+
+; ===========================================================================
+;  UPGRADE OURS: an existing AmiTCP_NG is already installed -- just replace the library
+;  and commands with this version. No NEW .orig backups are made (this is our own
+;  stack; any original foreign-stack backup from the first upgrade is preserved so
+;  Uninstall still restores the truly-original stack). Config is left as-is.
+; ===========================================================================
+(procedure P_UpgradeOurs
+(
+	(P_SetupConfig)
+
+	(copyfiles
+		(prompt "Updating the AmiTCP_NG bsdsocket.library")
+		(help @copyfiles-help)
+		(source #lib-source)
+		(dest "LIBS:")
+		(newname "bsdsocket.library")
+		(confirm "expert")
+	)
+	(copyfiles
+		(prompt "Updating the AmiTCP_NG network commands in C:")
+		(help @copyfiles-help)
+		(source #tools-source)
+		(dest "C:")
+		(all)
+	)
+
+	(makedir "DEVS:NetInterfaces" (infos))
+	(P_InstallStartup)
+	(P_WriteMarker)
+
+	(message (cat
+		"Your existing AmiTCP_NG installation has been updated to version " #ng-version ".\n\n"
+		"The library and network commands were replaced; your configuration (the 'AmiTCP' "
+		"drawer and DEVS:NetInterfaces) is untouched.\n\n"
+		"Please reboot your Amiga to start using the updated AmiTCP_NG."
+	))
+))
+
+; ===========================================================================
+;  UNINSTALL: roll back. If we backed up a previous library (an upgrade), restore it and
+;  the original commands; else, if a full install of ours is detected, remove what it
+;  added; otherwise change nothing (so a repeated Uninstall never harms restored files).
+; ===========================================================================
+(procedure P_Uninstall
+(
+	(if (>= (exists "LIBS:bsdsocket.library.orig" (noreq)) 1)
+	(
+		; --- undo an UPGRADE: restore the originals we backed up ---
+		(if (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+			(delete "LIBS:bsdsocket.library"
+				(prompt "Removing the AmiTCP_NG library") (help @delete-help)))
+		(rename "LIBS:bsdsocket.library.orig" "LIBS:bsdsocket.library"
+			(prompt "Restoring your previous bsdsocket.library") (help "This moves your backed-up original file back into place."))
+
+		; Undo the command set an upgrade installed: for each command we ship, remove our
+		; copy and, where we backed up the original (C:<name>.orig), move it back.
+		; Commands we added that Roadshow did not have (no .orig) are simply removed.
+		(foreach #tools-source "#?"
+		(
+			(if (>= (exists (tackon "C:" @each-name) (noreq)) 1)
+				(delete (tackon "C:" @each-name)
+					(prompt "Removing our " @each-name) (help @delete-help)))
+			(if (>= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 1)
+				(rename (tackon "C:" (cat @each-name ".orig")) (tackon "C:" @each-name)
+					(prompt "Restoring your previous " @each-name)
+					(help "This moves your backed-up original command back into place.")))
+		))
+
+		(set #undo-note "Your previous bsdsocket.library and network commands have been restored.")
+	)
+	; No upgrade backup is present. Only tear anything down if a FULL install of OURS is
+	; actually here -- detected by our own full-install sentinel (#fullinstall-marker),
+	; which only a full install writes and only this branch removes. An upgrade never
+	; creates it, so a SECOND consecutive Uninstall (after an upgrade was rolled back and
+	; its .orig backups consumed) finds no marker and falls through to the no-op branch,
+	; never mistaking the restored originals for our install. Because the marker's name is
+	; unmistakably ours it cannot pre-exist from Roadshow or anything else.
+	(if (>= (exists #fullinstall-marker (noreq)) 1)
+	(
+		; --- undo a FULL install: remove the library and every command we shipped ---
+		(if (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+			(delete "LIBS:bsdsocket.library"
+				(prompt "Removing the AmiTCP_NG library") (help @delete-help)))
+
+		; Delete exactly the commands we install, by enumerating our own C: payload.
+		(foreach #tools-source "#?"
+			(if (>= (exists (tackon "C:" @each-name) (noreq)) 1)
+				(delete (tackon "C:" @each-name)
+					(prompt "Removing " @each-name) (help @delete-help))
+			)
+		)
+
+		; Remove the sentinel last, so a repeated Uninstall becomes a clean no-op.
+		(delete #fullinstall-marker (prompt "Removing the AmiTCP_NG install marker") (help @delete-help))
+		(set #undo-note "The AmiTCP_NG library and commands have been removed.")
+	)
+	(
+		; --- nothing of ours detected: change nothing (safe on a repeated Uninstall) ---
+		(set #undo-note "No AmiTCP_NG installation was detected, so nothing was removed.")
+	)))
+
+	; Remove the AmiTCP_NG version marker (it identifies our install; once gone, a later
+	; run sees no AmiTCP_NG and treats the machine accordingly).
+	(if (>= (exists #ng-marker (noreq)) 1)
+		(delete #ng-marker (prompt "Removing the AmiTCP_NG version marker") (help @delete-help)))
+
+	; Drop the AmiTCP: assign (this session) and neutralise the S:User-Startup hook by
+	; replacing our tagged block with a harmless comment.
+	(makeassign "AmiTCP" (safe))
+	(startup @app-name
+		(prompt "Removing the AmiTCP_NG lines from S:User-Startup")
+		(help @startup-help)
+		(command "; AmiTCP_NG has been uninstalled")
+	)
+
+	(message (cat
+		#undo-note "\n\n"
+		"Your 'AmiTCP' drawer and your interface configuration in DEVS:NetInterfaces "
+		"were left in place; delete them by hand if you no longer want them.\n\n"
+		"Please reboot your Amiga to complete the rollback."
+	))
+))
+
+; ===========================================================================
+;  PREVIEW: describe what an install would do, changing nothing.
+; ===========================================================================
+(procedure P_Preview
+(
+	(if #ours
+		(set #plan (cat
+			"An AmiTCP_NG UPDATE would be performed (an existing AmiTCP_NG install was found):\n\n"
+			"  * Replace 'LIBS:bsdsocket.library' with this version (" #ng-version ").\n"
+			"  * Replace the AmiTCP_NG network commands in C:.\n"
+			"  * Leave your 'AmiTCP' drawer and DEVS:NetInterfaces configuration untouched.\n"
+			"  * Make no new backups; any original pre-AmiTCP_NG stack backup is preserved\n"
+			"    for Uninstall."
+		))
+	(if #existing
+		(set #plan (cat
+			"An UPGRADE would be performed (an existing bsdsocket.library was found):\n\n"
+			"  * Create " #amitcp-dir "/db and install the network database there.\n"
+			"  * Set up the 'AmiTCP:' assign to " #amitcp-dir ".\n"
+			"  * Back up 'LIBS:bsdsocket.library' to 'LIBS:bsdsocket.library.orig'.\n"
+			"  * Replace 'LIBS:bsdsocket.library' with AmiTCP_NG.\n"
+			"  * Back up your existing network commands (Online, AddNetInterface,\n"
+			"    ShowNetStatus, ...) to 'C:<name>.orig' and install AmiTCP_NG's own.\n"
+			"  * Add the AmiTCP: assign and Network-Startup to 'S:User-Startup'.\n\n"
+			"Your interface configuration (DEVS:NetInterfaces) would be left untouched. "
+			"Roadshow's own config tools drive AmiTCP_NG down a path that hangs, so we "
+			"install our commands over them; Uninstall restores your originals."
+		))
+		(set #plan (cat
+			"A FULL INSTALL would be performed (no existing stack was found):\n\n"
+			"  * Create " #amitcp-dir "/db and install the network database there.\n"
+			"  * Set up the 'AmiTCP:' assign to " #amitcp-dir ".\n"
+			"  * Install 'LIBS:bsdsocket.library'.\n"
+			"  * Install our network commands into C: (Online, Offline, AddNetInterface,\n"
+			"    ConfigureNetInterface, AddNetRoute, DeleteNetRoute, RemoveNetInterface,\n"
+			"    NetShutdown, GetNetStatus, ShowNetStatus, ping).\n"
+			"  * Install 'S:Network-Startup', example interface configs into\n"
+			"    SYS:Storage/NetInterfaces, and a DEVS:Internet/hosts file.\n"
+			"  * Add the AmiTCP: assign and Network-Startup to 'S:User-Startup'."
+		))
+	))
+	(message #plan
+		(prompt "Preview -- nothing has been changed on your system.")
+	)
+))
+
+; ===========================================================================
+;  Main
+; ===========================================================================
+
+(welcome (cat
+	"This will install AmiTCP_NG, an open TCP/IP stack for AmigaOS "
+	"providing a drop-in 'bsdsocket.library'."
+))
+
+; AmiTCP_NG is a plain MC68000 build and runs on every Amiga -- no CPU choice.
+
+; Detect an existing TCP/IP stack from SEVERAL independent signals, to pick UPGRADE
+; vs FULL INSTALL automatically (a full install over an existing stack would be
+; destructive, and at novice level a question can be silently answered by default).
+(set #existing 0)
+(if (>= (exists "LIBS:bsdsocket.library" (noreq)) 1) (set #existing 1))
+(if (>= (exists "C:AddNetInterface"      (noreq)) 1) (set #existing 1))
+(if (>= (exists "DEVS:NetInterfaces"     (noreq)) 1) (set #existing 1))
+(if (>= (exists "S:Network-Startup"      (noreq)) 1) (set #existing 1))
+
+; Is the existing stack OUR OWN AmiTCP_NG (vs a foreign stack such as Roadshow)? Our
+; installer drops #ng-marker on every install, so its presence means "ours" -> a
+; straight version upgrade rather than a foreign-stack replace.
+(set #ours 0)
+(if (>= (exists #ng-marker (noreq)) 1) (set #ours 1))
+
+; Choose the action.
+(set #action
+	(askchoice
+		(prompt "What would you like to do?")
+		(help "Install ... put AmiTCP_NG on this machine (it upgrades an existing "
+			"stack in place, or does a full install on a clean machine).\n\n"
+			"Uninstall ... roll back a previous AmiTCP_NG install: restore the "
+			"library (and command) that were backed up, or remove what a full "
+			"install added.\n\n"
+			"Preview ... show exactly what an install would do, without changing "
+			"anything.\n\n" @askchoice-help)
+		(choices "Install AmiTCP_NG"
+			 "Uninstall / roll back"
+			 "Preview (change nothing)")
+		(default 0)
+	)
+)
+
+(if (= #action 1)
+	; ---- Uninstall ----
+	(P_Uninstall)
+	; ---- Install or Preview: both need the destination ----
+	(
+		(P_AskDest)
+		(if (= #action 2)
+			(P_Preview)
+			(if #ours (P_UpgradeOurs)
+			    (if #existing (P_Upgrade) (P_FullInstall)))
+		)
+	)
+)
+
+(exit)

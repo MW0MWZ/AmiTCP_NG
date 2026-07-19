@@ -1,0 +1,16 @@
+# AmiTCP_NG interface configuration -- static IP address example (A2065).
+# Copy to DEVS:NetInterfaces/ under your chosen interface name and edit.
+
+device=a2065.device
+unit=0
+
+# Static configuration (do NOT also set configure=dhcp):
+address=192.168.0.10
+netmask=255.255.255.0
+gateway=192.168.0.1
+
+# Name resolution (optional):
+nameserver=192.168.0.1
+domain=home.lan
+
+requiresinitdelay=no

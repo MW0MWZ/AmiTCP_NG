@@ -1,0 +1,5 @@
+# AmiTCP_NG interface configuration -- UAE emulated Ethernet (uaenet.device).
+device=uaenet.device
+unit=0
+configure=dhcp
+requiresinitdelay=no

@@ -1,0 +1,283 @@
+AmiTCP_NG is a fork and continuation of AmiTCP/IP 3.0b2. All AmiTCP_NG changes and
+additions are:
+
+	Copyright (C) 2026 Andy Taylor (MW0MWZ)
+
+released under the GNU General Public License, version 2 (see COPYING) -- the same
+licence as the original work. The original AmiTCP/IP and Berkeley copyright notices
+below are retained in full and continue to apply to the original code.
+
+======================================================================
+
+Revision $Id: COPYRIGHTS,v 1.13 1994/05/14 13:52:16 jraja Exp $.
+
+All files in this release, except ones noted in this file, are:
+
+	Copyright � 1993, 1994 AmiTCP/IP Group, <amitcp-group@hut.fi>
+                    Helsinki University of Technology, Finland.
+                    All rights reserved.
+
+	Members of the group are
+
+		Tomi Ollila	<Tomi.Ollila@hut.fi>
+		Pekka Pessi	<Pekka.Pessi@hut.fi>
+		Markus Peuhkuri	<Markus.Peuhkuri@hut.fi>
+		Jarno Rajahalme	<Jarno.Rajahalme@hut.fi>
+
+	Refer to the GNU General Public Licence version 2 (see file
+	COPYING) for terms on use, copying and modification of this
+	software.
+
+The code and documents are mostly based on the material provided by
+Berkeley University of California, which is thereby acknowledged:
+
+   Copyright (c) 1982, 1986, 1990 The Regents of the University of California.
+   All rights reserved.
+  
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions
+   are met:
+   1. Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+   3. All advertising materials mentioning features or use of this software
+      must display the following acknowledgement:
+  	This product includes software developed by the University of
+  	California, Berkeley and its contributors.
+   4. Neither the name of the University nor the names of its contributors
+      may be used to endorse or promote products derived from this software
+      without specific prior written permission.
+  
+   THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+   ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+   ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+   OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+   LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+   OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+   SUCH DAMAGE.
+
+Some code is also based on the code provided by the Carnegie Mellon
+University, which is thereby acknowledged:
+
+   Mach Operating System
+   Copyright (c) 1992 Carnegie Mellon University
+   All Rights Reserved.
+   
+   Permission to use, copy, modify and distribute this software and its
+   documentation is hereby granted, provided that both the copyright
+   notice and this permission notice appear in all copies of the
+   software, derivative works or modified versions, and any portions
+   thereof, and that both notices appear in supporting documentation.
+   
+   CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
+   CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND FOR
+   ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
+
+
+RPC code originates from Sun Microsystems, Inc., which is thereby
+acknowledged:
+
+   Sun RPC is a product of Sun Microsystems, Inc. and is provided for
+   unrestricted use provided that this legend is included on all tape
+   media and as a part of the software program in whole or part.  Users
+   may copy or modify Sun RPC without charge, but are not authorized
+   to license or distribute it to anyone else except as part of a product or
+   program developed by the user.
+   
+   SUN RPC IS PROVIDED AS IS WITH NO WARRANTIES OF ANY KIND INCLUDING THE
+   WARRANTIES OF DESIGN, MERCHANTIBILITY AND FITNESS FOR A PARTICULAR
+   PURPOSE, OR ARISING FROM A COURSE OF DEALING, USAGE OR TRADE PRACTICE.
+   
+   Sun RPC is provided with no support and without any obligation on the
+   part of Sun Microsystems, Inc. to assist in its use, correction,
+   modification or enhancement.
+   
+   SUN MICROSYSTEMS, INC. SHALL HAVE NO LIABILITY WITH RESPECT TO THE
+   INFRINGEMENT OF COPYRIGHTS, TRADE SECRETS OR ANY PATENTS BY SUN RPC
+   OR ANY PART THEREOF.
+   
+   In no event will Sun Microsystems, Inc. be liable for any lost revenue
+   or profits or other special, indirect and consequential damages, even if
+   Sun has been advised of the possibility of such damages.
+   
+   Sun Microsystems, Inc.
+   2550 Garcia Avenue
+   Mountain View, California  94043
+  
+The use of the included RPC code is not further restricted, so the above
+applies.
+
+
+GNU General Public Licence (COPYING) is
+
+	Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+        	                 675 Mass Ave, Cambridge, MA 02139, USA
+
+
+Installer and Installer project icon are
+
+	(c) Copyright 1991-93 Commodore-Amiga, Inc.  All Rights Reserved.
+	Reproduced and distributed under license from Commodore.
+
+	INSTALLER SOFTWARE IS PROVIDED "AS-IS" AND SUBJECT TO CHANGE;
+	NO WARRANTIES ARE MADE.  ALL USE IS AT YOUR OWN RISK.  NO LIABILITY
+	OR RESPONSIBILITY IS ASSUMED.    
+
+
+Files
+	devs/networks/rhslip.device (*)
+	devs/networks/rhcslip.device (*)
+	devs/networks/a2060.device
+	devs/networks/a2065.device
+	doc/slip.doc
+	env/sana2/rhslip0.config
+	netinclude/devices/sana2.h (source distribution only)
+	netinclude/devices/sana2.i (source distribution only)
+	netinclude/devices/sana2specialstats.h (source distribution only)
+	netinclude/devices/sana2specialstats.i (source distribution only)
+
+  are
+        (C) Copyright 1991 Commodore-Amiga Inc.
+                  All Rights Reserved
+	(C) Copyright 1992 Commodore-Amiga Inc.
+
+  (*) These files include modifications by Olaf Seibert. See note below
+  for conditions.
+
+  All these files are distributed under following licence:
+
+      Warning
+      -------
+       
+      The information contained herein is subject to change without
+      notice. Commodore specifically does not make any endorsement or
+      representation with respect to the use, results, or performance of
+      the information (including without limitation its capabilities,
+      appropriateness, reliability, currentness or availability).
+      
+      Disclaimer
+      ----------
+      
+      This information is provided "As Is" without warranty of any
+      kind, either express or implied.  The entire risk as to the use of
+      this information is assumed by the user.  In no event will
+      Commodore or its affiliated companies be liable for any damages,
+      direct, indirect, incidental, special or consequential, resulting
+      from any claim arising out of the information presented herein,
+      even if it has been advised of the possibility of such damages. 
+      Some states do not allow the exclusion or limitation of such
+      implied warranties, so the above limitations may not apply.
+
+      ----------------------------------------------------------------------
+      All the files in this archive are freely redistributable as long as 
+      the above Copyright, Warning and Disclaimer are present in all copies.
+      ----------------------------------------------------------------------
+
+In addition, following applies to the distributed rhslip.device and
+rhcslip.device:
+
+      Addendum by Olaf Seibert, 21 June 1993:
+
+      Because Commodore claims copyright on their files, I claim 
+      copyright on the changes. The changes are intended to fix bugs, 
+      but the same disclaimer applies, where "The copyright holder" is
+      substituted for "Commodore".
+
+Napsaterm is based on the Niftyterm 1.2, which has the following
+copyright notices:
+
+    Niftyterm is (C) Copyright 1989, 1990 Christopher J. Newman and Todd
+    Williamson
+    All Rights Reserved.
+    
+    Permission to use, copy, modify, distribute, and sell this software and
+    its documentation for any purpose is hereby granted without fee,
+    provided that the above copyright notice appear in all copies and that
+    both that copyright notice and this permission notice appear in
+    supporting documentation, and that the names of Christopher J. Newman
+    and Todd Williamson not be used in advertising or publicity pertaining
+    to distribution of the software without specific, written prior
+    permission.  Christopher J. Newman and Todd Williamson make no
+    representations about the suitability of this software for any purpose.
+    It is provided "as is" without express or implied warranty.
+    
+    CHRISTOPHER J. NEWMAN AND TODD WILLIAMSON DISCLAIM ALL WARRANTIES WITH
+    REGARD TO THIS SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS, IN NO EVENT SHALL CHRISTOPHER J. NEWMAN OR
+    TODD WILLIAMSON BE LIABLE FOR ANY SPECIAL, INDIRECT OR CONSEQUENTIAL
+    DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+    PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTUOUS
+    ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+    
+    Authors: Christopher J. Newman and Todd Williamson
+    Niftyterm was compiled with Manx Aztec C version 5.0d
+    Niftyterm source code is available upon request.  Send a disk and a
+    self-addressed mailer to the address below, and I'll send you a copy.
+
+    If you find this program useful, Chris and I would certainly appreciate
+    a donation to support further development:
+    
+    Todd Williamson
+    5440 Fifth Avenue Apt. 59
+    Pittsburgh, Pa.  15232-2243
+
+
+usergroup.library contains a modified initialization file from SAS C 6.51
+library sources, `libinit.c'.  This file is copyright � SAS Institue, Inc.
+
+NetFS
+
+   Files doc/netfs.doc
+	 bin/netmount
+	 l/netfs-handler
+	 serv/netfs-server
+   are part of NetFS. NetFS is Copyright � 1993 by Timo Rossi. It can
+   be freely distributed for non-commercial purposes. It can be
+   included on disk collections such as Fred Fish's AmigaLibDisks or
+   CD-ROMs such as the AmiNET CD-ROM.
+
+   It may not be used for military purposes or life-critical purposes such
+   as controlling nuclear reactors or guidance systems for a manned spacecraft.
+
+   If you want to include netfs in a commercial product, you should contact
+
+	   Timo Rossi
+	   Mattilankatu 40 A 4
+	   40600 Jyv�skyl�
+	   FINLAND
+
+	   E-Mail:  trossi@jyu.fi
+
+   NetFS is NOT under the GNU General Public Licence.
+            ~~~
+   Source code is not currently available, but it may be in the future...
+
+NcFTP
+
+      Author is Mike Gleanson, NCEMRSoft <mgleason@cse.unl.edu>. Port was
+      made by Carsten Heyl <ch@irb.informatik.uni-dortmund.de>.
+
+Carsten Heyl's NFS Client
+
+      The files:
+
+	doc/ch_die.doc, doc/ch_setowner.doc, doc/ch_mknod.doc,
+	doc/ch_chmod.doc, doc/showmount.doc, db/ch_nfstab, bin/ch_die,
+	bin/ch_mknod, bin/ch_chmod, bin/ch_nfsmount, bin/ch_nfsc,
+	bin/ch_nfsctl, bin/ch_setowner, bin/showmount, help/ch_nfsutil
+	and help/ch_nfsc
+
+      are
+
+	Copyright (C) 1993, 1994 Carsten Heyl
+	All rights reserved.
+
+	You may freely copy this archive [the above files] as long as
+	it's contents are left unmodified.

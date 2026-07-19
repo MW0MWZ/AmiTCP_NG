@@ -1,0 +1,10 @@
+; AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2.
+; $VER: Network-Startup 1.0 (AmiTCP_NG)
+;
+; Bring up every network interface configured under DEVS:NetInterfaces/. Each
+; file there describes one interface (see the examples in SYS:Storage/NetInterfaces).
+; This runs from S:User-Startup so the network is up by the time Workbench opens.
+;
+; The pattern ~(#?.info) matches every file EXCEPT Workbench .info icons.
+FailAt 30
+AddNetInterface DEVS:NetInterfaces/~(#?.info)

@@ -1,0 +1,322 @@
+# $Id: Smakefile,v 3.13 1994/04/22 13:53:20 jraja Exp $
+# 
+# Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>,
+#                    Helsinki University of Technology, Finland.
+#                    All rights reserved.
+#
+# Smakefile for AmiTCP/IP Project
+#
+# Created      : Mon Mar  8 03:15:42 1993 ppessi
+# Last modified: Sat Mar 26 12:16:21 1994 too
+# 
+# HISTORY
+# $Log: Smakefile,v $
+# Revision 3.13  1994/04/22  13:53:20  jraja
+# Minor changes
+#
+# Revision 3.12  1994/03/26  10:18:02  too
+# Added kern/accesscontrol.[cho]
+#
+# Revision 3.11  1994/02/27  00:04:05  ppessi
+# Added autodoc generation rules
+#
+# Revision 3.10  1994/02/18  06:20:15  jraja
+# Updated SCOPTIONS for SAS/C 6.51.
+#
+# Revision 3.9  1994/02/15  20:47:53  jraja
+# Removed SCOPTIONS from MISC sources, added SCOPTIONS dependency to the
+# amitcp.gst rule.
+#
+# Revision 3.8  1994/02/03  19:12:31  ppessi
+# Changed the default options slightly
+#
+# Revision 3.7  1994/02/03  04:41:17  ppessi
+# Added net/sana2config.[hc]
+# Changed the SCOPTIONS mechanism
+#
+# Revision 3.6  1994/01/23  22:10:49  jraja
+# Added net/sana2perror.c, removed special rule for it.
+#
+# Revision 3.5  1994/01/12  07:13:36  jraja
+# Moved sys/cdefs.h to the netinclude.
+#
+# Revision 3.4  1994/01/09  21:17:52  too
+# Added amiga_errlists.c to API_C files
+#
+# Revision 3.3  1994/01/09  11:55:39  jraja
+# Added one space between file names...
+#
+# Revision 3.2  1994/01/06  13:33:35  too
+# Added amiga_sendrecv.[co] and sockargs.h to API files
+#
+# Revision 1.37  1993/11/11  23:48:08  jraja
+# Changed assebler include dir to INCLUDE: (SAS/C standard).
+# Added in_cksum.asm and mbuf.i to MISC.
+#
+# Revision 1.36  1993/10/21  01:58:48  ppessi
+# Using optimized in_cksum() from netinet/in_cksum.asm
+#
+# Revision 1.35  1993/10/14  00:07:22  ppessi
+# Added new target, install.
+#
+# Revision 1.34  1993/10/11  01:41:35  jraja
+# Changed /src to /amitcp to accomodate the new directory structure.
+#
+
+DEST = amitcp:
+
+MAKE = smake
+CC= sc
+LD= sc LINK
+AS= a68k
+
+RM= delete
+INSTALL= copy dates all
+AUTODOC= autodoc -C -I -c -t8
+MKDIR = makedir
+
+CFLAGS= NoOpt Params=Registers Debug=FF AddSymbols
+CFLAGS= Opt Params=Registers StripDebug
+AFLAGS= -i/amitcp -iINCLUDE:
+
+IDIRS=	IDIR=/amitcp IDIR=conf IDIR=protos IDIR=netinclude:
+DEFS=	DEF=RCS_ID_C=// DEF=AMITCP DEF=KERNEL \
+	DEF=NO_DEBUG DEF=NDEBUG DEF=NO_ARP_DEBUG DEF=NO_TCPDEBUG \
+	DEF=NO_ICMPPRINTFS DEF=NO_SOCKBUF_DEBUG \
+	DEF=USE_ALIGNED_COPIES DEF=DIRECTED_BROADCAST
+
+SCOPTIONS= NoCheckAbort NoStackCheck StructureEquivalence \
+	StringMerge StringsConst StringSection=Near \
+	NoMultipleIncludes NoErrorSource NoVersion NoErrorHighlight \
+	SmallCode SmallData \
+	Map MapHunk MapSymbols MapLib MapXReference \
+	LinkerOptions=Plain NoIcons Batch \
+	OptInl OptimizerInlineLocal OptimizerTime OptimizerScheduler \
+	OptComp=5 OptDep=5 OptRDep=5 \
+	$(IDIRS) $(DEFS) \
+	GlobalSymbolTable=amitcp.gst \
+	Ignore=306 Ignore=304 Ignore=308
+#
+# System headers
+#
+SYS_H= \
+	sys/synch.h sys/uio.h \
+	sys/kernel.h sys/malloc.h sys/mbuf.h sys/queue.h \
+	sys/socketvar.h sys/domain.h sys/protosw.h \
+	sys/systm.h 
+
+PROTOS_H= \
+	protos/kern/amiga_api_protos.h 	protos/kern/amiga_main_protos.h \
+	protos/kern/amiga_select_protos.h protos/kern/amiga_time_protos.h \
+	protos/kern/amiga_userlib_protos.h protos/kern/kern_malloc_protos.h \
+	protos/kern/kern_synch_protos.h protos/kern/subr_prf_protos.h \
+	protos/kern/uipc_domain_protos.h \
+	protos/kern/uipc_socket2_protos.h protos/kern/uipc_socket_protos.h \
+	protos/net/if_loop_protos.h protos/net/if_protos.h \
+	protos/net/radix_protos.h protos/net/raw_cb_protos.h \
+	protos/net/raw_usrreq_protos.h protos/net/rtsock_protos.h \
+	protos/netinet/in_cksum_protos.h protos/netinet/in_pcb_protos.h \
+	protos/netinet/in_proto_protos.h protos/netinet/in_protos.h \
+	protos/netinet/ip_icmp_protos.h protos/netinet/ip_input_protos.h \
+	protos/netinet/ip_output_protos.h protos/netinet/raw_ip_protos.h \
+	protos/netinet/tcp_debug_protos.h protos/netinet/tcp_input_protos.h \
+	protos/netinet/tcp_output_protos.h protos/netinet/tcp_subr_protos.h \
+	protos/netinet/tcp_timer_protos.h protos/netinet/tcp_usrreq_protos.h \
+	protos/netinet/udp_usrreq_protos.h
+
+# Protocol inspecific network routines:
+# network interfaces, input queue scheduling, 
+# raw sockets, routing
+NET_C=  net/sana2perror.c \
+	net/if.c net/if_loop.c \
+	net/raw_cb.c net/raw_usrreq.c \
+	net/route.c net/rtsock.c net/radix.c \
+	net/if_sana.c net/netisr.c net/sana2config.c \
+	net/sana2copybuff.c net/sana2arp.c
+
+NET_O=  net/sana2perror.o \
+	net/if.o net/if_loop.o \
+	net/raw_cb.o net/raw_usrreq.o \
+	net/route.o net/rtsock.o net/radix.o \
+	net/if_sana.o net/netisr.o net/sana2config.o \
+	net/sana2copybuff.o net/sana2arp.o
+
+NET_H= \
+	net/if_types.h net/if_sana.h \
+	net/sana2request.h net/sana2arp.h net/sana2config.h \
+	net/netisr.h net/raw_cb.h net/radix.h 
+
+# netinet -- internet protocols (ip, icmp, tcp, udp, arp)
+NETINET_C= \
+	netinet/in.c netinet/in_cksum.c netinet/in_pcb.c netinet/in_proto.c \
+	netinet/ip_icmp.c \
+	netinet/ip_input.c netinet/ip_output.c netinet/raw_ip.c \
+	netinet/tcp_debug.c netinet/tcp_input.c netinet/tcp_output.c \
+	netinet/tcp_subr.c netinet/tcp_timer.c netinet/tcp_usrreq.c \
+	netinet/udp_usrreq.c
+
+NETINET_O= \
+	netinet/in.o netinet/in_cksum.o netinet/in_pcb.o netinet/in_proto.o \
+	netinet/ip_icmp.o \
+	netinet/ip_input.o netinet/ip_output.o netinet/raw_ip.o \
+	netinet/tcp_debug.o netinet/tcp_input.o netinet/tcp_output.o \
+	netinet/tcp_subr.o netinet/tcp_timer.o netinet/tcp_usrreq.o \
+	netinet/udp_usrreq.o 
+
+NETINET_H= \
+	netinet/in_pcb.h netinet/in_var.h netinet/icmp_var.h  \
+	netinet/tcpip.h netinet/tcp_debug.h netinet/tcp_fsm.h \
+	netinet/tcp_seq.h netinet/tcp_timer.h netinet/tcp_var.h \
+	netinet/udp_var.h 
+
+# "Kernel" sources
+# main, timeouts, syncronization, memory management,
+# BSD socket ("Unix interprocess communication") routines,
+# logging and netstat rexx interface 
+KERN_C= \
+	kern/amiga_main.c kern/amiga_time.c \
+	kern/amiga_config.c kern/amiga_netdb.c \
+	kern/kern_synch.c kern/kern_malloc.c kern/uipc_mbuf.c \
+	kern/uipc_domain.c kern/uipc_socket.c kern/uipc_socket2.c \
+	kern/amiga_log.c kern/amiga_cstat.c kern/amiga_rexx.c \
+	kern/subr_prf.c kern/accesscontrol.c
+
+KERN_O= \
+	kern/config_var.o \
+	kern/amiga_main.o kern/amiga_time.o \
+	kern/amiga_config.o kern/amiga_netdb.o \
+	kern/kern_synch.o kern/kern_malloc.o kern/uipc_mbuf.o \
+	kern/uipc_domain.o kern/uipc_socket.o kern/uipc_socket2.o \
+	kern/amiga_log.o kern/amiga_cstat.o kern/amiga_rexx.o \
+	kern/subr_prf.o kern/accesscontrol.o
+
+KERN_H= \
+	kern/amiga_includes.h kern/amiga_time.h kern/amiga_config.h \
+	kern/amiga_netdb.h kern/amiga_log.h kern/amiga_rexx.h \
+	kern/amiga_subr.h kern/accesscontrol.h
+
+# Application interface sources
+# Amiga "struct Library" interface, API functions,
+API_C=\
+	api/amiga_api.c api/amiga_libtables.c api/amiga_syscalls.c \
+	api/amiga_sendrecv.c api/amiga_generic.capi/amiga_generic2.c \
+	api/amiga_libcalls.c api/amiga_errlists.c \
+	api/getxbyy.c api/gethostnamadr.c api/allocdatabuffer.c \
+	api/res_comp.c api/res_debug.c api/res_init.c \
+	api/res_mkquery.c api/res_query.c api/res_send.c #api/gethna_nores.c
+
+API_O=\
+	api/amiga_api.o api/amiga_libtables.o api/amiga_syscalls.o \
+	api/amiga_sendrecv.o api/amiga_generic.o api/amiga_generic2.o \
+	api/amiga_libcalls.o api/amiga_errlists.o \
+	api/getxbyy.o api/gethostnamadr.o api/allocdatabuffer.o \
+	api/res_comp.o api/res_debug.o api/res_init.o \
+	api/res_mkquery.o api/res_query.o api/res_send.o #api/gethna_nores.o
+
+API_H=\
+	api/amiga_raf.h api/amiga_api.h api/amiga_libcallentry.h \
+	api/allocdatabuffer.h api/gethtbynamadr.h \
+	api/arpa_nameser.h api/resolv.h api/sockargs.h \
+	api/apicalls.h api/apicalls_sasc.h api/apicalls_gnuc.h
+
+#
+# Misc headers
+#
+MISC_H=\
+	all_includes.h \
+	conf/conf.h conf/rcs.h
+
+#
+# Misc sources
+#
+MISC= \
+	all_includes.c GNUmakefile Smakefile GCCOPTS \
+	kern/variables.src kern/config_var.awk \
+	netinet/in_cksum.asm sys/mbuf.i
+
+#
+# Sources containing autodoc entries
+#
+AUTODOCSRC= \
+	api/auto_extras.c api/auto_inetaddr.c api/auto_netdb.c \
+	api/auto_nonsocket.c api/auto_protocols.c api/auto_socket.c \
+	api/amiga_generic2.c api/gethostnamadr.c 
+
+CSRCS=	$(KERN_C) $(NETINET_C) $(NET_C) $(API_C)
+OBJS=   $(API_O) $(KERN_O) $(NETINET_O) $(NET_O)
+SRCS=	$(CSRCS) $(SYS_H) $(API_H) $(KERN_H) $(NET_H) $(NETINET_H)\
+	$(MISC_H) $(MISC) $(PROTOS_H)
+LIBSRC= 
+LIBS=  # LIB netlib:sana2.lib
+
+all: amitcp bsdsocket.doc
+
+amitcp: SCOPTIONS $(OBJS)
+	$(LD) to=$@ $(LIBSRC) $(LIBS) <WITH <
+$(OBJS)
+<
+
+bsdsocket.doc: $(AUTODOCSRC)
+	$(AUTODOC) $(AUTODOCSRC) > $@
+
+net:	$(NET_O)
+netinet:  $(NETINET_O)
+kern:	$(KERN_O)
+api:	$(API_O)
+
+echo:
+	 list quick files nohead $(OBJS) lformat="%p%n"
+
+gst: amitcp.gst
+
+amitcp.gst: SCOPTIONS $(SYS_H) $(API_H) $(KERN_H) $(NET_H) $(NETINET_H) \
+            $(MISC_H) $(PROTOS_H)
+	-gst unload `list AmiTCP.gst LFORMAT="%f%n"` 
+	-$(RM) AmiTCP.gst
+	$(CC) $(CFLAGS) MGST=AmiTCP.gst all_includes.c
+
+SCOPTIONS: Smakefile
+	copy to $@ <from < 
+$(SCOPTIONS) 
+<
+
+netinet/in_cksum.o: netinet/in_cksum.asm
+	$(AS) $(AFLAGS) netinet/in_cksum.asm -o$@
+
+# Special rule for variables
+kern/config_var.o: kern/config_var.c
+
+kern/config_var.c: kern/variables.src kern/config_var.awk
+	gawk -f kern/config_var.awk -v TARGETTI=C $< > $@
+
+# Special rule for TeX
+kern/config_var.tex: kern/variables.src kern/config_var.awk
+	gawk -f kern/config_var.awk -v TARGETTI=TEX $< > $@ 
+
+#
+install: all $(DEST)doc
+	$(INSTALL) amitcp $(DEST)
+	$(INSTALL) bsdsocket.doc $(DEST)doc
+
+$(DEST)doc:
+	-$(MKDIR) $@
+
+clean:
+	-$(RM) net/\#?.o netinet/\#?.o kern/\#?.o api/\#?.o \#?.o \#?.(map|lnk)
+
+veryclean: clean
+	-$(RM) amitcp.gst amitcp
+ 	
+date:
+	date
+
+TAGS:
+	etags $(CSRCS) 
+
+.c.o:
+	$(CC) $(CFLAGS) $*.c
+
+.c.s:
+	$(CC) $(CFLAGS) $*.c DISASM=$@
+
+# DO NOT DELETE THIS LINE -- make depend depends on it.

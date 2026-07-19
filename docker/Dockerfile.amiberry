@@ -1,0 +1,27 @@
+# AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
+# Headless Amiberry for AmiTCP_NG real-network testing. Unlike the stock Debian
+# FS-UAE package (no NIC compiled in), Amiberry (v7.1.1, pinned below) carries in-tree
+# SLIRP user-mode networking (src/slirp/, incl. a BOOTP/DHCP server) plus A2065
+# and uaenet.device SANA-II emulation -- so our if_sana.c can bind a real
+# emulated Ethernet NIC and we can exercise ARP / DHCP / real UDP+TCP.
+# Xvfb + Mesa software GL give the SDL2 GUI a context with no real GPU.
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates cmake g++ make pkg-config flex bison \
+      libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev \
+      libflac-dev libmpg123-dev libpng-dev zlib1g-dev \
+      libmpeg2-4-dev libserialport-dev libportmidi-dev libpcap-dev \
+      libenet-dev libxml2-dev libglew-dev \
+      xvfb xauth procps mesa-utils libgl1-mesa-dri libglx-mesa0 libgl1 \
+      python3 python3-pip \
+    && pip3 install --break-system-packages amitools \
+    && rm -rf /var/lib/apt/lists/*
+# v7.1.1 = last SDL2 release (v8.x needs SDL3, absent on bookworm) AND already
+# carries the in-tree SLIRP stack incl. its BOOTP/DHCP server (src/slirp/bootp.cpp),
+# A2065 + uaenet.device SANA-II emulation (SLIRP landed in v7.0.0).
+RUN git clone --depth 1 --branch v7.1.1 https://github.com/BlitterStudio/amiberry /opt/amiberry \
+    && cd /opt/amiberry \
+    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j"$(nproc)"
+ENV LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+WORKDIR /work

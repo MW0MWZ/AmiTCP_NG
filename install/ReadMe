@@ -1,0 +1,132 @@
+AmiTCP_NG -- an open TCP/IP stack for AmigaOS
+=============================================
+
+AmiTCP_NG is a free, open-source TCP/IP stack for 68k AmigaOS (2.04 and later).
+It provides a drop-in "bsdsocket.library" -- the standard Amiga networking API --
+so existing Amiga network software just works, with no time limit.
+
+It is a modern-toolchain revival of AmiTCP/IP 3.0b2, and a 100% drop-in
+replacement for Olaf Barthel's Roadshow: it speaks the same bsdsocket.library
+API, uses the same configuration files, and ships the same command set, so
+Roadshow's own tools and front-ends (Roadie, NetMon) drive it unchanged.
+
+The Roadshow-compatible parts are a clean-room re-implementation, written from
+scratch using the open Roadshow SDK only as a reference -- no Roadshow code is
+included. With thanks to Olaf Barthel for making that SDK available.
+
+Copyright (C) 2026 Andy Taylor (MW0MWZ). Released under the GNU GPL v2 (see the
+COPYING file). Portions derive from AmiTCP/IP 3.0b2 (AmiTCP/IP Group) and the
+4.4BSD-Lite networking code (see COPYRIGHTS).
+
+
+Requirements
+------------
+
+  * AmigaOS 2.04 or later, any 68000 (or better) Amiga.
+  * A SANA-II network device driver for your card (e.g. a2065.device for the
+    Commodore A2065, or your card's driver), installed in DEVS:Networks/.
+
+
+Installing
+----------
+
+Double-click "Install-AmiTCP_NG" (or run it with the Installer tool).
+
+How much the installer asks depends on the USER LEVEL you pick in the Installer's
+opening dialog (the standard Amiga Novice / Intermediate / Expert choice):
+
+  * NOVICE -- the installer asks NOTHING and takes every default. It installs the
+    "AmiTCP" drawer to "SYS:Programs/AmiTCP" (or "SYS:AmiTCP" if you have no
+    Programs drawer), and if it finds an existing TCP/IP stack it automatically
+    upgrades it (see UPGRADE below). This is the "just install it" path.
+
+  * INTERMEDIATE / EXPERT -- unlocks the extra choices:
+      - which action to perform:
+          Install ..... put AmiTCP_NG on this machine.
+          Uninstall ... roll back a previous AmiTCP_NG install.
+          Preview ..... show exactly what an install would do, changing nothing.
+        (Uninstall / roll back is ONLY offered above Novice level.)
+      - WHERE the "AmiTCP" drawer (its configuration and host database) is
+        created -- any volume or drawer; the default is still
+        "SYS:Programs/AmiTCP" (or "SYS:AmiTCP" with no Programs drawer).
+
+Either way the installer sets up an "AmiTCP:" assign to wherever the drawer ends
+up. The install METHOD is chosen automatically from what is already present, so
+it cannot do the wrong thing:
+
+  * UPGRADE (an existing TCP/IP stack was detected -- a "bsdsocket.library", an
+    "AddNetInterface" command, a "DEVS:NetInterfaces" drawer or an
+    "S:Network-Startup", for example a Roadshow install). AmiTCP_NG backs up your
+    original "LIBS:bsdsocket.library" as "LIBS:bsdsocket.library.orig" and replaces
+    it, and installs its own network commands (Online, Offline, AddNetInterface,
+    ShowNetStatus, ...) over the existing ones, backing up each original as
+    "C:<name>.orig". Your interface configuration in "DEVS:NetInterfaces" is left
+    untouched and now drives AmiTCP_NG, with no time limit. Replacing the commands
+    is deliberate: the previous stack's own tools (e.g. Roadshow's AddNetInterface)
+    do not drive AmiTCP_NG's library correctly, so AmiTCP_NG supplies matching
+    commands of its own. (Stack-specific extras of the previous stack, such as
+    Roadshow's PPP/PPPoE drivers or its IP-filter firewall, are not provided by
+    AmiTCP_NG.)
+
+  * FULL INSTALL (no stack was detected). AmiTCP_NG installs the library AND its
+    own complete set of Roadshow-compatible commands into C: (Online, Offline,
+    AddNetInterface, ConfigureNetInterface, AddNetRoute, DeleteNetRoute,
+    RemoveNetInterface, NetShutdown, GetNetStatus, ShowNetStatus, ping), an
+    "S:Network-Startup" script, example interface configurations in
+    "SYS:Storage/NetInterfaces", and a line in "S:User-Startup" to bring the
+    network up at boot.
+
+Reboot when the installer finishes.
+
+
+Configuring an interface (full install)
+---------------------------------------
+
+1. Copy an example from "SYS:Storage/NetInterfaces" into "DEVS:NetInterfaces",
+   renaming it to whatever you want the interface to be called, e.g. "eth0".
+
+2. Edit it for your hardware. The key settings are:
+
+       device=a2065.device      ; your card's SANA-II driver
+       unit=0                    ; device unit (usually 0)
+       configure=dhcp            ; get address/DNS automatically, OR omit this
+                                 ; and set a static address instead:
+       ; address=192.168.0.10
+       ; netmask=255.255.255.0
+       ; gateway=192.168.0.1
+
+3. Reboot, or bring it up now from a Shell -- the interface name is enough (it is
+   looked up in DEVS:NetInterfaces, exactly like Roadshow); a full path also works:
+
+       AddNetInterface eth0
+
+These are the same configuration files Roadshow uses, so existing Roadshow
+interface configurations work unchanged.
+
+
+Uninstalling / rolling back
+---------------------------
+
+Run "Install-AmiTCP_NG" again, pick the INTERMEDIATE or EXPERT user level at the
+start (Uninstall is not offered at Novice level), and choose "Uninstall". It
+automatically does the right thing:
+
+  * If you had upgraded over an existing stack, your backed-up library
+    ("LIBS:bsdsocket.library.orig") and every backed-up command ("C:<name>.orig")
+    are restored, putting your previous stack back exactly as it was.
+
+  * If it was a full install, the AmiTCP_NG library and every command it
+    installed are removed.
+
+Either way the "AmiTCP:" assign and the AmiTCP_NG lines in "S:User-Startup" are
+removed. Your "AmiTCP" drawer and your "DEVS:NetInterfaces" configuration are
+left in place (delete them by hand if you no longer want them). Reboot to finish.
+
+
+Buy me a coffee
+---------------
+
+This is a hobby project, done for the love of the Amiga -- not to make money, and
+it will always be free. But if you find it useful and fancy buying me a coffee,
+that is very kind: https://paypal.me/AndyTaylorTweet -- entirely optional, and
+thank you either way.

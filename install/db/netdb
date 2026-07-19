@@ -1,0 +1,35 @@
+# AmiTCP_NG network database (AmiTCP:db/netdb).
+#
+# Static localhost entry plus the standard services, protocols and networks.
+# Host names and DNS servers are NOT hard-coded here -- they are configured at
+# runtime by DHCP or by your DEVS:NetInterfaces settings (AddNetInterface).
+
+# Hosts
+H 127.0.0.1 localhost
+
+# Networks
+N loopback 127
+
+# Protocols
+P ip   0  IP
+P icmp 1  ICMP
+P tcp  6  TCP
+P udp  17 UDP
+
+# Services (common)
+S echo    7/udp
+S echo    7/tcp
+S daytime 13/udp
+S ftp     21/tcp
+S ssh     22/tcp
+S telnet  23/tcp
+S smtp    25/tcp
+S domain  53/udp
+S domain  53/tcp
+S bootps  67/udp
+S bootpc  68/udp
+S http    80/tcp
+S pop3    110/tcp
+S ntp     123/udp
+S imap    143/tcp
+S https   443/tcp

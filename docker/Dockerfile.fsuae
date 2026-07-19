@@ -1,0 +1,13 @@
+# AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
+# Headless FS-UAE for AmiTCP_NG runtime testing. Xvfb + Mesa software GL
+# (llvmpipe) give FS-UAE the OpenGL context it requires with no real GPU.
+# amitools (xdftool) assembles the boot disk. Disposable (--rm).
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fs-uae xvfb ca-certificates procps xauth \
+      libgl1-mesa-dri libglx-mesa0 libgl1 mesa-utils \
+      python3 python3-pip \
+    && pip3 install --break-system-packages amitools \
+    && rm -rf /var/lib/apt/lists/*
+ENV LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
+WORKDIR /work

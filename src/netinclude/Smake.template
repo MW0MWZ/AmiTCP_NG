@@ -1,0 +1,77 @@
+# $Id: Smake.template,v 3.2 1994/03/07 22:47:23 ppessi Exp $
+#
+# Smakefile template for simple usergroup utilities
+#
+# Copyright © 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>
+#                  Helsinki University of Technology, Finland.
+#
+# Created      : Sun Nov 28 17:25:35 1993 ppessi
+# Last modified: Tue Mar  8 00:47:02 1994 ppessi
+#
+# $Log: Smake.template,v $
+# Revision 3.2  1994/03/07  22:47:23  ppessi
+# Updated RCSREV command
+#
+# Revision 3.1  1994/02/24  03:59:59  ppessi
+# Initial revision for AmiTCP 3 beta
+#
+
+CC=      sc
+LD=      sc
+MAKE=    smake
+TAGS=    etags
+RM=      delete quiet
+MKDIR=   makedir
+INSTALL= copy nopro dates all
+RCSREV=  rcsrev prefix=AmiTCP/IP_
+CAT=     type 
+
+DEST=    AmiTCP:
+
+CFLAGS = Optimize Debug=line $(CFLAGS)
+LDFLAGS= Stripdebug Noicons $(LDFLAGS)
+
+# DEF=RCS_ID_C=static char *rcsid
+DEFS=    DEF=RCS_ID_C=//  DEF=AMIGA=1 $(DEFS)
+IDIRS=   IDIR=netinclude: $(IDIRS)
+SCOPTIONS= stringmerge structureequivalence \
+	 nostackcheck nomultipleincludes \
+	 noerrorsource noversion noerrorhighlight \
+	 smallcode smalldata \
+	 map maphunk mapsymbols maplib mapxreference \
+	 linkeroptions=plain noicons batch \
+	 optinl opttime optcomp=5 optdep=5 optrdep=5 \
+	 $(IDIRS) $(DEFS) $(SCOPTIONS)
+
+
+all: $(PROG)
+
+$(PROG): SCOPTIONS $(OBJS)
+	$(LD) $(LDFLAGS) LINK BATCH TO $@ FROM $(OBJS) $(LIBS) 
+
+.c.o:
+	-@$(RM) $*.o  > nil:
+	$(CC) $(CFLAGS) $*.c
+
+$(PROG)_rev.h: $(PROG).c
+	-$(RCSREV) $(PROG) $(PROG).c
+
+SCOPTIONS: Smake.def
+	copy to $@ <from < 
+$(SCOPTIONS)
+<
+
+install: all $(DEST)bin
+	$(INSTALL) $(PROG) $(DEST)bin
+
+$(DEST)bin:
+	-$(MKDIR) $@
+
+TAGS:	$(SRCS)
+	$(TAGS) $(SRCS)
+
+clean:
+	-$(RM) \#?(_rev.?|.o|.map|.lnk|.info) SCOPTIONS
+
+# DO NOT DELETE THIS LINE -- make depend depends on it.
+$(PROG).o: $(PROG).c $(PROG)_rev.h

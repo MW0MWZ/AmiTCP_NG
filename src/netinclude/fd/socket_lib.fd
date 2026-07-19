@@ -1,0 +1,72 @@
+*
+* $Id: socket_lib.fd,v 3.3 1994/01/20 02:39:19 jraja Exp $
+*
+* Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>
+*                    Helsinki University of Technology, Finland.
+*                    All rights reserved.
+*
+* fd file for the "bsdsocket.library" version 3
+*
+* Created      : Mon Apr  5 10:19:13 1993 ppessi
+* Last modified: Thu Jan 20 00:50:30 1994 jraja
+*
+*
+##base _SocketBase
+##bias 30
+##public
+*------ BSD Socket System Calls ------
+Socket(domain, type, protocol)(d0/d1/d2)
+Bind(s, name, namelen)(d0/a0/d1)
+Listen(s, backlog)(d0/d1)
+Accept(s, addr, addrlen)(d0/a0/a1)
+Connect(s, name, namelen)(d0/a0/d1)
+SendTo(s, msg, len, flags, to, tolen)(d0/a0/d1/d2/a1/d3)
+Send(s, msg, len, flags)(d0/a0/d1/d2)
+RecvFrom(s, buf, len, flags, from, fromlen)(d0/a0/d1/d2/a1/a2)
+Recv(s, buf, len, flags)(d0/a0/d1/d2)
+Shutdown(s, how)(d0/d1)
+SetSockOpt(s, level, optname, optval, optlen)(d0/d1/d2/a0/d3)
+GetSockOpt(s, level, optname, optval, optlen)(d0/d1/d2/a0/a1)
+GetSockName(s, hostname, namelen)(d0/a0/a1)
+GetPeerName(s, hostname, namelen)(d0/a0/a1)
+*------ Generic System Calls Related to Sockets
+IoctlSocket(d, request, argp)(d0/d1/a0)
+CloseSocket(d)(d0)
+*------ AmiTCP/IP specific stuff ------
+WaitSelect(nfds, readfds, writefds, execptfds, timeout, maskp)(d0/a0/a1/a2/a3/d1)
+SetSocketSignals(SIGINTR, SIGIO, SIGURG)(d0/d1/d2)
+GetDTableSize()()
+ObtainSocket(id, domain, type, protocol)(d0/d1/d2/d3)
+ReleaseSocket(fd, id)(d0/d1)
+ReleaseCopyOfSocket(fd, id)(d0/d1)
+Errno()()
+SetErrnoPtr(errno_p, size)(a0/d0)
+*------ INet library calls related to INet address manipulation ------
+Inet_NtoA(in)(d0)
+Inet_Addr(cp)(a0)
+Inet_LnaOf(in)(d0)
+Inet_NetOf(in)(d0)
+Inet_MakeAddr(net, host)(d0/d1)
+Inet_Network(cp)(a0)
+*------ NetDB Functions ------ 
+GetHostByName(name)(a0)
+GetHostByAddr(addr, len, type)(a0/d0/d1)
+GetNetByName(name)(a0)
+GetNetByAddr(net, type)(d0/d1)
+GetServByName(name, proto)(a0/a1)
+GetServByPort(port, proto)(d0/a0)
+GetProtoByName(name)(a0)
+GetProtoByNumber(proto)(d0) 
+*------ Syslog function ------
+SyslogA(level, format, ap)(d0/a0/a1)
+*------ AmiTCP/IP 2 extensions ------
+Dup2Socket(fd1, fd2)(d0/d1)
+*------ AmiTCP/IP version 3 extensions below ------
+SendMsg(s, msg, flags)(d0/a0/d1)
+RecvMsg(s, msg, flags)(d0/a0/d1)
+*------ Host identification ------
+GetHostName(hostname, size)(a0/d0)
+GetHostId()()
+*------ Socket Base manipulation ------
+SocketBaseTagList(taglist)(a0)
+##end

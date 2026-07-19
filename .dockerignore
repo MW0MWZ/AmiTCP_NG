@@ -1,0 +1,8 @@
+# The Docker build context needs only the sources + docker/ scripts. Exclude the
+# large, runtime-only, and host-specific trees: the emulator system files and
+# working disks (emu/, mounted at run time, some files root-owned by emulator
+# runs), local test programs and logs (tmp/), build outputs (build/), and git.
+emu/
+tmp/
+build/
+.git/

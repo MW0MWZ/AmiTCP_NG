@@ -1,0 +1,14 @@
+# AmiTCP_NG interface configuration -- Commodore A2065 (and compatible) Ethernet.
+#
+# To use: copy this file to DEVS:NetInterfaces/ under the name you want the
+# interface to have (e.g. "eth0"), edit if necessary, then reboot (or run
+# "AddNetInterface DEVS:NetInterfaces/eth0" from a Shell).
+
+device=a2065.device
+unit=0
+
+# Obtain the IP address, netmask, gateway and DNS servers automatically via DHCP.
+configure=dhcp
+
+# Some drivers need a moment after opening before they can be configured.
+requiresinitdelay=no
