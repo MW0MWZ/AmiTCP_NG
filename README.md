@@ -40,7 +40,9 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   `gethostby*_r`, …) with a RAM-tiered **DNS response cache**.
 - **Modern TCP** — **RFC 1323 window scaling + timestamps**; socket buffers, the
   mbuf pool and the DNS cache size to installed RAM, and timestamps gate on the
-  CPU (68020+).
+  CPU (68020+). Initial sequence numbers are randomised per connection
+  (**RFC 6528**, a keyed HalfSipHash of the connection tuple), hardening TCP
+  against off-path spoofing and blind connection injection.
 - **Packet capture (BPF)** — a Berkeley Packet Filter subsystem (the `bpf_*`
   vectors): open a channel, bind it to an interface, set a filter, and read
   captured frames — or inject your own — the raw-packet engine a `tcpdump`/`pcap`
@@ -85,6 +87,12 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   68000/68010). Both are negotiated per connection and degrade cleanly against
   peers that don't offer them — see
   [docs/BUILDING.md](docs/BUILDING.md#throughput-and-memory).
+- **Randomised TCP sequence numbers (RFC 6528).** Each connection's initial
+  sequence number is a keyed HalfSipHash of its address/port 4-tuple plus a
+  per-boot secret, instead of a predictable global counter — hardening TCP
+  against off-path spoofing and blind connection injection. The keyed hash is
+  light (add/rotate/xor, no multiplies) and suited to a 68000; the secret is a
+  best-effort boot seed, as this class of machine has no hardware RNG.
 - **DNS response caching.** A small, RAM-tiered cache in front of the resolver
   remembers successful lookups (honouring each record's TTL) and definitive
   "host not found" results, so repeated `gethostbyname` / `getaddrinfo` calls

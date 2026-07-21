@@ -135,7 +135,8 @@ void
 tcp_init()
 {
 
-	tcp_iss = 1;		/* wrong */
+	tcp_iss = 1;		/* monotonic base M for the RFC 6528 ISN (net/tcp_isn.c) */
+	tcp_isn_init();		/* seed the per-boot ISN secret */
 	tcp_now = 1;		/* RFC 1323 clock; non-zero (0 == "no ts_recent") */
 	tcb.inp_next = tcb.inp_prev = &tcb;
 	if (max_protohdr < sizeof(struct tcpiphdr))

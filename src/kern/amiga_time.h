@@ -109,4 +109,7 @@ struct timeoutRequest * createTimeoutRequest(TimerCallback_t fun,
 void deleteTimeoutRequest(struct timeoutRequest *tr);
 BOOL timer_poll(VOID);
 
+/* Best-effort one-shot entropy seed for the TCP ISN secret (net/tcp_isn.c). */
+void ng_gather_entropy(UBYTE *buf, int len);
+
 #endif /* AMIGA_TIME_H */

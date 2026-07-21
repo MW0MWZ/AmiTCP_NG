@@ -104,6 +104,8 @@ RCS_ID_C="$Id: amiga_time.c,v 1.15 1993/06/04 11:16:15 jraja Exp $";
 
 #include <kern/amiga_includes.h>
 #include <kern/amiga_time.h>
+#include <sys/time.h>		/* get_time()/struct timeval -- ISN entropy seed */
+#include <exec/memory.h>	/* MEMF_* for AvailMem() -- ISN entropy seed */
 
 /*
  * include prototypes for timeout functions
@@ -370,4 +372,53 @@ BOOL timer_poll(VOID)
   }
 
   return FALSE;
+}
+
+/*
+ * ng_gather_entropy() -- fill `buf` (len bytes) with a BEST-EFFORT one-shot seed
+ * for the TCP ISN secret (see net/tcp_isn.c). This machine has no hardware RNG,
+ * no ASLR, and often no battery-backed clock, so this is deliberately best-effort.
+ *
+ * Be honest about where the bits actually come from: the DOMINANT per-boot entropy
+ * is GetSysTime()'s SUB-SECOND field (tw[1]) -- it captures the wall-clock jitter
+ * between power-on and tcp_init() (disk seeks, etc.), on the order of ~15-20 bits.
+ * The library-base pointers (SysBase, TimerBase) and AvailMem() figures are almost
+ * FIXED for a given machine + Kickstart + startup-sequence (no ASLR, a
+ * deterministic bump allocator, the same drivers loaded in the same order), so
+ * they mostly differentiate one MACHINE from another rather than one boot from the
+ * next -- still worth folding in, but do NOT add more static pointers under the
+ * illusion that they add per-boot entropy: they don't.
+ *
+ * It is NOT cryptographic-grade. The goal is only to make the TCP initial sequence
+ * number unguessable to an off-path attacker instead of a counter starting at 1;
+ * the security benefit is bounded by the ~15-20 bits above, but it is real and
+ * differs per boot and per machine. Called once, from tcp_init().
+ */
+void
+ng_gather_entropy(UBYTE *buf, int len)
+{
+  struct timeval tv;
+  ULONG tw[2], v[4], k0, k1;
+  int i;
+
+  get_time(&tv);			/* GetSysTime: the sub-second part varies */
+  bcopy((caddr_t)&tv, (caddr_t)tw, sizeof(tw));	/* secs, micros as two ULONGs */
+
+  /* Fold in a few live pointers and the free-memory sizes (which differ by
+   * machine and by what is loaded at boot) alongside the clock. */
+  v[0] = tw[0] ^ (ULONG)FindTask(NULL);
+  v[1] = tw[1] ^ (ULONG)&tv;
+  v[2] = (ULONG)AvailMem(MEMF_CHIP) ^ (ULONG)SysBase;
+  v[3] = (ULONG)AvailMem(MEMF_FAST) ^ (ULONG)AvailMem(MEMF_LARGEST)
+	 ^ (ULONG)TimerBase;
+
+  k0 = 0x9e3779b9UL ^ v[0];
+  k1 = 0x243f6a88UL ^ v[3];
+  for (i = 0; i < 4; i++) {
+    k0 ^= v[i];   k0 = (k0 << 13) | (k0 >> 19);	/* rotl 13 */
+    k1 += k0;     k1 = (k1 <<  7) | (k1 >> 25);	/* rotl 7  */
+    k0 ^= k1;
+  }
+  for (i = 0; i < len; i++)
+    buf[i] = (UBYTE)(((i & 4) ? k1 : k0) >> ((i & 3) * 8));
 }

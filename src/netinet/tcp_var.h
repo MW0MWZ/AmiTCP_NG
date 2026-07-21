@@ -252,6 +252,9 @@ struct	tcpstat {
 #ifdef KERNEL
 extern struct	inpcb tcb;		/* head of queue of active tcpcb's */
 extern struct	tcpstat tcpstat;	/* tcp statistics */
+
+void	tcp_isn_init(void);		/* seed the per-boot ISN secret (net/tcp_isn.c) */
+tcp_seq	tcp_new_isn(struct tcpcb *tp);	/* RFC 6528 randomised initial send seq # */
 #endif
 
 #endif /* !TCP_VAR_H */

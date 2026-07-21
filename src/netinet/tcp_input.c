@@ -711,8 +711,8 @@ findpcb:
 		if (iss)
 			tp->iss = iss;
 		else
-			tp->iss = tcp_iss;
-		tcp_iss += TCP_ISSINCR/2;
+			tp->iss = tcp_new_isn(tp);	/* RFC 6528 randomised ISN */
+		tcp_iss += TCP_ISSINCR/2;		/* advance the base M */
 		tp->irs = ti->ti_seq;
 		tcp_sendseqinit(tp);
 		tcp_rcvseqinit(tp);

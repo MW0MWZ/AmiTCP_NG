@@ -304,7 +304,8 @@ tcp_usrreq(so, req, m, nam, control)
 		tcpstat.tcps_connattempt++;
 		tp->t_state = TCPS_SYN_SENT;
 		tp->t_timer[TCPT_KEEP] = TCPTV_KEEP_INIT;
-		tp->iss = tcp_iss; tcp_iss += TCP_ISSINCR/2;
+		tp->iss = tcp_new_isn(tp);	/* RFC 6528 randomised ISN */
+		tcp_iss += TCP_ISSINCR/2;	/* advance the base M */
 		tcp_sendseqinit(tp);
 		error = tcp_output(tp);
 		break;

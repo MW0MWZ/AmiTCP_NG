@@ -17,8 +17,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE="$ROOT/build/release/AmiTCP_NG"
 # Project version -- single source of truth is src/bsdsocket.library_rev.h. Names the
-# artifacts AmiTCP_NG-v<Major.Minor.Revision>.{lha,adf}.
-VER="$(grep -E 'define[[:space:]]+AMITCP_NG_VER' "$ROOT/src/bsdsocket.library_rev.h" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+# artifacts AmiTCP_NG-v<version>.{lha,adf}. Reads the FULL quoted string, so any
+# pre-release suffix (e.g. 4.1.1-beta) is preserved in the artifact names and the
+# installer marker, not stripped to the bare Major.Minor.Revision.
+VER="$(grep -E 'define[[:space:]]+AMITCP_NG_VER' "$ROOT/src/bsdsocket.library_rev.h" | sed -E 's/.*"([^"]+)".*/\1/' | head -1)"
 [ -n "$VER" ] || { echo "!!! build-release: could not read AMITCP_NG_VER from src/bsdsocket.library_rev.h" >&2; exit 1; }
 LHA_NAME="AmiTCP_NG-v$VER.lha"
 ADF_NAME="AmiTCP_NG-v$VER.adf"
