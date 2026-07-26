@@ -585,6 +585,44 @@ rexx_gethostname(struct CSource *args, UBYTE **errstrp, struct CSource *res)
   return RETURN_OK;
 }
 
+static UBYTE err_hostname[] = "invalid host name\n";
+
+/*
+ * Validate a host name per RFC 952 / RFC 1123: 1..MAXHOSTNAMELEN characters, each
+ * a letter, digit, '-' or '.'. Dot-separated labels are 1..63 characters, must not
+ * be empty (so no leading, trailing or doubled dots) and must not start or end
+ * with a hyphen. Returns 1 if valid, 0 otherwise. This keeps the configured host
+ * name -- what gethostname() hands to applications -- well-formed rather than
+ * whatever text happened to follow HOSTNAME= in the config file.
+ */
+static int
+ng_hostname_valid(const char *s, int len)
+{
+  int i, label;
+
+  if (len <= 0 || len > MAXHOSTNAMELEN)
+    return 0;
+  for (i = 0, label = 0; i < len; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '.') {
+      if (label == 0 || s[i-1] == '-')		/* empty label, or label ended in '-' */
+	return 0;
+      label = 0;
+      continue;
+    }
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+	  (c >= '0' && c <= '9') || c == '-'))
+      return 0;					/* illegal character */
+    if (label == 0 && c == '-')			/* label starts with a hyphen */
+      return 0;
+    if (++label > 63)				/* label too long */
+      return 0;
+  }
+  if (label == 0 || s[len-1] == '-')		/* trailing dot, or ends in a hyphen */
+    return 0;
+  return 1;
+}
+
 LONG
 rexx_sethostname(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 {
@@ -592,7 +630,22 @@ rexx_sethostname(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 
   if (ReadItem((UBYTE *)Buffer, sizeof(Buffer), args) <= 0) {
     *errstrp = ERR_SYNTAX;
-    return RETURN_ERROR;
+    return RETURN_WARN;		/* skip this bad line, keep parsing the rest of the config */
+  }
+
+  /*
+   * PORT (AmiTCP_NG): validate the configured host name so gethostname() only ever
+   * returns a well-formed name -- reject config-file junk rather than storing it.
+   * RETURN_WARN (not RETURN_ERROR): the config reader treats RETURN_ERROR as fatal
+   * and aborts the WHOLE file -- a single bad HOSTNAME= would then stop the stack
+   * from initialising. RETURN_WARN prints the error, skips just this line, and
+   * leaves host_name at its prior/default value (sethostname() is not called here).
+   * (A trailing-dot FQDN root like "amiga." is deliberately rejected: this is a
+   * host-name label store, not a resolver query string.)
+   */
+  if (!ng_hostname_valid(Buffer, (int)strlen(Buffer))) {
+    *errstrp = err_hostname;
+    return RETURN_WARN;
   }
 
   /*

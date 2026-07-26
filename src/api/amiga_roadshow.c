@@ -402,7 +402,21 @@ ng_flush_dynamic_nameservers(void)
 #define IFC_DestinationAddress	(IFC_BASE + 3)	/* STRPTR (point-to-point) */
 #define IFC_BroadcastAddress	(IFC_BASE + 4)	/* STRPTR                  */
 #define IFC_Metric		(IFC_BASE + 5)	/* LONG routing metric     */
+#define IFC_MTU			(IFC_BASE + 6)	/* LONG interface MTU (B)  */
 #define IFC_State		(IFC_BASE + 8)	/* LONG, one of SM_*       */
+
+/*
+ * AmiTCP_NG-private creation tags for AddInterfaceTagList(): the SANA-II receive /
+ * transmit request-pool sizes, from the interface config's iprequests= /
+ * writerequests= keys. A private TAG_USER range well outside Roadshow's
+ * IFC_/CAAMTA_/IFA_/... ranges -- these only pass between AmiTCP_NG's own
+ * AddNetInterface command and this library. Absent / 0 = use the RAM-tiered
+ * default (net/sana2config.c). MUST match the definitions in src/tools/ng_lvo.h.
+ */
+#define NGCT_IPRequests		(TAG_USER + 0x004E4701)	/* LONG receive requests */
+#define NGCT_WriteRequests	(TAG_USER + 0x004E4702)	/* LONG send requests    */
+#define NGCT_TcpSendspace	(TAG_USER + 0x004E4703)	/* LONG TCP send buffer  */
+#define NGCT_TcpRecvspace	(TAG_USER + 0x004E4704)	/* LONG TCP recv buffer  */
 
 /* IFC_State values (Roadshow SM_* interface-state machine). */
 #define NG_SM_Offline	0
@@ -535,6 +549,29 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
       e = ifioctl(so, SIOCSIFMETRIC, (caddr_t)&ifr);
       break;
     }
+    case IFC_MTU: {
+      /*
+       * Set the interface MTU. The SANA-II read buffers were posted at the device's
+       * hardware MTU when the interface attached, so the MTU may only be LOWERED from
+       * there (a smaller MTU just fragments sooner; the device cannot carry larger
+       * frames). Clamp to the device's reported maximum and to the IPv4 minimum (68);
+       * ignore anything sillier. if_mtu is a short.
+       *
+       * The ceiling is the SANA softc's ss_maxmtu -- cached once at attach and NEVER
+       * mutated -- NOT the live ifp->if_mtu: this call is shared with the public
+       * ConfigureInterfaceTagList LVO, so using the live (possibly already-lowered)
+       * if_mtu as its own ceiling would ratchet the MTU down permanently and make a
+       * later "raise it back to 1500" silently clamp to the lowered value. For a
+       * non-SANA interface (loopback) there is no device ceiling, so honour as given.
+       */
+      long m = (long)ti->ti_Data;
+      long ceil = (ifp->if_type == IFT_SANA)
+		  ? (long)((struct sana_softc *)ifp)->ss_maxmtu : 0;
+      if (ceil > 0 && m > ceil) m = ceil;
+      if (m >= 68)
+	ifp->if_mtu = (short)m;
+      break;
+    }
     case IFC_State: {
       struct ifreq ifr;
       short flags = ifp->if_flags;
@@ -602,7 +639,8 @@ LONG SAVEDS RAF3(_ConfigureInterfaceTagList,
  * success, -1 + errno (EADDRINUSE if the name is taken, ENXIO if the device
  * could not be opened).
  */
-extern struct ifnet *sana_add_interface(char *ifname, char *devname, long devunit);
+extern struct ifnet *sana_add_interface(char *ifname, char *devname, long devunit,
+					long ipreq, long wreq);
 
 LONG SAVEDS RAF5(_AddInterfaceTagList,
 		 struct SocketBase *,	libPtr,		a6,
@@ -614,6 +652,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
 {
 #endif
   int error;
+  long ipreq, wreq;
 
   CHECK_TASK();
 
@@ -629,8 +668,50 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
     writeErrnoValue(libPtr, EADDRINUSE);	/* interface already exists */
     return (-1);
   }
+  /*
+   * Pull the SANA-II request-pool sizes out of the tag list before creating the
+   * interface (they size the read/write ring at creation). Absent = 0 = the
+   * RAM-tiered default. ng_apply_iface_config() below ignores these private tags.
+   */
+  { struct TagItem *ti, *tstate = tags;
+    long sndsp = 0, rcvsp = 0;
+    ipreq = wreq = 0;
+    while ((ti = ng_nexttag(&tstate)) != NULL) {
+      if (ti->ti_Tag == NGCT_IPRequests)         ipreq = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_WriteRequests) wreq  = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpSendspace)  sndsp = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpRecvspace)  rcvsp = (long)ti->ti_Data;
+    }
+    /*
+     * Honour an explicit tcp.sendspace= / tcp.recvspace= from the interface config by
+     * overriding the RAM-tiered socket-buffer defaults (absent = 0 = keep the tier).
+     *
+     * IMPORTANT -- these are GLOBAL, not per-interface: tcp_sendspace/tcp_recvspace and
+     * sb_max are process-wide and read at socket attach (soreserve in tcp_attach) for
+     * EVERY socket, whichever interface it is later routed over (a BSD socket is not
+     * bound to an interface at creation). So this key on one interface's config sets
+     * the default for the whole stack. Semantics, matching Roadshow's model: LAST
+     * writer wins if several interfaces set it, and the value PERSISTS until reboot
+     * (RemoveInterface does not restore the tiered default). It also lifts the RAM-tier
+     * safety cap for the whole machine -- deliberately, since it is an explicit user
+     * override -- so document "only set this if you mean it" in the config (we do).
+     *
+     * Raise sb_max to cover the larger of the two so soreserve()'s sb_max ceiling does
+     * not clip the reservation, and so the window-scale shift (grown from the socket's
+     * receive high-water) can match a larger recvspace. The AddNetInterface tool clamps
+     * the values (<= 1 MB), so this cannot drive sb_max to an absurd size; a request an
+     * mbuf pool cannot satisfy fails cleanly at soreserve (ENOBUFS), it does not crash.
+     */
+    if (sndsp > 0 || rcvsp > 0) {
+      extern u_long tcp_sendspace, tcp_recvspace, sb_max;
+      if (sndsp > 0) tcp_sendspace = (u_long)sndsp;
+      if (rcvsp > 0) tcp_recvspace = (u_long)rcvsp;
+      if (tcp_sendspace > sb_max) sb_max = tcp_sendspace;
+      if (tcp_recvspace > sb_max) sb_max = tcp_recvspace;
+    }
+  }
   if (sana_add_interface((char *)interface_name, (char *)device_name,
-			 (long)unit) == NULL) {
+			 (long)unit, ipreq, wreq) == NULL) {
     ReleaseSyscallSemaphore(libPtr);
     writeErrnoValue(libPtr, ENXIO);		/* could not open the device */
     return (-1);

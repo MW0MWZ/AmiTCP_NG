@@ -52,7 +52,15 @@ struct Library *SocketBase;
 #define TU                      0x80000000UL	/* TAG_USER */
 #define IFC_Address             (TU + 1801)
 #define IFC_NetMask             (TU + 1802)
+#define IFC_MTU                 (TU + 1806)
 #define IFC_State               (TU + 1808)
+/* AmiTCP_NG-private creation tags for the SANA-II read/write request-pool sizes
+ * (iprequests=/writerequests=) and the TCP socket-buffer overrides
+ * (tcp.sendspace=/tcp.recvspace=). MUST match the defs in src/api/amiga_roadshow.c. */
+#define NGCT_IPRequests         (TU + 0x004E4701UL)
+#define NGCT_WriteRequests      (TU + 0x004E4702UL)
+#define NGCT_TcpSendspace       (TU + 0x004E4703UL)
+#define NGCT_TcpRecvspace       (TU + 0x004E4704UL)
 #define SM_Up                   3
 #define RTA_DefaultGateway      (TU + 1603)
 #define CAAMTA_RouterTableSize  (TU + 2006)
@@ -160,7 +168,20 @@ struct ifcfg {
   char ns[MAXNS][VALLEN];
   int  nns;
   int  initdelay;
+  long ipreq;                /* iprequests=    (0 = use the stack's RAM-tiered default) */
+  long wreq;                 /* writerequests= (0 = use the stack's RAM-tiered default) */
+  long mtu;                  /* mtu=           (0 = use the device's reported MTU)      */
+  long sendspace;            /* tcp.sendspace= (0 = use the stack's RAM-tiered default) */
+  long recvspace;            /* tcp.recvspace= (0 = use the stack's RAM-tiered default) */
 };
+
+/* Parse a non-negative decimal from val, stopping at the first non-digit. */
+static long ng_atol(const char *val)
+{
+  long v = 0; int n;
+  for (n = 0; val[n] >= '0' && val[n] <= '9'; n++) v = v * 10 + (val[n] - '0');
+  return v;
+}
 
 /* Parse one keyword=value (or "keyword value") line into cfg. */
 static void parse_line(char *line, struct ifcfg *cfg)
@@ -192,6 +213,18 @@ static void parse_line(char *line, struct ifcfg *cfg)
   else if (ci_eq(kw, "domain"))    s_copy(cfg->domain, val, VALLEN);
   else if (ci_eq(kw, "nameserver")){ if (cfg->nns < MAXNS) s_copy(cfg->ns[cfg->nns++], val, VALLEN); }
   else if (ci_eq(kw, "requiresinitdelay")) cfg->initdelay = ci_eq(val, "yes");
+  /* Clamp to 65535: the stack stores these in a UWORD ring field, so an oversized
+   * value would otherwise silently wrap (e.g. 100000 -> 34464) with no diagnostic. */
+  else if (ci_eq(kw, "iprequests"))    { cfg->ipreq = 0; for (n=0; val[n] >= '0' && val[n] <= '9'; n++) cfg->ipreq = cfg->ipreq*10 + (val[n]-'0'); if (cfg->ipreq > 65535) cfg->ipreq = 65535; }
+  else if (ci_eq(kw, "writerequests")) { cfg->wreq  = 0; for (n=0; val[n] >= '0' && val[n] <= '9'; n++) cfg->wreq  = cfg->wreq*10 + (val[n]-'0'); if (cfg->wreq  > 65535) cfg->wreq  = 65535; }
+  /* mtu= (bytes): the stack stores if_mtu in a short and clamps to the device MTU, so
+   * cap at 32767 here to keep the value non-negative in the tag. */
+  else if (ci_eq(kw, "mtu"))           { cfg->mtu = ng_atol(val); if (cfg->mtu > 32767) cfg->mtu = 32767; }
+  /* tcp.sendspace= / tcp.recvspace= (bytes): override the RAM-tiered socket buffers.
+   * Cap at 1 MB -- far above any sensible 68k window and enough headroom to raise
+   * sb_max in the stack without risking an absurd allocation. */
+  else if (ci_eq(kw, "tcp.sendspace")) { cfg->sendspace = ng_atol(val); if (cfg->sendspace > 1048576) cfg->sendspace = 1048576; }
+  else if (ci_eq(kw, "tcp.recvspace")) { cfg->recvspace = ng_atol(val); if (cfg->recvspace > 1048576) cfg->recvspace = 1048576; }
   /* unknown keywords are ignored (forward-compatible, like Roadshow) */
 }
 
@@ -202,6 +235,7 @@ static int read_cfg(const char *path, struct ifcfg *cfg)
   BPTR  fh;
 
   cfg->unit = 0; cfg->dhcp = 0; cfg->have_address = 0; cfg->nns = 0; cfg->initdelay = 0;
+  cfg->ipreq = 0; cfg->wreq = 0; cfg->mtu = 0; cfg->sendspace = 0; cfg->recvspace = 0;
   cfg->device[0] = cfg->address[0] = cfg->netmask[0] = cfg->gateway[0] = cfg->domain[0] = '\0';
 
   fh = Open((STRPTR)path, MODE_OLDFILE);
@@ -252,6 +286,8 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
 {
   char  devpath[VALLEN];
   long  r, i;
+  struct TagItem ct[12];	/* creation tags: NGCT counts + MTU/buffers (+ static IFC_*) */
+  int   nc = 0;
 
   /* Pass the driver name to the stack exactly as the config gives it. The stack
    * resolves it (bare name -> a resident driver like wifipi.device; else the
@@ -260,13 +296,27 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
    * failed with ENXIO, so we no longer do that. */
   s_copy(devpath, cfg->device, sizeof(devpath));
 
+  /* Honour iprequests=/writerequests= by passing them as private creation tags so
+   * the stack sizes the SANA-II read/write ring accordingly (0 = unset -> the
+   * stack's RAM-tiered default). This prefix is shared by both creation paths. */
+  if (cfg->ipreq > 0) { ct[nc].ti_Tag = NGCT_IPRequests;    ct[nc].ti_Data = (ULONG)cfg->ipreq; nc++; }
+  if (cfg->wreq  > 0) { ct[nc].ti_Tag = NGCT_WriteRequests; ct[nc].ti_Data = (ULONG)cfg->wreq;  nc++; }
+
+  /* tcp.sendspace=/tcp.recvspace= override the stack's global socket buffers, and
+   * mtu= sets the interface MTU. All three are honoured on both the DHCP and the
+   * static path, so they go in the shared prefix. 0 = unset -> keep the default. */
+  if (cfg->sendspace > 0) { ct[nc].ti_Tag = NGCT_TcpSendspace; ct[nc].ti_Data = (ULONG)cfg->sendspace; nc++; }
+  if (cfg->recvspace > 0) { ct[nc].ti_Tag = NGCT_TcpRecvspace; ct[nc].ti_Data = (ULONG)cfg->recvspace; nc++; }
+  if (cfg->mtu       > 0) { ct[nc].ti_Tag = IFC_MTU;           ct[nc].ti_Data = (ULONG)cfg->mtu;       nc++; }
+
   if (cfg->dhcp) {
     /* --- DHCP: add the interface unaddressed, then let the stack lease one. --- */
     struct MsgPort *port;
     struct AAMX    *aam = 0;
     struct TagItem  tg[4];
 
-    r = add_iface(ifname, devpath, cfg->unit, (void *)0, quiet);
+    ct[nc].ti_Tag = TAG_END; ct[nc].ti_Data = 0;
+    r = add_iface(ifname, devpath, cfg->unit, (void *)ct, quiet);
     if (r != 0) { if (!quiet) Printf((STRPTR)"%s: AddInterface failed, errno %ld\n", (LONG)ifname, v_errno()); return r; }
     if (cfg->initdelay) Delay(150);          /* ~3s device warm-up */
 
@@ -302,17 +352,16 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
     return r;
   } else {
     /* --- Static (or unconfigured if no address given). --------------------- */
-    struct TagItem it[4];
-    int n = 0;
+    int n = nc;   /* continue after the NGCT request-count prefix */
 
     if (cfg->have_address) {
-      it[n].ti_Tag = IFC_Address; it[n].ti_Data = (ULONG)cfg->address; n++;
-      if (cfg->netmask[0]) { it[n].ti_Tag = IFC_NetMask; it[n].ti_Data = (ULONG)cfg->netmask; n++; }
-      it[n].ti_Tag = IFC_State; it[n].ti_Data = SM_Up; n++;
+      ct[n].ti_Tag = IFC_Address; ct[n].ti_Data = (ULONG)cfg->address; n++;
+      if (cfg->netmask[0]) { ct[n].ti_Tag = IFC_NetMask; ct[n].ti_Data = (ULONG)cfg->netmask; n++; }
+      ct[n].ti_Tag = IFC_State; ct[n].ti_Data = SM_Up; n++;
     }
-    it[n].ti_Tag = TAG_END; it[n].ti_Data = 0;
+    ct[n].ti_Tag = TAG_END; ct[n].ti_Data = 0;
 
-    r = add_iface(ifname, devpath, cfg->unit, cfg->have_address ? (void *)it : (void *)0, quiet);
+    r = add_iface(ifname, devpath, cfg->unit, (void *)ct, quiet);
     if (r != 0) { if (!quiet) Printf((STRPTR)"%s: AddInterface failed, errno %ld\n", (LONG)ifname, v_errno()); return r; }
     if (cfg->initdelay) Delay(150);
 

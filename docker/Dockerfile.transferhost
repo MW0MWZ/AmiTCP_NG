@@ -1,0 +1,46 @@
+# AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
+#
+# Transfer-test host: Samba (SMB2) + FTP + Fitz in ONE container, all serving the
+# same directory, so we can measure AmiTCP_NG bulk-transfer throughput from an
+# Amiga guest (the methods the community actually uses -- see GitHub issue #1).
+# Test infrastructure only -- never shipped in a release.
+#
+# Build:  docker build -f docker/Dockerfile.transferhost -t amitcp-ng-transferhost docker
+# Run:    ./docker/run-transferhost.sh          (see docker/README.transferhost.md)
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      samba samba-common-bin smbclient \
+      vsftpd \
+      socat \
+      build-essential mercurial pkg-config libfuse3-dev ca-certificates \
+      procps iproute2 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Fitz: symmetric P2P file server/mounter, its own protocol, TCP port 17711,
+# MIT-licensed (Aminet comm/tcp/Fitz).  Best-effort: its source is a personal Hg
+# server, so a fetch/build failure must NOT sink Samba+FTP -- mark it and carry on;
+# the entrypoint skips `fitz serve` if the marker is present. ---
+RUN (hg clone http://home.sm41.de/projects/fitz /tmp/fitz \
+      && make -C /tmp/fitz all \
+      && make -C /tmp/fitz install \
+      && rm -rf /tmp/fitz) \
+    || touch /FITZ_UNAVAILABLE
+
+# Local FTP user (simplest robust FTP: a real user chrooted to the share).
+# vsftpd's PAM stack includes pam_shells, which rejects a login unless the user's
+# shell is listed in /etc/shells -- so add nologin there (standard FTP-only-user fix).
+RUN useradd -m -d /srv/share -s /usr/sbin/nologin amiga \
+    && echo 'amiga:amiga' | chpasswd \
+    && echo '/usr/sbin/nologin' >> /etc/shells \
+    && chmod 0755 /srv/share
+
+COPY transferhost-smb.conf     /etc/samba/smb.conf
+COPY transferhost-vsftpd.conf  /etc/vsftpd.conf
+COPY transferhost-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# SMB (445/139), FTP (21 + passive range), Fitz (17711),
+# raw TCP throughput SOURCE (9000, streams zeros) + SINK (9001, discards)
+EXPOSE 139 445 21 17711 30000-30009 9000 9001
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

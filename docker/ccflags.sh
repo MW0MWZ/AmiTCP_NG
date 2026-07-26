@@ -12,7 +12,12 @@ GCCINC=/opt/m68k-amigaos/lib/gcc/m68k-amigaos/6.5.0b/include
 # tasks (e.g. NETTRACE log_task), which hung the stack; libnix has no such need.
 NG_INC="-nostdinc -Isrc/netinclude -Isrc -Isrc/conf -Isrc/protos -isystem $NDK -isystem $LIBNIX -isystem $SYSINC -isystem $GCCINC"
 NG_DEF="-DAMITCP -DKERNEL -DSOCKBUF_DEBUG -DTCPDEBUG -DDIRECTED_BROADCAST -DICMPPRINTFS"
+# CPU target multilib. Default -m68000 (runs on every 68k, the "standard" build).
+# build-release.sh overrides NG_ARCH (-m68020 / -m68040) to ship pre-tuned variants;
+# it is applied to BOTH compile (codegen) and link (libgcc multilib), so an 020/040
+# build actually emits 020/040 instructions, not just links the 000 objects.
+NG_ARCH="${NG_ARCH:--m68000}"
 # -Wall -Werror: the whole stack core compiles warning-clean; keep it that way --
 # a new warning fails the build instead of being silently swallowed by build.sh.
-NG_CFLAGS="-noixemul -std=gnu89 -fno-builtin -O1 -fomit-frame-pointer -Wall -Werror"
+NG_CFLAGS="-noixemul -std=gnu89 -fno-builtin -O1 -fomit-frame-pointer -Wall -Werror $NG_ARCH"
 NG_FORCEINC="-include src/conf/rcs.h -include src/conf/amitcp_ng_bases.h"

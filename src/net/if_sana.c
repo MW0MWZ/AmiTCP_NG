@@ -650,10 +650,12 @@ iface_make(struct ssconfig *ifc)
  * cleans up entirely after itself on that path, leaving no phantom interface.
  */
 struct ifnet *
-sana_add_interface(char *ifname, char *devname, long devunit)
+sana_add_interface(char *ifname, char *devname, long devunit,
+		   long ipreq, long wreq)
 {
   struct ssconfig ssc;
   LONG unit_val = devunit;
+  LONG ipreq_val = ipreq, wreq_val = wreq;
   int i;
 
   aligned_bzero_const((caddr_t)&ssc, sizeof ssc);
@@ -670,6 +672,14 @@ sana_add_interface(char *ifname, char *devname, long devunit)
   ssc.args->a_name = (UBYTE *)ssc.name;
   ssc.args->a_dev  = (UBYTE *)devname;
   ssc.args->a_unit = &unit_val;
+  /*
+   * PORT (AmiTCP_NG): honour an explicit iprequests=/writerequests= from the
+   * interface config (0 = unset -> ssconfig() uses the RAM-tiered default in
+   * net/sana2config.c). a_ipno/a_writeno are LONG* into these locals, which stay
+   * valid for the synchronous iface_make() call below.
+   */
+  if (ipreq > 0) ssc.args->a_ipno    = &ipreq_val;
+  if (wreq  > 0) ssc.args->a_writeno = &wreq_val;
   /* All other ssc_args fields remain 0/NULL => ssconfig() uses wire defaults. */
 
   return iface_make(&ssc);

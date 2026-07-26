@@ -168,11 +168,23 @@ extern const char wrongTaskErrorFmt[];
     return;						\
   }      
 
+/*
+ * PORT (AmiTCP_NG) fix: wrapped in do { } while (0). This macro expands to
+ * multiple statements ending in `return`; unwrapped, `if (cond) API_STD_RETURN(e,
+ * r);` bound only the inner `if (e == 0) return r;` to the guard, leaving
+ * `writeErrnoValue(); return -1;` to run UNCONDITIONALLY. That silently broke
+ * gethostname() -- its `if (namelen <= 0) API_STD_RETURN(EINVAL, 0);` made every
+ * call return -1 without touching the buffer. (It was the only if-guarded use; the
+ * other ~25 are standalone statements, unaffected.) The do/while makes it a single
+ * statement, correct in every context.
+ */
 #define API_STD_RETURN(error, ret)	\
-  if (error == 0)			\
-    return ret;				\
-  writeErrnoValue(libPtr, error);	\
-  return -1;
+  do {					\
+    if (error == 0)			\
+      return ret;			\
+    writeErrnoValue(libPtr, error);	\
+    return -1;				\
+  } while (0)
 						
 /*
  * getSock() gets a socket referenced by given filedescriptor if exists,

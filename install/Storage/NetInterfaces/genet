@@ -1,0 +1,38 @@
+# AmiTCP_NG interface configuration -- PiStorm Gigabit Ethernet (genet.device, ~1 Gbit).
+#
+# To use: copy this file to DEVS:NetInterfaces/ under the name you want the
+# interface to have (e.g. "eth0"), edit if necessary, then reboot (or run
+# "AddNetInterface DEVS:NetInterfaces/eth0" from a Shell).
+
+device=genet.device
+unit=0
+
+# Obtain the IP address, netmask, gateway and DNS servers automatically via DHCP.
+configure=dhcp
+
+# Wired driver -- no warm-up needed before configuring.
+requiresinitdelay=no
+
+# --- Performance: size the SANA-II receive/transmit rings for a ~1 Gbit link. ---
+# At gigabit the driver delivers bursts far faster than a 68k can process them. If
+# the receive ring is too shallow a burst overruns it and is dropped AT THE DRIVER,
+# which makes TCP retransmit and collapses throughput -- the main cause of slow
+# downloads on a fast NIC. A deep ring absorbs the burst. Each receive request pins
+# one MTU-sized buffer (~2 KB), so 256 reads is ~0.5 MB of RAM -- fine on a big-RAM
+# PiStorm-class machine. Transmit requests are cheap (no pinned buffer).
+#
+# Leave these OUT to let AmiTCP_NG auto-size the rings by installed RAM instead.
+# These are generous starting points for gigabit -- tune to taste.
+iprequests=256
+writerequests=256
+
+# --- Optional overrides (uncomment only if you specifically need them) -----------
+# mtu=1500              Interface MTU. 1500 is already the Ethernet default; you only
+#                       need this to LOWER it for a link that requires a smaller MTU.
+# tcp.sendspace=262144  TCP send/receive socket buffers, in bytes. These are STACK-WIDE
+# tcp.recvspace=262144  (like Roadshow): they set the default for every connection on the
+#                       machine, not just this interface, and persist until reboot. LEAVE
+#                       THEM OUT on a fast machine -- AmiTCP_NG already auto-sizes them by
+#                       RAM (up to ~256 KB on 32 MB+, with window scaling), bigger than the
+#                       classic 64 KB Roadshow figure; a SMALLER value here would REDUCE
+#                       throughput. Only set them to force a size (e.g. to cap memory).

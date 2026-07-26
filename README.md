@@ -140,6 +140,103 @@ Installer Novice / Intermediate / Expert choice):
 Reboot when the installer finishes. End-user details are in
 [install/ReadMe](install/ReadMe).
 
+## Configuring your network from cold
+
+AmiTCP_NG is configured the same way as Roadshow, so existing configurations work
+unchanged. There are two pieces: a **per-interface** file that says which hardware
+to use and how to get an address, and an optional **stack** file for global
+settings. In most cases the interface file is all you need.
+
+### 1. Describe your interface — `DEVS:NetInterfaces/<name>`
+
+Create one text file per network interface. **The file's name is the interface
+name** (so `DEVS:NetInterfaces/eth0` defines interface `eth0`). The simplest
+possible file — get everything (address, netmask, router, DNS) from DHCP:
+
+```
+device=a2065.device
+configure=dhcp
+```
+
+Or a fixed (static) address instead:
+
+```
+device=a2065.device
+address=192.168.0.10
+netmask=255.255.255.0
+gateway=192.168.0.1
+nameserver=192.168.0.1
+```
+
+Settings AmiTCP_NG acts on:
+
+| Key                  | Meaning |
+|----------------------|---------|
+| `device=`            | **Required.** SANA-II driver. A bare name resolves to `DEVS:Networks/<name>`; a resident driver name (e.g. `wifipi.device`) is used directly. |
+| `unit=`              | Device unit number (default `0`). |
+| `configure=dhcp`     | Lease the address / netmask / router / DNS via DHCP. Omit for a static setup. |
+| `address=`           | Static IPv4 address. |
+| `netmask=`           | Static subnet mask. |
+| `gateway=`           | Default-route gateway. |
+| `nameserver=`        | A DNS server. Repeat the line for more than one. |
+| `domain=`            | Default domain name. |
+| `requiresinitdelay=yes` | Pause briefly after opening the device (some hardware needs a warm-up before it will configure). |
+
+Roadshow keys that AmiTCP_NG does not act on (`iprequests`, `writerequests`,
+`filter`, `configure=auto/fastauto`, `debug`) are accepted and ignored, so a
+Roadshow interface file drops in without edits.
+
+### 2. Bring it up
+
+```
+AddNetInterface eth0
+```
+
+`AddNetInterface` reads `DEVS:NetInterfaces/eth0` and brings the interface up —
+running the DHCP handshake or applying the static address as the file dictates.
+After that, `Online`/`Offline` toggle it, and `ShowNetStatus` reports the current
+state. A full install also drops in a boot-time `S:Network-Startup` script that
+does this for you at startup.
+
+### 3. Stack-wide settings — `AmiTCP:db/AmiTCP.config`
+
+Optional. One `NAME=VALUE` per line; `#` starts a comment. Read once when the stack
+starts. The knobs worth knowing:
+
+| Setting                | Meaning |
+|------------------------|---------|
+| `HOSTNAME=<name>`      | The host's own name — what `gethostname()` returns to applications. |
+| `USELOOPBACK=YES`      | Bring up the `127.0.0.1` loopback interface (recommended; the default). |
+| `USENAMESERVER=SECOND` | DNS resolution order: `NO` (local hosts table only), `FIRST` (ask DNS first), `SECOND` (local table first, then DNS). |
+| `GATEWAY=NO`           | Whether to forward IP between interfaces (act as a router). |
+| `TCP_SENDSPACE=<bytes>`| TCP send-buffer size (overrides the auto-tuned default; see below). |
+| `TCP_RECVSPACE=<bytes>`| TCP receive-buffer size (overrides the auto-tuned default). |
+
+A minimal example:
+
+```
+useloopback=YES
+HOSTNAME=my-amiga
+```
+
+### 4. It tunes itself to your machine
+
+You normally do **not** need to touch the buffer sizes — AmiTCP_NG sizes them to the
+hardware it finds at startup, so it stays lean on a small machine and opens up on a
+big one:
+
+| Installed RAM     | TCP buffers | Notes |
+|-------------------|-------------|-------|
+| ≤ 1 MB (e.g. 512K A500) | ~16 KB | Lean enough to still boot. |
+| 2–4 MB            | ~61 KB | Stock. |
+| 8–16 MB           | ~128 KB | RFC 1323 window scaling engages. |
+| 32 MB+ (PiStorm-class) | ~256 KB | Large scaled windows. |
+
+It also matches the CPU: RFC 1323 **timestamps** are enabled on a 68020 or better
+and left off on a bare 68000/68010 (where the per-segment cost is not worth it);
+window scaling is on everywhere. The `TCP_SENDSPACE`/`TCP_RECVSPACE` settings above
+override these defaults if you want to tune by hand.
+
 ## Build & test
 
 Everything runs in disposable Docker containers — you need only Docker on the

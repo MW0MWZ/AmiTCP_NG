@@ -399,7 +399,28 @@ ssconfig(struct sana_softc *ifp, struct ssconfig *ifc)
   }
   
   ifp->ss_ip.type = args->a_iptype ? *args->a_iptype : wd->wd_iptype;
-  reqtotal += ifp->ss_ip.reqno = args->a_ipno ? *args->a_ipno : wd->wd_ipno;
+  /*
+   * PORT (AmiTCP_NG): size the SANA-II receive ring to the RAM tier, mirroring the
+   * transmit if_snd sizing in net/if_sana.c. The stock wire default posts only 16
+   * CMD_READ buffers; on a fast link (accelerated machine / gigabit driver) a burst
+   * that overruns the ring is dropped at the driver -> TCP retransmit -> throughput
+   * collapse (GitHub issue #1 -- the receive-side mirror of the transmit tail-drop
+   * fixed earlier). Scale the ring to about one receive window of MSS-sized frames
+   * (tcp_recvspace / MTU; tcp_recvspace is set per tier by ng_ram_tier at init,
+   * before any interface is configured), floored at the wire default so small
+   * machines stay lean, and capped so pinned receive-buffer memory stays bounded.
+   * An explicit iprequests= (a_ipno) from the interface config always wins.
+   */
+  if (args->a_ipno) {
+    reqtotal += ifp->ss_ip.reqno = *args->a_ipno;
+  } else {
+    extern u_long tcp_recvspace;
+    long mtu  = ifp->ss_if.if_mtu ? (long)ifp->ss_if.if_mtu : 1500;  /* real MTU, like if_snd */
+    long ipno = (long)(tcp_recvspace / (u_long)mtu);   /* ~one window in MSS-sized frames */
+    if (ipno < wd->wd_ipno) ipno = wd->wd_ipno;   /* never below the wire default (16) */
+    if (ipno > 256)         ipno = 256;           /* bound pinned receive memory     */
+    reqtotal += ifp->ss_ip.reqno = ipno;
+  }
 
   ifp->ss_arp.type = args->a_arptype ? *args->a_arptype : wd->wd_arptype;
   reqtotal += ifp->ss_arp.reqno = args->a_arpno ? *args->a_arpno : wd->wd_arpno;

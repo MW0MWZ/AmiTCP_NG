@@ -439,6 +439,20 @@ ng_ram_tier(void)
     udp_recvspace = 41600;
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
   }
+
+  /*
+   * Match the IP input queue depth to the receive ring (see the SANA read-ring
+   * sizing in net/sana2config.c) so ipintrq does not become the new drop point on a
+   * fast link once the ring is deep. Same tcp_recvspace-derived scale, floored at
+   * the IFQ_MAXLEN default and capped. Runs before ip_init() copies ipqmaxlen into
+   * ipintrq.ifq_maxlen.
+   */
+  { extern int ipqmaxlen;
+    long q = (long)(tcp_recvspace / 1500UL);
+    if (q < 50)  q = 50;		/* never below the IFQ_MAXLEN default */
+    if (q > 256) q = 256;
+    ipqmaxlen = (int)q;
+  }
 }
 
 /*

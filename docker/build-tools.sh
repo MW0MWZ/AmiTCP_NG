@@ -6,12 +6,13 @@
 # drop-in tool set (Roadie, NetMon and existing scripts drive them unchanged). Output
 # binaries land in build/ (NOT committed -- compiled artifacts, release only).
 #
-# Each is a plain MC68000, -noixemul build. The route/interface/status tools share
-# src/tools/ng_lvo.h, so they compile with -Isrc/tools.
+# A -noixemul build. The route/interface/status tools share src/tools/ng_lvo.h, so
+# they compile with -Isrc/tools. NG_ARCH selects the CPU multilib (default -m68000);
+# build-release.sh sets -m68020/-m68040 to match the library variant it is packaging.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC="$ROOT/docker/cc.sh m68k-amigaos-gcc"
-CFLAGS="-noixemul -O2 -m68000 -Wall -Werror -Isrc/tools -Isrc"
+CFLAGS="-noixemul -O2 ${NG_ARCH:--m68000} -Wall -Werror -Isrc/tools -Isrc"
 
 echo ">>> building AmiTCP_NG tools ..."
 

@@ -24,12 +24,12 @@ if ! "$ROOT/docker/build.sh" >"$BUILD_LOG" 2>&1; then
   exit 1
 fi
 rm -f "$BUILD_LOG"
-docker run --rm -v "$ROOT":/work -w /work "$IMG" bash -c '
+docker run --rm -e NG_ARCH -v "$ROOT":/work -w /work "$IMG" bash -c '
   source docker/ccflags.sh
   m68k-amigaos-gcc -c src/lib/bsdsocket_lib.c -o build/obj/bsdsocket_lib.o \
       $NG_INC -Isrc $NG_DEF $NG_CFLAGS
   cd build/obj
-  m68k-amigaos-gcc -noixemul -m68000 -nostartfiles -e _start \
+  m68k-amigaos-gcc -noixemul $NG_ARCH -nostartfiles -e _start \
       -o /work/build/bsdsocket.library *.o \
       -Wl,--allow-multiple-definition \
       /opt/m68k-amigaos/m68k-amigaos/lib/libamiga.a
