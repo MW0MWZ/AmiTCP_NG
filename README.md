@@ -65,8 +65,8 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   DNS-server management, interface configuration/query/enumeration, routing,
   network statistics + system status, RoadshowData tunables, kernel `mbuf`
   access, the `get*ent` database iterators, `getaddrinfo`/`getnameinfo`,
-  reentrant `gethostby*`, and a working **DHCP client**), plus its capability
-  flags.
+  reentrant `gethostby*`, the host-name query **`gethostname()`**, and a working
+  **DHCP client**), plus its capability flags.
 - **Zero-configuration networking (RFC 3927).** When DHCP finds no server, the
   interface automatically self-assigns an IPv4 link-local address
   (`169.254.x.y`) — ARP-probed for uniqueness, announced, and defended against
@@ -82,10 +82,12 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 - **Machine-adaptive TCP performance.** Full **RFC 1323 window scaling and
   timestamps**, so a single connection can scale past the old 64 KB /
   round-trip wall. The stack sizes itself to the hardware at start-up: socket
-  buffers and the mbuf pool tier to installed **RAM**, and the CPU-costly
-  timestamp option is gated on the **processor** (on for 68020+, off for a bare
-  68000/68010). Both are negotiated per connection and degrade cleanly against
-  peers that don't offer them — see
+  buffers, the SANA-II receive ring, and the mbuf pool tier to installed **RAM**,
+  and the CPU-costly timestamp option is gated on the **processor** (on for
+  68020+, off for a bare 68000/68010). Both are negotiated per connection and
+  degrade cleanly against peers that don't offer them. Per-interface tuning knobs
+  — `iprequests`/`writerequests`, `mtu`, and `tcp.sendspace`/`tcp.recvspace` — are
+  honoured when set. This is early-stage tuning with more to come — see
   [docs/BUILDING.md](docs/BUILDING.md#throughput-and-memory).
 - **Randomised TCP sequence numbers (RFC 6528).** Each connection's initial
   sequence number is a keyed HalfSipHash of its address/port 4-tuple plus a
@@ -106,6 +108,9 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   engine), with the `SBTC_NUM_PACKET_FILTER_CHANNELS` capability so tools can
   discover it. Validated over an emulated A2065 NIC: live capture of ARP/IP in
   both directions, and injection confirmed by capturing the injected frame back.
+- **CPU-tuned release builds.** A standard **68000** build that runs on every
+  68k Amiga, plus **68020**- and **68040**-optimised variants that emit
+  CPU-specific code; pick the archive matching your machine.
 - A few advanced surfaces remain deliberately deferred (IP filter `ipf_*`,
   monitor hooks, server API) — see
   [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md).
