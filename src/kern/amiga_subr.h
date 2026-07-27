@@ -52,6 +52,12 @@
 #ifndef AMIGA_SUBR_H
 #define AMIGA_SUBR_H
 
+/* ng_bcopy(): non-overlapping payload copy -- MOVE16 fast path on 68040/060 for a
+ * 16-aligned bulk, else CopyMem. Used on the user<->mbuf socket copies (uiomove) only;
+ * the SANA driver-buffer copies stay on CopyMem (see ng_copy.c). Declared before the
+ * __SASC/gcc split so both toolchains see it. */
+void ng_bcopy(const void *src, void *dst, long len);
+
 #if __SASC
 /*
  * Using builtin functions (string.h included in kern/amiga_includes.h)
@@ -76,7 +82,7 @@
  * NOTE: bcopy is infact ovbcopy(). Optimize this when all other works!
  */
 
-#undef bcopy 
+#undef bcopy
 #define bcopy(a,b,c) CopyMem((APTR)(a),b,c)
 #define ovbcopy(a,b,c) memmove(b,a,c)
 

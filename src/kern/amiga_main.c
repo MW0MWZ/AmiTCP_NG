@@ -386,9 +386,22 @@ main(int argc, char *argv[])
  * into these same globals, so running first makes the tier a DEFAULT the user
  * can still override. Runs before mbinit() too, so the chosen maxmem takes hold.
  */
-#ifndef MEMF_TOTAL
-#define MEMF_TOTAL	0x00080000L	/* installed RAM; exec V36+ */
-#endif
+/*
+ * Total installed RAM as ng_ram_tier() detected it, published so a diagnostic tool
+ * (GetNetStatus DEBUG) can read back exactly what the running stack saw -- and compare
+ * it against its own walk -- to tell RAM-under-detection apart from a config override.
+ * Queried via SocketBaseTagList(SBTC_NG_DETECTED_RAM).
+ */
+u_long ng_detected_ram = 0;
+
+/*
+ * The RAM-tier window ceiling, captured once here at boot. The link-speed auto-tune
+ * (api/amiga_roadshow_compat.c) clamps its target DOWN to this fixed value -- NOT to the live
+ * tcp_recvspace, which each interface-add mutates, so that a second, faster interface
+ * can still reach the true ceiling and a slower one cannot ratchet it permanently down.
+ */
+u_long ng_ram_ceiling = 0;
+
 static void
 ng_ram_tier(void)
 {
@@ -396,15 +409,24 @@ ng_ram_tier(void)
   /* sb_max is in <sys/socketvar.h>; mbconf in <sys/mbuf.h> -- both included above. */
   ULONG total;
 
-  /* AvailMem(MEMF_TOTAL) reports installed RAM but needs exec V36+ (Kickstart
-   * 2.0). On older Kickstart fall back to free RAM (MEMF_ANY == 0), which
-   * under-tiers -- a safe, conservative choice -- rather than over-committing on
-   * a small machine. A zero result (probe failure) falls through to the lowest
-   * tier below. */
-  if (SysBase->LibNode.lib_Version >= 36)
-    total = AvailMem(MEMF_TOTAL);
-  else
-    total = AvailMem(MEMF_ANY);
+  /*
+   * Total installed RAM, by summing the exec memory list directly. AvailMem(MEMF_TOTAL)
+   * would be the obvious call, but the MEMF_TOTAL flag is missing on the oldest (pre-2.0)
+   * Kickstarts, so we walk MemList instead: it works on every Kickstart with no version
+   * dependency and agrees with what the `avail` command reports (confirmed on a 349 MB
+   * PiStorm). Held under Forbid() so the list can't change mid-walk.
+   */
+  {
+    struct MemHeader *mh;
+    total = 0;
+    Forbid();
+    for (mh = (struct MemHeader *)SysBase->MemList.lh_Head;
+	 mh->mh_Node.ln_Succ != NULL;
+	 mh = (struct MemHeader *)mh->mh_Node.ln_Succ)
+      total += (ULONG)((UBYTE *)mh->mh_Upper - (UBYTE *)mh->mh_Lower);
+    Permit();
+  }
+  ng_detected_ram = total;		/* publish for GetNetStatus DEBUG (SBTC_NG_DETECTED_RAM) */
 
   udp_sendspace = 9216;			/* really the max datagram size; unchanged */
 
@@ -431,14 +453,37 @@ ng_ram_tier(void)
     tcp_sendspace = tcp_recvspace = 90 * 1460;	/* 131400 (~128 KB), MSS-aligned */
     udp_recvspace = 41600;
     ng_dns_cache_max = DNS_CACHE_ENTRIES_16MB;
-  } else {
-    /* 32 MB+ (PiStorm-class): window scaling engaged -- ~256 KB buffers/windows. */
+  } else if (total <= 64UL * 1024 * 1024) {
+    /* 16-64 MB: ~256 KB buffers/windows. */
     mbconf.maxmem = 4096;
     sb_max        = 512UL * 1024;
     tcp_sendspace = tcp_recvspace = 180 * 1460;	/* 262800 (~256 KB), MSS-aligned */
     udp_recvspace = 41600;
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
+  } else if (total <= 128UL * 1024 * 1024) {
+    /* 64-128 MB: ~512 KB windows -- enough to fill ~100-150 Mbit at internet RTT (and a
+     * gigabit link on a LAN). A single connection is capped at window/RTT, so the bigger
+     * window directly lifts single-stream throughput up to the link's bandwidth-delay
+     * product. sb_max = 2x the buffer (sbreserve needs the headroom); the mbuf pool holds
+     * ~8 such connections (send+recv). */
+    mbconf.maxmem = 8192;
+    sb_max        = 1024UL * 1024;
+    tcp_sendspace = tcp_recvspace = 359 * 1460;	/* 524140 (~512 KB), MSS-aligned */
+    udp_recvspace = 41600;
+    ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
+  } else {
+    /* 128 MB+ (big PiStorm / Vampire, "memory to burn"): ~1 MB windows. Beyond this the
+     * window exceeds the bandwidth-delay product of any realistic 68k link (bandwidth x
+     * RTT) -- once the window >= BDP the pipe is full and a bigger one only costs RAM
+     * without adding throughput, so this is the sensible top. Users on a very-high-RTT
+     * fast path can still push it higher per-interface with tcp.recvspace=. */
+    mbconf.maxmem = 16384;
+    sb_max        = 2048UL * 1024;
+    tcp_sendspace = tcp_recvspace = 718 * 1460;	/* 1048280 (~1 MB), MSS-aligned */
+    udp_recvspace = 41600;
+    ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
   }
+  ng_ram_ceiling = tcp_recvspace;	/* fixed ceiling for the link-speed auto-tune */
 
   /*
    * Match the IP input queue depth to the receive ring (see the SANA read-ring

@@ -44,7 +44,7 @@ struct ng_sin { UBYTE sin_len, sin_family; UWORD sin_port; ULONG sin_addr; UBYTE
  * silently overrunning the adjacent stack locals (which is the bug this once was). */
 typedef char ng_sin_must_hold_a_sockaddr_in[(sizeof(struct ng_sin) >= 16) ? 1 : -1];
 
-/* IFQ tags used here (see amiga_roadshow.c / the Roadshow SDK). */
+/* IFQ tags used here (see amiga_roadshow_compat.c / the Roadshow SDK). */
 #define IFQ_DeviceName_      (IFQ_BASE + 1)
 #define IFQ_DeviceUnit_      (IFQ_BASE + 2)
 #define IFQ_HardwareType_    (IFQ_BASE + 7)

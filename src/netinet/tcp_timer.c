@@ -130,8 +130,15 @@ tcp_fasttimo()
 	inp = tcb.inp_next;
 	if (inp)
 	for (; inp != &tcb; inp = inp->inp_next)
+		/*
+		 * Flush a pending ACK -- delayed (TF_DELACK) OR an immediate one that a
+		 * caller set but could not send (TF_ACKNOW). Including TF_ACKNOW is a
+		 * safety net: the every-other-segment rule (TCP_SETDELACK) can raise
+		 * TF_ACKNOW, and every setter is expected to call tcp_output itself, but
+		 * this guarantees the ~200ms ceiling holds even if some path does not.
+		 */
 		if ((tp = (struct tcpcb *)inp->inp_ppcb) &&
-		    (tp->t_flags & TF_DELACK)) {
+		    (tp->t_flags & (TF_DELACK | TF_ACKNOW))) {
 			tp->t_flags &= ~TF_DELACK;
 			tp->t_flags |= TF_ACKNOW;
 			tcpstat.tcps_delack++;

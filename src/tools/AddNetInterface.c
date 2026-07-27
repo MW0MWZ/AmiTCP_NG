@@ -48,7 +48,7 @@
 
 struct Library *SocketBase;
 
-/* --- Roadshow extension-API tag values (see amiga_roadshow.c) --------------- */
+/* --- Roadshow extension-API tag values (see amiga_roadshow_compat.c) --------------- */
 #define TU                      0x80000000UL	/* TAG_USER */
 #define IFC_Address             (TU + 1801)
 #define IFC_NetMask             (TU + 1802)
@@ -56,7 +56,7 @@ struct Library *SocketBase;
 #define IFC_State               (TU + 1808)
 /* AmiTCP_NG-private creation tags for the SANA-II read/write request-pool sizes
  * (iprequests=/writerequests=) and the TCP socket-buffer overrides
- * (tcp.sendspace=/tcp.recvspace=). MUST match the defs in src/api/amiga_roadshow.c. */
+ * (tcp.sendspace=/tcp.recvspace=). MUST match the defs in src/api/amiga_roadshow_compat.c. */
 #define NGCT_IPRequests         (TU + 0x004E4701UL)
 #define NGCT_WriteRequests      (TU + 0x004E4702UL)
 #define NGCT_TcpSendspace       (TU + 0x004E4703UL)
@@ -124,7 +124,7 @@ static long v_errno(void) {                                                /* Er
 }
 
 /* AddressAllocationMessage -- struct Message (20-byte prefix) then the fields we
- * touch. Layout mirrors amiga_roadshow.c's `struct ng_aam`. */
+ * touch. Layout mirrors amiga_roadshow_compat.c's `struct ng_aam`. */
 struct AAMX {
   char mn[20];
   long aam_Reserved, aam_Result, aam_Version, aam_Protocol;

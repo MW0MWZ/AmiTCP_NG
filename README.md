@@ -60,7 +60,8 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   **ICMP `ping`** (to the gateway and to loopback).
 - **Validated on real 68k hardware** (PiStorm accelerator + `wifipi.device`):
   interface bring-up, DHCP lease, default-route install, DNS, `ping`, and
-  end-to-end connectivity over a 100 Mbit WiFi link.
+  end-to-end connectivity over a 100 Mbit WiFi link — where the link-speed window
+  auto-tuning roughly doubled single-stream throughput.
 - **Roadshow-compatible extension API** implemented (address conversion,
   DNS-server management, interface configuration/query/enumeration, routing,
   network statistics + system status, RoadshowData tunables, kernel `mbuf`
@@ -82,12 +83,14 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 - **Machine-adaptive TCP performance.** Full **RFC 1323 window scaling and
   timestamps**, so a single connection can scale past the old 64 KB /
   round-trip wall. The stack sizes itself to the hardware at start-up: socket
-  buffers, the SANA-II receive ring, and the mbuf pool tier to installed **RAM**,
-  and the CPU-costly timestamp option is gated on the **processor** (on for
-  68020+, off for a bare 68000/68010). Both are negotiated per connection and
+  buffers, the SANA-II receive ring, and the mbuf pool tier to installed **RAM**
+  (and the TCP window is then sized to each NIC's **link speed**, never above that
+  RAM ceiling), and the CPU-costly timestamp option is gated on the **processor**
+  (on for 68020+, off for a bare 68000/68010). Both are negotiated per connection and
   degrade cleanly against peers that don't offer them. Per-interface tuning knobs
   — `iprequests`/`writerequests`, `mtu`, and `tcp.sendspace`/`tcp.recvspace` — are
-  honoured when set. This is early-stage tuning with more to come — see
+  honoured when set, and `GetNetStatus DEBUG` shows the RAM it detected, each NIC's
+  link speed, and the window it chose. More tuning still to come — see
   [docs/BUILDING.md](docs/BUILDING.md#throughput-and-memory).
 - **Randomised TCP sequence numbers (RFC 6528).** Each connection's initial
   sequence number is a keyed HalfSipHash of its address/port 4-tuple plus a
@@ -224,23 +227,38 @@ useloopback=YES
 HOSTNAME=my-amiga
 ```
 
-### 4. It tunes itself to your machine
+### 4. It tunes itself to your machine and your link
 
-You normally do **not** need to touch the buffer sizes — AmiTCP_NG sizes them to the
-hardware it finds at startup, so it stays lean on a small machine and opens up on a
-big one:
+You normally do **not** need to touch the buffer sizes. AmiTCP_NG sets the TCP window
+automatically from two things, and uses the **smaller** of them:
 
-| Installed RAM     | TCP buffers | Notes |
-|-------------------|-------------|-------|
-| ≤ 1 MB (e.g. 512K A500) | ~16 KB | Lean enough to still boot. |
-| 2–4 MB            | ~61 KB | Stock. |
-| 8–16 MB           | ~128 KB | RFC 1323 window scaling engages. |
-| 32 MB+ (PiStorm-class) | ~256 KB | Large scaled windows. |
+- **Your RAM sets the ceiling.** The socket buffers are backed by an mbuf pool sized to
+  installed RAM, so a small machine stays lean and a big one can afford a large window:
 
-It also matches the CPU: RFC 1323 **timestamps** are enabled on a 68020 or better
-and left off on a bare 68000/68010 (where the per-segment cost is not worth it);
-window scaling is on everywhere. The `TCP_SENDSPACE`/`TCP_RECVSPACE` settings above
-override these defaults if you want to tune by hand.
+  | Installed RAM | Window ceiling |
+  |---|---|
+  | ≤ 1 MB (e.g. 512K A500) | ~16 KB (lean enough to still boot) |
+  | 2–4 MB | ~61 KB |
+  | 8–16 MB | ~128 KB |
+  | 16–64 MB | ~256 KB |
+  | 64–128 MB | ~512 KB |
+  | 128 MB+ (PiStorm-class) | ~1 MB |
+
+- **Your link speed sets the target.** The window that fills a link without overshooting
+  is its bandwidth-delay product, so the stack reads each NIC's link speed and sizes the
+  window to it — ~512 KB for a ~100 Mbit link, ~1 MB for gigabit — never above the RAM
+  ceiling. A window *larger* than the link needs doesn't add throughput and hurts loss
+  recovery, so on a big-RAM machine a 100 Mbit NIC is deliberately held to ~512 KB, not
+  1 MB. (A driver that doesn't report its speed simply falls back to the RAM ceiling.)
+
+RFC 1323 **window scaling** makes the >64 KB windows possible and is negotiated per
+connection; **timestamps** are enabled on a 68020+ and left off on a bare 68000/68010
+(where the per-segment cost is not worth it).
+
+To override, set `tcp.sendspace=`/`tcp.recvspace=` in a `DEVS:NetInterfaces` interface
+config (this is stack-wide — the last interface configured wins) or
+`TCP_SENDSPACE=`/`TCP_RECVSPACE=` in `AmiTCP.config`. Run **`GetNetStatus DEBUG`** to see
+the RAM the stack detected and the window it chose.
 
 ## Build & test
 

@@ -616,8 +616,14 @@ setdtablesize(struct SocketBase * libPtr, UWORD size)
 */
 #endif
 
-/* SBTC_SYSTEM_STATUS helper -- computes the SBSYSSTAT_* bitmask (api/amiga_roadshow.c). */
+/* SBTC_SYSTEM_STATUS helper -- computes the SBSYSSTAT_* bitmask (api/amiga_roadshow_compat.c). */
 extern ULONG ng_system_status(struct SocketBase *libPtr);
+
+/* Live values behind the SBTC_NG_* diagnostic query codes (GetNetStatus DEBUG). */
+extern unsigned long ng_detected_ram;			/* kern/amiga_main.c   */
+extern unsigned long tcp_sendspace, tcp_recvspace;	/* netinet/tcp_usrreq.c */
+extern unsigned long sb_max;				/* kern/uipc_socket2.c  */
+extern unsigned long ng_last_if_baudrate;		/* api/amiga_roadshow_compat.c */
 
 ULONG SAVEDS RAF2(_SocketBaseTagList,
 		  struct SocketBase *,	libPtr,		a6,
@@ -756,7 +762,7 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
        * and FAILED the whole SocketBaseTagList call on any unknown code, which
        * some tools treat as a hard error. Return 1 for a family we implement, 0
        * for one still stubbed -- so clients cleanly use what works and skip the
-       * rest. Flip a 0 to 1 as each tranche lands (see api/amiga_roadshow.c and
+       * rest. Flip a 0 to 1 as each tranche lands (see api/amiga_roadshow_compat.c and
        * api/amiga_libtables.c).
        */
       case (SBTC_HAVE_ADDRESS_CONVERSION_API << SBTB_CODE):
@@ -809,6 +815,27 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	 */
 	if (!((UWORD)tag & SBTF_SET))
 	  *tagData = ng_system_status(libPtr);
+	break;
+
+      /*
+       * AmiTCP_NG-private diagnostics (GET-only): report the stack's live tuning so
+       * GetNetStatus DEBUG can show what the running stack actually detected/selected,
+       * versus what its own RAM walk implies. A SET is meaningless -- leave it untouched.
+       */
+      case (SBTC_NG_DETECTED_RAM  << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)ng_detected_ram;
+	break;
+      case (SBTC_NG_TCP_SENDSPACE << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)tcp_sendspace;
+	break;
+      case (SBTC_NG_TCP_RECVSPACE << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)tcp_recvspace;
+	break;
+      case (SBTC_NG_SB_MAX        << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)sb_max;
+	break;
+      case (SBTC_NG_LINK_SPEED    << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)ng_last_if_baudrate;
 	break;
 
       default:

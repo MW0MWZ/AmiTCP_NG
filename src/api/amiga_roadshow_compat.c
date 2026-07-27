@@ -16,7 +16,12 @@
  */
 
 /*
- * amiga_roadshow.c --- Roadshow bsdsocket.library EXTENSION entry points (the Roadshow-compat shim).
+ * amiga_roadshow_compat.c --- Roadshow bsdsocket.library COMPATIBILITY layer.
+ *
+ * This is our OWN, clean-room code that implements Roadshow's PUBLISHED extension
+ * ABI so Roadshow's config tools can drive our stack. It contains NO Roadshow
+ * source -- the "roadshow" in the name means "compatible with", not "copied from".
+ * (Roadshow itself is Olaf Barthel's closed-source product; see the attribution above.)
  *
  * PORT (AmiTCP_NG): this file is entirely new. AmiTCP 3.0b2 exported 45 library
  * vectors (socket() at LVO -30 ... SocketBaseTagList() at -294). Olaf Barthel's
@@ -642,6 +647,45 @@ LONG SAVEDS RAF3(_ConfigureInterfaceTagList,
 extern struct ifnet *sana_add_interface(char *ifname, char *devname, long devunit,
 					long ipreq, long wreq);
 
+/*
+ * ng_speed_window -- the TCP window we WANT for a link of the given speed, in bytes.
+ *
+ * The window that fills a link without overshooting is its bandwidth-delay product
+ * (bandwidth x RTT); more than that just queues data in the path and hurts loss
+ * recovery. RAM only sets the CEILING (how big a window the mbuf pool can back, via
+ * ng_ram_tier); the LINK sets the target, and the caller clamps target down to the
+ * ceiling. Values are anchored on real-hardware testing (512 KB tested fastest on a
+ * ~100 Mbit PiStorm WiFi link). Returns 0 for an unknown/zero baud rate, which tells
+ * the caller "I can't tell -- keep the RAM default". if_baudrate comes from the SANA-II
+ * S2_DEVICEQUERY BPS field; a driver that leaves it 0 simply falls back to the RAM tier.
+ */
+static u_long
+ng_speed_window(u_long bps)
+{
+  /* MSS-aligned (n x 1460), matching the RAM tiers: keeps a full number of segments and
+   * lets the ~64 KB value stay under the 16-bit window (44*1460=64240) so it needs no
+   * window-scale shift, while 512 KB / 1 MB coincide exactly with the RAM-tier values. */
+  if (bps == 0)                  return 0;		/* unknown -> keep RAM default */
+  if (bps <=  12000000UL)        return  44UL * 1460;	/* 64240  (~64 KB):  ~10 Mbit (A2065, PLIP) */
+  if (bps <= 128000000UL)        return 359UL * 1460;	/* 524140 (~512 KB): ~100 Mbit (wifipi)     */
+  return 718UL * 1460;					/* 1048280 (~1 MB):  gigabit+ (genet)       */
+}
+
+/*
+ * Sticky: set once any interface supplies an explicit tcp.sendspace=/recvspace=. It
+ * makes an explicit override beat the link-speed auto-tune on EVERY subsequent interface
+ * (not just the last one configured), matching the documented "a config override always
+ * wins". Persists until the stack is torn down (overrides persist until reboot anyway).
+ */
+static BOOL ng_tcp_user_override = FALSE;
+
+/*
+ * The if_baudrate of the most recently added interface, published so GetNetStatus DEBUG
+ * can show what link speed the auto-tune actually read from the driver (0 = the driver
+ * reports none, so the RAM ceiling was used). Queried via SBTC_NG_LINK_SPEED.
+ */
+u_long ng_last_if_baudrate = 0;
+
 LONG SAVEDS RAF5(_AddInterfaceTagList,
 		 struct SocketBase *,	libPtr,		a6,
 		 STRPTR,		interface_name,	a0,
@@ -652,7 +696,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
 {
 #endif
   int error;
-  long ipreq, wreq;
+  long ipreq, wreq, sndsp, rcvsp;	/* sndsp/rcvsp needed again for the auto-tune below */
 
   CHECK_TASK();
 
@@ -674,8 +718,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
    * RAM-tiered default. ng_apply_iface_config() below ignores these private tags.
    */
   { struct TagItem *ti, *tstate = tags;
-    long sndsp = 0, rcvsp = 0;
-    ipreq = wreq = 0;
+    ipreq = wreq = sndsp = rcvsp = 0;
     while ((ti = ng_nexttag(&tstate)) != NULL) {
       if (ti->ti_Tag == NGCT_IPRequests)         ipreq = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_WriteRequests) wreq  = (long)ti->ti_Data;
@@ -704,17 +747,51 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
      */
     if (sndsp > 0 || rcvsp > 0) {
       extern u_long tcp_sendspace, tcp_recvspace, sb_max;
+      ng_tcp_user_override = TRUE;	/* explicit override now beats auto-tune everywhere */
       if (sndsp > 0) tcp_sendspace = (u_long)sndsp;
       if (rcvsp > 0) tcp_recvspace = (u_long)rcvsp;
-      if (tcp_sendspace > sb_max) sb_max = tcp_sendspace;
-      if (tcp_recvspace > sb_max) sb_max = tcp_recvspace;
+      /*
+       * sb_max must be at least ~2x the buffer, NOT merely equal to it: sbreserve()
+       * rejects any reservation larger than sb_max * MCLBYTES / (MSIZE + MCLBYTES)
+       * (~94% of sb_max), so setting sb_max == the buffer makes every socket's
+       * soreserve() fail with ENOBUFS -- which breaks ALL TCP (incl. DNS-over-TCP).
+       * The RAM-tier defaults already use sb_max = 2 * buffer; match that here.
+       */
+      if (2 * tcp_sendspace > sb_max) sb_max = 2 * tcp_sendspace;
+      if (2 * tcp_recvspace > sb_max) sb_max = 2 * tcp_recvspace;
     }
   }
-  if (sana_add_interface((char *)interface_name, (char *)device_name,
-			 (long)unit, ipreq, wreq) == NULL) {
-    ReleaseSyscallSemaphore(libPtr);
-    writeErrnoValue(libPtr, ENXIO);		/* could not open the device */
-    return (-1);
+  {
+    struct ifnet *newif = sana_add_interface((char *)interface_name, (char *)device_name,
+					     (long)unit, ipreq, wreq);
+    if (newif == NULL) {
+      ReleaseSyscallSemaphore(libPtr);
+      writeErrnoValue(libPtr, ENXIO);		/* could not open the device */
+      return (-1);
+    }
+    ng_last_if_baudrate = (u_long)newif->if_baudrate;	/* what the auto-tune sees (GetNetStatus DEBUG) */
+    /*
+     * Link-speed auto-tune. When neither this nor any earlier interface gave an explicit
+     * tcp.sendspace/recvspace (ng_tcp_user_override), size the default window to this
+     * interface's link speed instead of leaving it at the RAM-tier value (which, on a
+     * big-RAM machine, is a 1 MB ceiling a ~100 Mbit link cannot use and that measurably
+     * hurts -- see ng_speed_window). RAM stays the CEILING: we clamp the speed target down
+     * to the FIXED ng_ram_ceiling captured at boot (not the live, already-mutated window),
+     * so a small-RAM machine keeps its safe small window and, with several NICs, a faster
+     * one added later can still reach the full ceiling rather than being stuck at a slower
+     * NIC's value. A driver reporting baud 0 yields want==0 -> keep the RAM default. This
+     * is GLOBAL (last interface configured wins) and persists until reboot; iface_make()
+     * has already run S2_DEVICEQUERY so if_baudrate is populated by now.
+     */
+    if (sndsp <= 0 && rcvsp <= 0 && !ng_tcp_user_override) {
+      extern u_long tcp_sendspace, tcp_recvspace, ng_ram_ceiling;
+      u_long ceil = ng_ram_ceiling ? ng_ram_ceiling : tcp_recvspace;
+      u_long want = ng_speed_window((u_long)newif->if_baudrate);
+      if (want > 0) {
+	if (want > ceil) want = ceil;			/* clamp to the FIXED RAM ceiling */
+	tcp_sendspace = tcp_recvspace = want;
+      }
+    }
   }
 
   error = ng_apply_iface_config((char *)interface_name, tags);

@@ -133,6 +133,15 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
 #define NG_SBTB_CODE		1
 #define NG_SBTC_SYSTEM_STATUS	56
 #define NG_SBTM_GETVAL(code)	(NG_TU | (((code) & 0x3FFF) << NG_SBTB_CODE))
+
+/* AmiTCP_NG-private GET-only diagnostic codes (mirror of SBTC_NG_* in the library's
+ * amitcp/socketbasetags.h -- keep the values in step). Report the running stack's live
+ * tuning for GetNetStatus DEBUG. An older library returns 0 (unknown-code default). */
+#define NG_SBTC_DETECTED_RAM	0x2000	/* installed RAM the stack detected */
+#define NG_SBTC_TCP_SENDSPACE	0x2001	/* effective global tcp_sendspace   */
+#define NG_SBTC_TCP_RECVSPACE	0x2002	/* effective global tcp_recvspace   */
+#define NG_SBTC_SB_MAX		0x2003	/* effective global sb_max          */
+#define NG_SBTC_LINK_SPEED	0x2004	/* last interface's if_baudrate (bps) */
 #define SBSYSSTAT_Interfaces		(1L<<0)
 #define SBSYSSTAT_PTP_Interfaces	(1L<<1)
 #define SBSYSSTAT_BCast_Interfaces	(1L<<2)

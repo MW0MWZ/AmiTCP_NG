@@ -129,7 +129,7 @@ RCS_ID_C="$Id: amiga_api.c,v 3.7 1994/04/02 11:12:59 jraja Exp $";
 #include <kern/amiga_log.h>
 
 /* strncmp() is not declared by any reachable header in the GNUC/-noixemul
- * build (see the strcmp() note in amiga_roadshow.c for why plain
+ * build (see the strcmp() note in amiga_roadshow_compat.c for why plain
  * <string.h> cannot be included here). Still provided by libnix at link
  * time, so just declare it. */
 extern int strncmp(const char *, const char *, size_t);

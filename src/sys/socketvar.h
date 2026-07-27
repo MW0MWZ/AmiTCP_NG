@@ -144,6 +144,8 @@ struct socket {
 		u_long	sb_mbmax;	     /* max chars of mbufs to use */
 		long	sb_lowat;	     /* low water mark */
 		struct	mbuf *sb_mb;	     /* the mbuf chain */
+		struct	mbuf *sb_mbtail;     /* last mbuf in the last record (O(1) append;
+					      * valid only when sb_mb != 0 -- see sbappend) */
 		struct	newselitem *sb_sel;  /* chain for selecting tasks */
 		short	sb_flags;	     /* flags, see below */
 		struct timeval sb_timeo;     /* timeout for read/write */

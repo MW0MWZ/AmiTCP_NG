@@ -207,4 +207,19 @@
 #define SBSYSSTAT_Routes		(1L<<4)	/* >=1 route configured */
 #define SBSYSSTAT_DefaultRoute		(1L<<5)	/* a default route is present */
 
+/*
+ * AmiTCP_NG-private query codes (GET-only). Not part of the Roadshow ABI -- placed high
+ * in the code space (0x2000+) to stay clear of Roadshow's low, sequential codes. They
+ * let GetNetStatus DEBUG read back the stack's LIVE tuning: the RAM it detected at
+ * startup and the effective global tcp_sendspace/tcp_recvspace/sb_max, so a real machine
+ * can be diagnosed without a separate binary. An older library returns 0 (the dispatch's
+ * unknown-code default), which the tool reads as "not supported". Keep in step with the
+ * NG_SBTC_* mirror in src/tools/ng_lvo.h.
+ */
+#define SBTC_NG_DETECTED_RAM		0x2000	/* ULONG: installed RAM the stack detected */
+#define SBTC_NG_TCP_SENDSPACE		0x2001	/* ULONG: effective global tcp_sendspace  */
+#define SBTC_NG_TCP_RECVSPACE		0x2002	/* ULONG: effective global tcp_recvspace  */
+#define SBTC_NG_SB_MAX			0x2003	/* ULONG: effective global sb_max          */
+#define SBTC_NG_LINK_SPEED		0x2004	/* ULONG: last interface's if_baudrate (bps) */
+
 #endif /* !AMITCP_SOCKETBASETAGS_H */

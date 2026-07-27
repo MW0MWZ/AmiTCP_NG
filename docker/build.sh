@@ -9,7 +9,7 @@ IMG=amigadev/crosstools:m68k-amigaos
 "$ROOT/docker/gen_config_var.sh"          # regenerate the config-variable table
 # NG_ARCH selects the CPU multilib (default -m68000); forward it so ccflags.sh inside
 # the container picks up the variant build-release.sh asked for.
-docker run --rm -e NG_ARCH -v "$ROOT":/work -w /work "$IMG" bash -c '
+docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -v "$ROOT":/work -w /work "$IMG" bash -c '
   source docker/ccflags.sh
   mkdir -p build/obj
   # --- compile every translation unit ---
@@ -22,6 +22,27 @@ docker run --rm -e NG_ARCH -v "$ROOT":/work -w /work "$IMG" bash -c '
     fi
   done
   [ "$fail" = 0 ] || { echo "compile errors -> abort"; exit 1; }
+  # --- assemble the hand-tuned 68k routines (.S). gcc drives cpp+as; no C headers,
+  #     no -std/-force-include -- the .S carries its own #defines. NG_ARCH selects CPU.
+  #     Gated on NG_CKSUM_ASM (same switch that -D-empties in_cksum.c): when the asm is
+  #     OFF the C in_cksum() is compiled instead, and assembling the .S too would give a
+  #     duplicate _in_cksum -- so this MUST stay in lock-step with ccflags.sh.
+  # ng_move16.S (68040/060 MOVE16 copy) is always assembled -- it is self-gating
+  # (empty on other CPUs). The asm checksum is gated on NG_CKSUM_ASM (mutually
+  # exclusive with the C in_cksum.c).
+  asm_srcs="src/kern/ng_move16.S"
+  [ "$NG_CKSUM_ASM" = 1 ] && asm_srcs="$asm_srcs src/netinet/in_cksum_asm.S"
+  for a in $asm_srcs; do
+    o="build/obj/$(basename "${a%.S}").o"
+    if ! m68k-amigaos-gcc -c "$a" -o "$o" $NG_ARCH 2>/tmp/e; then
+      echo "ASSEMBLE FAIL: $a"; grep -m1 -iE "error:|fatal" /tmp/e; exit 1
+    fi
+  done
+  # Belt-and-braces: exactly one _in_cksum must survive into the object set, whichever
+  # path built it -- a duplicate would otherwise be silently arbitrated by the link-time
+  # --allow-multiple-definition (there for an unrelated libnix symbol).
+  n=$(m68k-amigaos-nm build/obj/*.o 2>/dev/null | grep -cE " T _in_cksum$")
+  [ "$n" = 1 ] || { echo "!!! expected exactly one _in_cksum definition, found $n"; exit 1; }
   echo "compiled $(ls build/obj/*.o | wc -l) objects"
   # --- link the stack program (installs bsdsocket.library at runtime) ---
   #  -noixemul                  : link libnix (light runtime).

@@ -217,29 +217,48 @@ round-trip-time wall on machines with the RAM to back it. Its companion,
 below; both are negotiated per connection and degrade cleanly against peers that
 don't offer them.
 
-### RAM-aware defaults (automatic)
+### RAM sets the ceiling, link speed sets the target (automatic)
 
-At start-up the stack reads the machine's installed RAM (`AvailMem`) and picks a
-tier, so it does not have to ship one compromise that either starves a 512 KB
-A500 or throttles a big-RAM PiStorm. The big-RAM tiers raise both the socket
-buffers and the internal `sb_max` window ceiling above 64 KB, which is what makes
-window scaling compute a nonzero shift:
+At start-up the stack reads the machine's installed RAM — by summing the exec
+memory list directly, which is portable across every Kickstart (unlike
+`AvailMem(MEMF_TOTAL)`, whose flag is missing on pre-2.0 Kickstarts) and agrees
+with what `avail` reports — and picks a
+tier, so it does not have to ship one compromise that either starves a 512 KB A500
+or throttles a big-RAM PiStorm. The big-RAM tiers raise both the socket buffers and
+the internal `sb_max` window ceiling above 64 KB, which is what makes window scaling
+compute a nonzero shift:
 
-| Installed RAM | mbuf pool (`MAXMEM`) | `sb_max` | `tcp.sendspace`/`recvspace` | window scale |
+| Installed RAM | mbuf pool (`MAXMEM`) | `sb_max` | RAM window ceiling | window scale |
 |---|---|---|---|---|
-| ≤ 1 MB   | 128 KB  | 64 KB   | 16060 bytes       | 0 (≤ 64 KB) |
-| 2–4 MB   | 256 KB  | 64 KB   | 61320 bytes       | 0 (≤ 64 KB) |
-| 8–16 MB  | 1 MB    | 256 KB  | 131400 (~128 KB)  | 2 |
-| 32 MB+   | 4 MB    | 512 KB  | 262800 (~256 KB)  | 3 |
+| ≤ 1 MB    | 128 KB  | 64 KB  | 16060 bytes       | 0 (≤ 64 KB) |
+| 2–4 MB    | 256 KB  | 64 KB  | 61320 bytes       | 0 (≤ 64 KB) |
+| 8–16 MB   | 1 MB    | 256 KB | 131400 (~128 KB)  | 2 |
+| 16–64 MB  | 4 MB    | 512 KB | 262800 (~256 KB)  | 3 |
+| 64–128 MB | 8 MB    | 1 MB   | 524140 (~512 KB)  | 3 |
+| 128 MB+   | 16 MB   | 2 MB   | 1048280 (~1 MB)   | 4 |
 
 Buffers are MSS-aligned (`n × 1460`) and stay under the socket-buffer reservation
 cap, so `soreserve()` never fails. The two smaller tiers still *negotiate* scaling
-but with a shift of 0 — fully interoperable, and they can still **send** into a
-large scaled window a peer advertises (bounded by their own send buffer); they
-just don't advertise a >64 KB receive window, which saves memory. Scaling degrades
-cleanly against peers that don't support it (they don't echo the option, so both
-scales stay 0). (Pre-Kickstart-2.0 machines, which lack `AvailMem(MEMF_TOTAL)`,
-fall back to reading *free* RAM, which only ever under-tiers — a safe choice.)
+but with a shift of 0 — fully interoperable, and they can still **send** into a large
+scaled window a peer advertises; they just don't advertise a >64 KB receive window.
+
+That RAM figure is only the **ceiling**. The window that actually fills a link
+without overshooting is its bandwidth-delay product, so when an interface comes up
+the stack reads its link speed (`if_baudrate`, from the SANA-II `S2_DEVICEQUERY`)
+and sizes the default window to the link — clamped down to the RAM ceiling above:
+
+| Link speed | window target |
+|---|---|
+| ≤ ~10 Mbit (A2065, PLIP) | 64 KB |
+| ~100 Mbit (wifipi, X-Surf-100) | 512 KB |
+| gigabit (genet) | 1 MB |
+
+So a 100 Mbit NIC on a 349 MB PiStorm gets a **512 KB** window, not the tier's 1 MB:
+a window larger than the link's BDP adds no throughput and worsens loss recovery. A
+driver that reports baud 0 falls back to the RAM ceiling. This is one global default
+(last interface configured wins); a per-interface `tcp.sendspace`/`tcp.recvspace`
+override always beats it, and `GetNetStatus DEBUG` prints the detected RAM, the tier
+ceiling, and the live window.
 
 ### Overriding the tier
 
@@ -255,7 +274,8 @@ The buffers are only a ceiling — the bytes that fill them come from the shared
 mbuf pool (`MAXMEM`). A bulk connection with both buffers full uses roughly twice
 its buffer size of pool: ~32 KB per connection on the ≤ 1 MB tier (16060-byte
 buffers), ~120 KB on the 2–4 MB tier (61320), ~260 KB on the 8–16 MB tier
-(131400), ~520 KB on the 32 MB+ tier (262800). So a single high-speed stream fits
+(131400), ~520 KB on the 16–64 MB tier (262800), ~1 MB on the 64–128 MB tier
+(524140), and ~2 MB on the 128 MB+ tier (1048280). So a single high-speed stream fits
 each tier's pool comfortably, but **several concurrent bulk streams** can exhaust
 it and stall — which is why the big-RAM tiers raise `MAXMEM` in step with their
 larger buffers. The pool allocates on demand, so a larger ceiling costs a

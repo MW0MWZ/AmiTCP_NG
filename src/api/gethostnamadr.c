@@ -137,7 +137,7 @@ static char sccsid[] = "@(#)gethostnamadr.c	6.45 (Berkeley) 2/24/91";
 #include <api/dns_cache.h>
 
 /* memcpy() is not declared by any reachable header in the GNUC/-noixemul
- * build (see the strcmp() note in amiga_roadshow.c for why plain
+ * build (see the strcmp() note in amiga_roadshow_compat.c for why plain
  * <string.h> cannot be included here). Still provided by libnix at link
  * time, so just declare it. */
 extern void *memcpy(void *, const void *, size_t);
@@ -448,7 +448,7 @@ static char *
 
 /*
  * PORT (AmiTCP_NG): the host-resolution core of gethostbyname(), factored out of
- * the register-argument library entry so getaddrinfo() (api/amiga_roadshow.c) can
+ * the register-argument library entry so getaddrinfo() (api/amiga_roadshow_compat.c) can
  * reuse the FULL numeric + local-database + DNS lookup directly. Assumes the
  * caller already validated the task context (the entry points do CHECK_TASK).
  */

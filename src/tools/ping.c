@@ -7,10 +7,10 @@
  * HOST/A, ...) and the familiar BSD ping output so existing scripts and habits carry
  * over. It opens a raw ICMP socket through the public bsdsocket.library API.
  *
- * NOTE: this tool is exercised only on real ICMP-capable networks. The project's
- * headless test rig (Amiberry + SLIRP) does NOT pass ICMP, so ping cannot be validated
- * there; it is build-verified and reviewed against the raw-socket path our stack
- * provides (netinet/in_proto.c: SOCK_RAW/IPPROTO_ICMP -> rip_usrreq/icmp).
+ * NOTE: the headless test rig (Amiberry + SLIRP) DOES pass ICMP to the SLIRP gateway
+ * (10.0.2.2) and to loopback, so ping is smoke-tested there against a live echo reply;
+ * only ICMP to the wider internet is unrouted under SLIRP. Raw-socket path in the stack:
+ * netinet/in_proto.c (SOCK_RAW/IPPROTO_ICMP -> rip_usrreq/icmp).
  *
  * Build: m68k-amigaos-gcc -noixemul -O2 -m68000 src/tools/ping.c -o ping
  */
@@ -148,6 +148,12 @@ int main(void)
   ULONG  addr;
   char   namebuf[64];
   int    rc = RETURN_OK;
+  /* Packet buffers kept OFF the stack. Two 1500-byte arrays in main()'s frame (~3 KB)
+   * overflow a Shell's default ~4 KB stack once the library-call chain is added, which
+   * corrupted the return address and crashed on exit (Guru 80000006). static = BSS, not
+   * stack; safe here as ping is a single-run, single-threaded tool. */
+  static UBYTE pkt[1500];
+  static UBYTE rbuf[1500];
 
   for (i = 0; i < 14; i++) a[i] = 0;
   rda = ReadArgs((STRPTR)
@@ -210,8 +216,7 @@ int main(void)
   Flush(Output());
 
   for (i = 0; !stop && (count < 0 || i < count); i++) {
-    UBYTE pkt[1500]; struct ng_icmp *ic = (struct ng_icmp *)pkt;
-    UBYTE rbuf[1500];
+    struct ng_icmp *ic = (struct ng_icmp *)pkt;
     struct timeval t0, t1; struct timeval tvto; ULONG sig;
     long n; long frlen; struct ng_sin from;
     int  plen = (int)sizeof(struct ng_icmp) + (int)size;

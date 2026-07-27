@@ -154,10 +154,10 @@ extern REGARGFUN VOID _SocketBaseTagList();
 
 /*
  * Roadshow (bsdsocket.library 3+) extensions --- entry points in
- * api/amiga_roadshow.c. Every vector below occupies its exact SFD offset;
+ * api/amiga_roadshow_compat.c. Every vector below occupies its exact SFD offset;
  * unimplemented ones share a clean-fail stub (by return type). As tranches land,
  * a stub in the table is swapped for its real function name -- the OFFSET never
- * moves. See api/amiga_roadshow.c and ref/NDK3.2/.../bsdsocket_lib.sfd.
+ * moves. See api/amiga_roadshow_compat.c and ref/NDK3.2/.../bsdsocket_lib.sfd.
  */
 extern REGARGFUN VOID _GetSocketEvents();
 extern REGARGFUN VOID _RoadshowStubErr();	/* -1 + errno ENOSYS (int/void) */
@@ -275,7 +275,7 @@ f_void UserLibrary_funcTable[] = {
    * vectors name their real function; not-yet-done vectors point at the shared
    * clean-fail stub matching their return type (_RoadshowStubErr for int/void/
    * BOOL, _RoadshowStubNull for pointer). Offsets noted for cross-checking
-   * against the SFD. See api/amiga_roadshow.c.
+   * against the SFD. See api/amiga_roadshow_compat.c.
    * ---------------------------------------------------------------------- */
   _GetSocketEvents,			/* -300 */
 

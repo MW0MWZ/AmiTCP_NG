@@ -98,6 +98,15 @@ RCS_ID_C="$Id: in_cksum.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
 #include <netinet/in_cksum_protos.h>
 
 /*
+ * AmiTCP_NG builds the hand-tuned 68k assembly checksum (in_cksum_asm.S) by default
+ * -- it defines NG_CKSUM_ASM and provides in_cksum(), so this portable C version is
+ * compiled out to avoid a duplicate symbol. Build without NG_CKSUM_ASM to fall back
+ * to this C implementation (e.g. for a new/unverified CPU target). The two are kept
+ * byte-for-byte equivalent by the cksumbench correctness harness.
+ */
+#ifndef NG_CKSUM_ASM
+
+/*
  * Checksum routine for Internet Protocol family headers (Portable Version).
  *
  * This routine is very heavily used in the network
@@ -214,3 +223,5 @@ in_cksum(m, len)
 	REDUCE;
 	return (~sum & 0xffff);
 }
+
+#endif /* !NG_CKSUM_ASM */

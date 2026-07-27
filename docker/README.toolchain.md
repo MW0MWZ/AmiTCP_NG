@@ -66,7 +66,7 @@ Key choices, all deliberate:
 ```bash
 docker run --rm -v "$PWD":/work -w /work amigadev/crosstools:m68k-amigaos bash -c '
   source docker/ccflags.sh
-  m68k-amigaos-gcc -c src/api/amiga_roadshow.c -o /tmp/o.o \
+  m68k-amigaos-gcc -c src/api/amiga_roadshow_compat.c -o /tmp/o.o \
     $NG_INC $NG_DEF $NG_CFLAGS $NG_FORCEINC'
 ```
 

@@ -182,11 +182,29 @@ struct	tcpcb *tcp_newtcpcb();
  * Set DELACK for segments received in order, but ack immediately
  * when segments are out of order (so fast retransmit can work).
  */
+
+/*
+ * Note that we need to ACK in-order data. Delayed-ACK with the classic
+ * "every other segment" rule: delay a lone in-order segment (to coalesce ACKs and
+ * piggyback -- each ACK costs a header build + checksum + SANA transmit, so halving
+ * the ACK count matters on a 68k), BUT if an ACK is already pending (this is the 2nd
+ * segment) send it immediately instead of waiting for the ~200 ms delayed-ACK timer.
+ * Without this, on a fast link the sender fills its window (up to 256 KB) in a couple
+ * of ms and then stalls up to 200 ms per window waiting for our ACK. TF_DELACK itself
+ * is the "one segment already pending" marker; tcp_output() clears both flags on send.
+ */
+#define	TCP_SETDELACK(tp) do { \
+	if ((tp)->t_flags & TF_DELACK) \
+		(tp)->t_flags = ((tp)->t_flags & ~TF_DELACK) | TF_ACKNOW; \
+	else \
+		(tp)->t_flags |= TF_DELACK; \
+} while (0)
+
 #define	TCP_REASS(tp, ti, m, so, flags) { \
 	if ((ti)->ti_seq == (tp)->rcv_nxt && \
 	    (tp)->seg_next == (struct tcpiphdr *)(tp) && \
 	    (tp)->t_state == TCPS_ESTABLISHED) { \
-		tp->t_flags |= TF_DELACK; \
+		TCP_SETDELACK(tp); \
 		(tp)->rcv_nxt += (ti)->ti_len; \
 		flags = (ti)->ti_flags & TH_FIN; \
 		tcpstat.tcps_rcvpack++;\
@@ -628,7 +646,17 @@ findpcb:
 			m->m_len -= sizeof(struct tcpiphdr);
 			sbappend(&so->so_rcv, m);
 			sorwakeup(so);
-			tp->t_flags |= TF_DELACK;
+			TCP_SETDELACK(tp);
+			/*
+			 * The header-prediction fast path returns here without falling
+			 * through to the dodata: "(needoutput || TF_ACKNOW) -> tcp_output"
+			 * at the bottom of the function -- so if TCP_SETDELACK just forced
+			 * the every-other-segment ACK (TF_ACKNOW), send it now. Otherwise
+			 * TF_DELACK is left for tcp_fasttimo. Without this the immediate ACK
+			 * would be stuck until later traffic, worse than the 200ms bound.
+			 */
+			if (tp->t_flags & TF_ACKNOW)
+				(void) tcp_output(tp);
 			return;
 		}
 	}

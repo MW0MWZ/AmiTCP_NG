@@ -532,7 +532,7 @@ static inline void uioread(caddr_t cp, int n, struct uio *uio)
     if (cnt > n)
       cnt = n;
 
-    bcopy(iov->iov_base, cp, cnt); /* wrong direction //pp */
+    ng_bcopy(iov->iov_base, cp, cnt); /* wrong direction //pp */
 
     iov->iov_base += cnt;
     iov->iov_len -= cnt;
@@ -762,7 +762,7 @@ static inline void uiowrite(caddr_t cp, int n, struct uio *uio)
     if (cnt > n)
       cnt = n;
 
-    bcopy(cp, iov->iov_base, cnt);
+    ng_bcopy(cp, iov->iov_base, cnt);
 
     iov->iov_base += cnt;
     iov->iov_len -= cnt;

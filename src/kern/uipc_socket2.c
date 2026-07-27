@@ -576,7 +576,16 @@ sbreserve(sb, cc)
 	u_long cc;
 {
 
-	if (cc > sb_max * mbconf.mclbytes / (MSIZE + mbconf.mclbytes))
+	/*
+	 * Reject a reservation that the mbuf accounting can't back. Divide BEFORE the
+	 * multiply: the natural form sb_max * mclbytes overflows a 32-bit u_long once
+	 * sb_max reaches 2 MB (2097152 * 2048 == 2^32 == 0), which made the test "cc > 0",
+	 * failing EVERY socket -- i.e. all TCP, incl. DNS -- on big-RAM tiers. Dividing
+	 * first keeps every intermediate under 2^32 for any u_long sb_max; the integer
+	 * rounding only makes the cap a few hundred bytes more conservative, harmless given
+	 * the 2x headroom between sb_max and the buffers.
+	 */
+	if (cc > sb_max / (MSIZE + mbconf.mclbytes) * mbconf.mclbytes)
 		return (0);
 	sb->sb_hiwat = cc;
 	sb->sb_mbmax = min(cc * 2, sb_max);
@@ -637,19 +646,28 @@ sbappend(sb, m)
 
 	if (m == 0)
 		return;
-	if ((n = sb->sb_mb)) {
-		while (n->m_nextpkt)
-			n = n->m_nextpkt;
-		do {
+	/*
+	 * Append after the last mbuf of the last record. sb_mbtail gives that in O(1)
+	 * instead of walking the whole chain, which was O(n) per append -> O(n^2) to
+	 * fill a large socket buffer (a real cost now that windows can be 256 KB / ~128
+	 * clusters). sb_mbtail is only trustworthy when the buffer is non-empty: the
+	 * receive path (soreceive) dequeues from the front with raw m_next surgery and
+	 * does not clear sb_mbtail, but it can only free the tail by emptying the buffer
+	 * (all removals are front-removals) -- so sb_mb == 0 is the reliable "empty"
+	 * test, and a stale sb_mbtail is never read while sb_mb != 0. sbcompress()
+	 * updates sb_mbtail to the new last mbuf.
+	 */
+	n = sb->sb_mb ? sb->sb_mbtail : (struct mbuf *)0;
 #ifdef USE_M_EOR
-			if (n->m_flags & M_EOR) {
-				sbappendrecord(sb, m); /* XXXXXX!!!! */
-				return;
-			}
-#endif
-		} while (n->m_next && (n = n->m_next));
+	if (n && (n->m_flags & M_EOR)) {
+		sbappendrecord(sb, m); /* XXXXXX!!!! */
+		return;
 	}
+#endif
 	sbcompress(sb, m, n);
+#ifdef SOCKBUF_DEBUG
+	sbcheck(sb);
+#endif
 }
 
 #ifdef SOCKBUF_DEBUG
@@ -658,6 +676,7 @@ sbcheck(sb)
 	register struct sockbuf *sb;
 {
 	register struct mbuf *m;
+	register struct mbuf *last = 0;
 	register int len = 0, mbcnt = 0;
 
 	for (m = sb->sb_mb; m; m = m->m_next) {
@@ -667,12 +686,17 @@ sbcheck(sb)
 			mbcnt += m->m_ext.ext_size;
 		if (m->m_nextpkt)
 			panic("sbcheck nextpkt");
+		last = m;
 	}
 	if (len != sb->sb_cc || mbcnt != sb->sb_mbcnt) {
 		printf("cc %ld != %ld || mbcnt %ld != %ld\n", len, sb->sb_cc,
 		    mbcnt, sb->sb_mbcnt);
 		panic("sbcheck");
 	}
+	/* The O(1)-append tail must point at the real last mbuf (only meaningful when
+	 * the buffer is non-empty -- see the sb_mbtail note in sbappend). */
+	if (sb->sb_mb && sb->sb_mbtail != last)
+		panic("sbcheck mbtail");
 }
 #endif
 
@@ -755,7 +779,19 @@ sbinsertoob(sb, m0)
 		m->m_flags |= M_EOR;
 	}
 #endif
-	sbcompress(sb, m, m0);
+	/*
+	 * OOB is inserted at *mp, which may be in the MIDDLE of the buffer (before the
+	 * normal-data record). sbcompress() will set sb_mbtail to this OOB record's last
+	 * mbuf -- correct only if the OOB record ended up last. If records follow it
+	 * (m0->m_nextpkt != 0) the real tail is unchanged, so restore it. When the buffer
+	 * was empty, m0->m_nextpkt == 0 and we keep sbcompress's value.
+	 */
+	{
+		register struct mbuf *savetail = sb->sb_mbtail;
+		sbcompress(sb, m, m0);
+		if (m0->m_nextpkt)
+			sb->sb_mbtail = savetail;
+	}
 }
 
 /*
@@ -804,6 +840,8 @@ panic("sbappendaddr");
 		n->m_nextpkt = m;
 	} else
 		sb->sb_mb = m;
+	/* This new record becomes the last record; record its last mbuf as the tail. */
+	{ register struct mbuf *t = m; while (t->m_next) t = t->m_next; sb->sb_mbtail = t; }
 	return (1);
 }
 
@@ -836,6 +874,8 @@ sbappendcontrol(sb, m0, control)
 		n->m_nextpkt = control;
 	} else
 		sb->sb_mb = control;
+	/* This new record becomes the last record; record its last mbuf as the tail. */
+	{ register struct mbuf *t = control; while (t->m_next) t = t->m_next; sb->sb_mbtail = t; }
 	return (1);
 }
 
@@ -902,6 +942,13 @@ sbcompress(sb, m, n)
 			printf("semi-panic: sbcompress\n");
 	}
 #endif
+	/*
+	 * n is now the last mbuf linked into this record. Every append path either
+	 * compresses into the LAST record (sbappend/sbappendrecord) -- so n is the
+	 * buffer tail -- or is the middle-insert sbinsertoob(), which restores
+	 * sb_mbtail itself. Record the tail here for O(1) sbappend.
+	 */
+	sb->sb_mbtail = n;
 }
 
 /*
@@ -917,6 +964,7 @@ sbflush(sb)
 		panic("sbflush");
 	while (sb->sb_mbcnt)
 		sbdrop(sb, (int)sb->sb_cc);
+	sb->sb_mbtail = 0;
 	if (sb->sb_cc || sb->sb_mb)
 		panic("sbflush 2");
 }
@@ -962,6 +1010,9 @@ sbdrop(sb, len)
 		m->m_nextpkt = next;
 	} else
 		sb->sb_mb = next;
+	/* Front-drop can only free the tail mbuf by emptying the buffer. */
+	if (sb->sb_mb == 0)
+		sb->sb_mbtail = 0;
 }
 
 /*
@@ -982,4 +1033,6 @@ sbdroprecord(sb)
 			MFREE(m, mn);
 		} while ((m = mn));
 	}
+	if (sb->sb_mb == 0)
+		sb->sb_mbtail = 0;
 }

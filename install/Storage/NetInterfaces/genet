@@ -26,13 +26,20 @@ requiresinitdelay=no
 iprequests=256
 writerequests=256
 
-# --- Optional overrides (uncomment only if you specifically need them) -----------
-# mtu=1500              Interface MTU. 1500 is already the Ethernet default; you only
-#                       need this to LOWER it for a link that requires a smaller MTU.
-# tcp.sendspace=262144  TCP send/receive socket buffers, in bytes. These are STACK-WIDE
-# tcp.recvspace=262144  (like Roadshow): they set the default for every connection on the
-#                       machine, not just this interface, and persist until reboot. LEAVE
-#                       THEM OUT on a fast machine -- AmiTCP_NG already auto-sizes them by
-#                       RAM (up to ~256 KB on 32 MB+, with window scaling), bigger than the
-#                       classic 64 KB Roadshow figure; a SMALLER value here would REDUCE
-#                       throughput. Only set them to force a size (e.g. to cap memory).
+# --- TCP window (optional) -------------------------------------------------------
+# You normally DON'T need to set this. AmiTCP_NG auto-tunes the TCP window from the
+# NIC's link speed, clamped to what your RAM can back: a gigabit link like this one is
+# sized to ~1 MB automatically. A gigabit link wants a LARGER window than a 100 Mbit
+# one (window = bandwidth x RTT), so it is NOT shrunk the way the ~100 Mbit configs
+# are. See what the stack actually chose with "GetNetStatus DEBUG".
+#
+# Set these only to force a size -- e.g. if your driver misreports its link speed and
+# DEBUG shows the wrong window. They are STACK-WIDE (like Roadshow): they set the
+# default for EVERY connection, not just this interface, and persist until reboot --
+# and any interface's value overrides, last one configured wins.
+# tcp.sendspace=1048576   1 MB -- a good gigabit value.
+# tcp.recvspace=1048576
+
+# --- Other optional overrides (uncomment only if you need them) ------------------
+# mtu=1500              Interface MTU. 1500 is the Ethernet default; only set this to
+#                       LOWER it for a link that requires a smaller MTU.

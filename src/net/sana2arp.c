@@ -389,7 +389,7 @@ ng_arp_announce(struct sana_softc *ssc, struct in_addr addr)
 
 /*
  * RFC 3927 link-local acquisition helpers, driven by the DHCP-failure fallback
- * path in the library (amiga_roadshow.c). That path runs in its own Process, so
+ * path in the library (amiga_roadshow_compat.c). That path runs in its own Process, so
  * every one of these takes splimp() around the instant it touches interface
  * state or the output path -- serialising with the network task exactly as the
  * socket API does. The caller releases the CPU (Delay()) only OUTSIDE these
