@@ -155,6 +155,12 @@ in_pcbbind(inp, nam)
 	register struct inpcb *head = inp->inp_head;
 	register struct sockaddr_in *sin;
 	u_short lport = 0;
+	/* SO_REUSEPORT (4.4BSD-Lite2 / Linux): a duplicate binding is permitted
+	 * only when the socket that already holds the port ALSO opted into
+	 * sharing. reuseport carries THIS socket's consent; it is 0 unless
+	 * SO_REUSEPORT is set (or SO_REUSEADDR on a multicast bind, below), so
+	 * with neither set every conflict is EADDRINUSE exactly as before. */
+	int reuseport = (so->so_options & SO_REUSEPORT);
 
 	if (in_ifaddr == 0)
 		return (EADDRNOTAVAIL);
@@ -165,7 +171,25 @@ in_pcbbind(inp, nam)
 	sin = mtod(nam, struct sockaddr_in *);
 	if (nam->m_len != sizeof (*sin))
 		return (EINVAL);
-	if (sin->sin_addr.s_addr != INADDR_ANY) {
+	if (IN_MULTICAST(ntohl(sin->sin_addr.s_addr))) {
+		/*
+		 * Treat SO_REUSEADDR as SO_REUSEPORT for multicast: allow full
+		 * duplicate binding of a multicast group + port when both this
+		 * and the already-bound socket set SO_REUSEPORT, or (BSD/Linux
+		 * multicast compat) both set SO_REUSEADDR. A multicast address
+		 * is not a local interface address, so skip the ifa check.
+		 *
+		 * Only OR in the bit this socket actually set -- do NOT synthesize
+		 * SO_REUSEPORT the caller never asked for, or consent becomes
+		 * order-dependent (a REUSEADDR-only socket would be allowed to
+		 * share with a REUSEPORT-only one in one bind order but not the
+		 * other). reuseport now mirrors exactly this socket's opted-in
+		 * bits, and the AND-check against the peer's so_options is
+		 * symmetric: both must set the SAME reuse option.
+		 */
+		if (so->so_options & SO_REUSEADDR)
+			reuseport |= SO_REUSEADDR;
+	} else if (sin->sin_addr.s_addr != INADDR_ANY) {
 		int tport = sin->sin_port;
 
 		sin->sin_port = 0;		/* yech... */
@@ -175,6 +199,7 @@ in_pcbbind(inp, nam)
 	}
 	lport = sin->sin_port;
 	if (lport) {
+		struct inpcb *t;
 		u_short aport = ntohs(lport);
 		int wild = 0;
 
@@ -182,26 +207,60 @@ in_pcbbind(inp, nam)
 		if (aport < IPPORT_RESERVED && (so->so_state & SS_PRIV) == 0)
 			return (EACCES);
 		/* even GROSSER, but this is the Internet */
-		if ((so->so_options & SO_REUSEADDR) == 0 &&
+		if ((so->so_options & (SO_REUSEADDR|SO_REUSEPORT)) == 0 &&
 		    ((so->so_proto->pr_flags & PR_CONNREQUIRED) == 0 ||
 		     (so->so_options & SO_ACCEPTCONN) == 0))
 			wild = INPLOOKUP_WILDCARD;
-		if (in_pcblookup(head,
-		    zeroin_addr, 0, sin->sin_addr, lport, wild))
+		/*
+		 * Allow the conflict only if the socket already holding the port
+		 * shares a reuse option we consented to (the anti-hijack rule --
+		 * both sides must opt in). SO_REUSEADDR keeps its old meaning:
+		 * reuseport stays 0 for it, so a plain-REUSEADDR rebind still
+		 * clears a lingering (wildcarded-away) pcb but cannot steal an
+		 * active co-bound socket. NB: AmigaOS has no UID/privilege model,
+		 * so this is cooperative-opt-in hygiene (matching BSD/Linux
+		 * SO_REUSEPORT semantics), not an enforced security boundary.
+		 */
+		t = in_pcblookup(head, zeroin_addr, 0, sin->sin_addr, lport, wild);
+		if (t && (reuseport & t->inp_socket->so_options) == 0)
 			return (EADDRINUSE);
 	}
 	inp->inp_laddr = sin->sin_addr;
 noname:
 	if (lport == 0)
 		do {
-			if (head->inp_lport++ < IPPORT_RESERVED ||
-			    head->inp_lport > IPPORT_USERRESERVED)
-				head->inp_lport = IPPORT_RESERVED;
+			/*
+			 * Roll the shared auto-allocation cursor through the IANA
+			 * dynamic range [IPPORT_ANONMIN, 65535]. A u_short wrap past
+			 * 65535 lands below IPPORT_ANONMIN and is snapped back up, so
+			 * no explicit upper bound is needed (65535 is the ceiling).
+			 */
+			if (++head->inp_lport < IPPORT_ANONMIN)
+				head->inp_lport = IPPORT_ANONMIN;
 			lport = htons(head->inp_lport);
 		} while (in_pcblookup(head,
 			    zeroin_addr, 0, inp->inp_laddr, lport, 0));
 	inp->inp_lport = lport;
 	return (0);
+}
+
+/*
+ * The "primary" local interface address for source selection: the first
+ * NON-loopback in_ifaddr. PORT (AmiTCP_NG): our self-start addresses lo0
+ * (127.0.0.1) before any real interface, so lo0 heads in_ifaddr -- using the
+ * raw list head as "the primary interface" (as stock BSD does) would hand out
+ * 127.0.0.1 as a source address. Skip loopback interfaces; fall back to the
+ * head only if nothing else exists.
+ */
+static struct in_ifaddr *
+in_primary_ifaddr(void)
+{
+	register struct in_ifaddr *ia;
+
+	for (ia = in_ifaddr; ia; ia = ia->ia_next)
+		if ((ia->ia_ifp->if_flags & IFF_LOOPBACK) == 0)
+			return (ia);
+	return (in_ifaddr);
 }
 
 /*
@@ -229,16 +288,19 @@ in_pcbconnect(inp, nam)
 		/*
 		 * If the destination address is INADDR_ANY,
 		 * use the primary local address.
-		 * If the supplied address is INADDR_BROADCAST,
-		 * and the primary interface supports broadcast,
-		 * choose the broadcast address for that interface.
+		 *
+		 * PORT (AmiTCP_NG): INADDR_BROADCAST is deliberately NOT rewritten to
+		 * a directed broadcast here. A limited broadcast (255.255.255.255) is
+		 * left as-is on the wire (what DHCP and RFC 919 want) and is emitted,
+		 * unrouted, by ip_broadcast_flood(); rewriting it to the directed
+		 * broadcast only mattered for the old routed path and depended on the
+		 * (loopback) list head. The source address for the send is chosen from
+		 * a broadcast-capable interface below (rtalloc fails for 255.255.255.255,
+		 * so the in_primary_ifaddr() fallback provides it).
 		 */
 #define	satosin(sa)	((struct sockaddr_in *)(sa))
 		if (sin->sin_addr.s_addr == INADDR_ANY)
-		    sin->sin_addr = IA_SIN(in_ifaddr)->sin_addr;
-		else if (sin->sin_addr.s_addr == (u_long)INADDR_BROADCAST &&
-		  (in_ifaddr->ia_ifp->if_flags & IFF_BROADCAST))
-		    sin->sin_addr = satosin(&in_ifaddr->ia_broadaddr)->sin_addr;
+		    sin->sin_addr = IA_SIN(in_primary_ifaddr())->sin_addr;
 	}
 	if (inp->inp_laddr.s_addr == INADDR_ANY) {
 		register struct route *ro;
@@ -288,7 +350,7 @@ in_pcbconnect(inp, nam)
 			if (ia == 0)
 				ia = in_iaonnetof(in_netof(sin->sin_addr));
 			if (ia == 0)
-				ia = in_ifaddr;
+				ia = in_primary_ifaddr();	/* not the raw head (lo0) */
 			if (ia == 0)
 				return (EADDRNOTAVAIL);
 		}

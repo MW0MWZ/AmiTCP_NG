@@ -117,7 +117,10 @@ struct arptable {
 
 extern struct ifnet loif;
 
-int	useloopback = 0;	/* use loopback interface for local traffic */
+/* DEPRECATED and IGNORED: local traffic ALWAYS uses the software loopback (see
+ * arpresolve() below and ng_config_loopback()). Kept only so an existing
+ * AmiTCP.config with a USELOOPBACK= line still parses; the value has no effect. */
+int	useloopback = 1;
 
 static void arpwhohas(register struct sana_softc *ssc, struct in_addr * addr);
 static void in_arpinput(register struct sana_softc *ssc, struct mbuf *m);
@@ -164,15 +167,6 @@ alloc_arptable(struct sana_softc* ssc, int to_allocate)
   }
 
   ssc->ss_arp.table = atab;
-}
-
-/* 
- * Notification function for arp entries 
- */
-LONG 
-arpentries_notify(void *dummy, LONG value)
-{
-  return (ULONG)value > ARPENTRIES_MIN;
 }
 
 /*
@@ -234,6 +228,19 @@ arptnew(u_long addr, struct arptable *atb, int permanent)
       }
       if (oldest) {
 	Remove((struct Node *)oldest);
+	/* The evicted entry may still hold a queued packet awaiting resolution;
+	 * free it before the slot is reused (as arptfree()/arpresolve() do), else
+	 * the caller's at_hold = m overwrites and leaks it. NULL it so a later
+	 * arptfree() of this reused slot cannot double-free the same mbuf. */
+	if (oldest->at_hold) {
+	  m_freem(oldest->at_hold);
+	  oldest->at_hold = NULL;
+	}
+	/* It was selected as "oldest" precisely because its timer was nearest the
+	 * kill threshold; restart it or the reused entry can be aged out on the
+	 * very next arptimer() tick before it resolves (the free-list path gets
+	 * this for free via arptfree(), which zeroes at_timer). */
+	oldest->at_timer = 0;
 	at = oldest;
       } else {
 	at = NULL;
@@ -551,32 +558,26 @@ arpresolve(register struct sana_softc *ssc,
   if (m->m_flags & M_BCAST) {	/* broadcast */
     return 1;
   }
-  /* if for us, use software loopback driver if up */
+  /*
+   * Destined to one of OUR OWN addresses: deliver it back to ourselves through
+   * the software loopback, unconditionally. (Historically this was gated on the
+   * "useloopback" knob, whose "off" mode forced local traffic out the hardware
+   * for testing -- but a SANA-II board that "can't hear its own transmissions"
+   * -- IFF_SIMPLEX, the default -- never receives a unicast it sends to its own
+   * address, so the "off" mode simply loses the packet. The knob is deprecated;
+   * to-self always loops back.) looutput() needs only the static loif ifnet, so
+   * this works even if lo0 was never addressed.
+   */
   for (ia = in_ifaddr; ia; ia = ia->ia_next)
     if ((ia->ia_ifp == &ssc->ss_if) &&
 	(destip->s_addr == ia->ia_addr.sin_addr.s_addr)) {
+      sin.sin_family = AF_INET;
+      sin.sin_addr = *destip;
+      (void) looutput(&loif, m, (struct sockaddr *)&sin, 0);
       /*
-       * This test used to be
-       *	if (loif.if_flags & IFF_UP)
-       * It allowed local traffic to be forced
-       * through the hardware by configuring the loopback down.
-       * However, it causes problems during network configuration
-       * for boards that can't receive packets they send.
-       * It is now necessary to clear "useloopback"
-       * to force traffic out to the hardware.
+       * The packet has already been sent and freed.
        */
-      if (useloopback) {
-	sin.sin_family = AF_INET;
-	sin.sin_addr = *destip;
-	(void) looutput(&loif, m, (struct sockaddr *)&sin, 0);
-	/*
-	 * The packet has already been sent and freed.
-	 */
-	return (0);
-      } else {
-	bcopy((caddr_t)ssc->ss_hwaddr, (caddr_t)desten, ssc->ss_if.if_addrlen);
-	return (1);
-      }
+      return (0);
     }
 
   if (ssc->ss_if.if_flags & IFF_NOARP) {

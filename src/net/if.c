@@ -98,7 +98,6 @@ void if_attach(struct ifnet *);
 struct ifaddr *ifa_ifwithaddr(register struct sockaddr *);
 struct ifaddr *ifa_ifwithdstaddr(register struct sockaddr *);
 struct ifaddr *ifa_ifwithnet(struct sockaddr *);
-struct ifaddr *ifa_ifwithaf(register int );
 struct ifaddr *ifaof_ifpforaddr(struct sockaddr *, register struct ifnet *);
 void link_rtrequest(int, struct rtentry *, struct sockaddr *);
 void if_down(register struct ifnet *);
@@ -356,23 +355,6 @@ ifa_ifwithnet(addr)
 }
 
 /*
- * Find an interface using a specific address family
- */
-struct ifaddr *
-ifa_ifwithaf(af)
-	register int af;
-{
-	register struct ifnet *ifp;
-	register struct ifaddr *ifa;
-
-	for (ifp = ifnet; ifp; ifp = ifp->if_next)
-	    for (ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next)
-		if (ifa->ifa_addr->sa_family == af)
-			return (ifa);
-	return ((struct ifaddr *)0);
-}
-
-/*
  * Find an interface address specific to an interface best matching
  * a given address.
  */
@@ -481,19 +463,25 @@ if_qflush(ifq)
 void
 if_slowtimo()
 {
-  /*
-   * This routine is disabled since there are 
-   * no timeouts in our network interfaces
-   */
-#ifndef AMITCP			
 	register struct ifnet *ifp;
 	spl_t s = splimp();
 
+	/*
+	 * PORT (AmiTCP_NG): re-enabled (was fully compiled out under #ifndef AMITCP
+	 * -- "no timeouts in our network interfaces"). Walk the interfaces and fire
+	 * each one's if_watchdog when its if_timer counts down to 0. The SANA driver
+	 * uses this to re-arm receive requests retired under mbuf-pool pressure (see
+	 * sana_watchdog / sana_rearm_reads in net/if_sana.c) -- the backstop that
+	 * recovers a receive ring bled to zero, which no device completion would wake.
+	 * The if_watchdog is called with the ifnet pointer (AmiTCP_NG convention; the
+	 * only watchdog in the tree, sana_watchdog, expects it). The ~1 s periodic
+	 * timer that calls this is scheduled from amiga_time.c.
+	 */
 	for (ifp = ifnet; ifp; ifp = ifp->if_next) {
 		if (ifp->if_timer == 0 || --ifp->if_timer)
 			continue;
 		if (ifp->if_watchdog)
-			(*ifp->if_watchdog)(ifp->if_unit);
+			(*ifp->if_watchdog)(ifp);
 	}
 	splx(s);
 #ifndef AMITCP
@@ -501,7 +489,6 @@ if_slowtimo()
 	 * Timeouts are scheduled from amiga_time.c in AmiTCP/IP.
 	 */
 	timeout(if_slowtimo, (caddr_t)0, hz / IFNET_SLOWHZ);
-#endif
 #endif
 }
 

@@ -64,7 +64,7 @@ STRPTR KW_VARS = (STRPTR)
   "NTH=NTHBASE,DBSANA=DEBUGSANA,DBICMP=DEBUGICMP,DBIP=DEBUGIP,"
   "GTW=GATEWAY,REDIR=IPSENDREDIRECTS,USENS=USENAMESERVER,"
   "ULO=USELOOPBACK,TCPSND=TCP_SENDSPACE,TCPRCV=TCP_RECVSPACE,"
-  "CON=CONSOLENAME,LOGF=LOGFILENAME";
+  "TCPMSS=TCP_MSSDFLT,TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,LOGF=LOGFILENAME";
 
 /* extern declarations */
 
@@ -92,6 +92,8 @@ extern LONG usens;
 extern LONG useloopback;
 extern ULONG tcp_sendspace;
 extern ULONG tcp_recvspace;
+extern int tcp_mssdflt;
+extern int tcp_iw;
 extern STRPTR consolename ;	 int logname_changed(void *pt, LONG new);
 extern STRPTR logfilename;
 /* Global variables */
@@ -121,6 +123,8 @@ struct cfg_variable variables[] = {
 { VAR_ENUM, VF_RW, NULL, &useloopback, boolean_enum },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_sendspace, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_recvspace, NULL },
+{ VAR_LONG, VF_RW, NULL, (LONG*)&tcp_mssdflt, NULL },
+{ VAR_LONG, VF_RW, NULL, (LONG*)&tcp_iw, NULL },
 { VAR_STRP, VF_RW, NULL, &consolename, logname_changed },
 { VAR_STRP, VF_RW, NULL, &logfilename, logname_changed }
 };

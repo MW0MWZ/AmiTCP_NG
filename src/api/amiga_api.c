@@ -410,11 +410,6 @@ LONG /* SAVEDS */ Null(void)
   return 0L;
 }
 
-LONG /* SAVEDS */ Garbage(void)
-{     
-  return -1L;
-}
-
 
 ULONG * SAVEDS RAF1(UL_Close,
 	  struct SocketBase *,	libPtr, a6)

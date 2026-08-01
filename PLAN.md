@@ -7,7 +7,12 @@
 > real 68k hardware) as a self-starting drop-in `bsdsocket.library`, with a working
 > DHCP client, the Roadshow-compatible extension API, a complete Roadshow-compatible
 > command set, an Amiga Installer, Berkeley Packet Filter (`bpf_*`) packet capture,
-> and real-network validation (DHCP, DNS, `ping`). The IP-filter `ipf_*` firewall
+> and real-network validation (DHCP, DNS, `ping`). Beyond the original plan the
+> stack has since been **modernised** (RFC 1323 window scaling + timestamps,
+> RFC 6928 IW10, SACK loss recovery), **hardened** (RFC 6528 randomised ISNs,
+> RFC 5961, a whole-codebase memory-safety review), and gained RFC 3927 ZeroConf,
+> a DNS cache, RAM/link-speed self-tuning, and correct same-segment broadcast +
+> loopback. The IP-filter `ipf_*` firewall
 > vectors remain deliberately deferred (see
 > [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md)).
 
@@ -51,7 +56,7 @@ Compile-first, then runtime on a **networked emulated AmigaOS**: FS-UAE (Linux) 
 - **It runs** — loads on emulated WB3.x, opens a SANA-II driver, ARP+ping over UDP/ICMP. **[done — self-starting drop-in library; real-network validated]**
 - **DHCP** — add the DHCP client (replaces AmiTCP's BOOTP). **[done — full DORA lease]**
 - **Roadshow-compat shim** — implement the extension vectors at exact SFD offsets; drive it with Roadshow's `AddNetInterface`/`Online`/`ShowNetStatus`. **[done — plus our own clean-room Roadshow-compatible command set and an Installer]**
-- **Modernize** — `getaddrinfo`, fixes; optional `bpf_*`/`ipf_*`. **[getaddrinfo and `bpf_*` packet capture done; the `ipf_*` firewall deliberately deferred]**
+- **Modernize** — `getaddrinfo`, fixes; optional `bpf_*`/`ipf_*`. **[getaddrinfo and `bpf_*` packet capture done. Also: modern TCP (RFC 1323 scaling/timestamps, RFC 6928 IW10, SACK), security hardening (RFC 6528, RFC 5961, memory-safety review), RFC 3927 ZeroConf, DNS cache, RAM/link-speed self-tuning, correct broadcast + loopback. The `ipf_*` firewall deliberately deferred]**
 
 ## Layout
 ```

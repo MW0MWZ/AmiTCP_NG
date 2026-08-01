@@ -266,6 +266,8 @@ getvalue(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 	break;
       case VAR_STRP:
 	value = ((UBYTE **)variables[var].value)[index];
+	if (value == NULL)		/* e.g. TASKNAME is unset in the library build */
+	  value = (UBYTE *)"";
 	vlen  = strlen((char *)value);
 	break;
       case VAR_INET:

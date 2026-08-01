@@ -115,13 +115,13 @@ typedef unsigned long bpf_u_int32;
 { \
 	if ((_k) < 0) \
 		return 0; \
-	len = MLEN(m); \
+	len = MLEN(_m); \
 	while ((_k) >= len) { \
 		(_k) -= len; \
 		(_m) = (_m)->m_next; \
 		if ((_m) == 0) \
 			return 0; \
-		len = MLEN(m); \
+		len = MLEN(_m); \
 	} \
 }
 

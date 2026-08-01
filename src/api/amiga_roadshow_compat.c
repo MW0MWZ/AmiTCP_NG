@@ -422,6 +422,7 @@ ng_flush_dynamic_nameservers(void)
 #define NGCT_WriteRequests	(TAG_USER + 0x004E4702)	/* LONG send requests    */
 #define NGCT_TcpSendspace	(TAG_USER + 0x004E4703)	/* LONG TCP send buffer  */
 #define NGCT_TcpRecvspace	(TAG_USER + 0x004E4704)	/* LONG TCP recv buffer  */
+#define NGCT_TcpMssdflt		(TAG_USER + 0x004E4705)	/* LONG off-subnet MSS cap */
 
 /* IFC_State values (Roadshow SM_* interface-state machine). */
 #define NG_SM_Offline	0
@@ -686,6 +687,36 @@ static BOOL ng_tcp_user_override = FALSE;
  */
 u_long ng_last_if_baudrate = 0;
 
+/*
+ * ng_effective_window -- the effective default TCP window (bytes) for a link of the
+ * given baud, applying the SAME policy as the global auto-tune below (the sndsp/rcvsp
+ * block in AddInterfaceTagList): an explicit user tcp.sendspace/recvspace override
+ * wins; otherwise the link-speed target (ng_speed_window) clamped to the FIXED RAM
+ * ceiling captured at boot; otherwise (unknown/zero baud) the current RAM-tier default.
+ *
+ * Exported so net/sana2config.c can size the SANA-II request rings (read + write) on
+ * the SAME window the sockets get -- the rings are sized in ssconfig() (inside
+ * iface_make()) which runs BEFORE the global auto-tune has stored its value, so the
+ * rings must derive the window from THIS interface's if_baudrate directly rather than
+ * reading the not-yet-updated tcp_sendspace/recvspace globals.
+ */
+u_long
+ng_effective_window(u_long baud)
+{
+  extern u_long tcp_sendspace, tcp_recvspace, ng_ram_ceiling;
+  u_long want, ceil;
+  u_long def = (tcp_sendspace > tcp_recvspace) ? tcp_sendspace : tcp_recvspace;
+
+  if (ng_tcp_user_override)		/* a config override forces the window */
+    return def;
+  want = ng_speed_window(baud);
+  if (want == 0)			/* driver reports no speed -> keep the RAM default */
+    return def;
+  ceil = ng_ram_ceiling ? ng_ram_ceiling : def;
+  if (want > ceil) want = ceil;		/* RAM stays the ceiling */
+  return want;
+}
+
 LONG SAVEDS RAF5(_AddInterfaceTagList,
 		 struct SocketBase *,	libPtr,		a6,
 		 STRPTR,		interface_name,	a0,
@@ -697,6 +728,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
 #endif
   int error;
   long ipreq, wreq, sndsp, rcvsp;	/* sndsp/rcvsp needed again for the auto-tune below */
+  long mssd;				/* tcp.mssdflt= off-subnet MSS cap (0 = keep global) */
 
   CHECK_TASK();
 
@@ -718,12 +750,13 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
    * RAM-tiered default. ng_apply_iface_config() below ignores these private tags.
    */
   { struct TagItem *ti, *tstate = tags;
-    ipreq = wreq = sndsp = rcvsp = 0;
+    ipreq = wreq = sndsp = rcvsp = mssd = 0;
     while ((ti = ng_nexttag(&tstate)) != NULL) {
       if (ti->ti_Tag == NGCT_IPRequests)         ipreq = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_WriteRequests) wreq  = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_TcpSendspace)  sndsp = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_TcpRecvspace)  rcvsp = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpMssdflt)    mssd  = (long)ti->ti_Data;
     }
     /*
      * Honour an explicit tcp.sendspace= / tcp.recvspace= from the interface config by
@@ -759,6 +792,18 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
        */
       if (2 * tcp_sendspace > sb_max) sb_max = 2 * tcp_sendspace;
       if (2 * tcp_recvspace > sb_max) sb_max = 2 * tcp_recvspace;
+    }
+    /*
+     * tcp.mssdflt= off-subnet MSS cap. GLOBAL and whole-stack (the clamp in
+     * tcp_mss() reads this global at connection time, not per-interface), same
+     * model as tcp_sendspace/recvspace above: last writer wins, persists until
+     * reboot, interface config overrides the AmiTCP.config/default value. 0 here
+     * means the key was absent -> leave the global (auto MTU-40, or a prior set).
+     * Clamp to <=65535: t_maxseg is a u_short, a larger value truncates.
+     */
+    if (mssd > 0) {
+      extern int tcp_mssdflt;
+      tcp_mssdflt = (mssd > 65535) ? 65535 : (int)mssd;
     }
   }
   {
@@ -1107,6 +1152,15 @@ VOID SAVEDS RAF2(_ReleaseInterfaceList,
 #define IFQ_Metric		(IFQ_BASE + 18)
 #define IFQ_State		(IFQ_BASE + 19)
 #define IFQ_HardwareMTU		(IFQ_BASE + 34)
+/* AmiTCP_NG-private interface query (NOT a Roadshow IFQ_ tag): the effective TCP
+ * MSS the stack computes for this interface -- interface MTU minus IP+TCP headers,
+ * clamped by any tcp.mssdflt override. The stack is the single source of truth so
+ * a tool never recomputes (and mis-reports) it. MUST match src/tools/ng_lvo.h. */
+#define NGIFQ_TcpMss		(TAG_USER + 0x004E4730)
+/* AmiTCP_NG-private transmit drop/error breakdown (see if_sana.c). MUST match ng_lvo.h. */
+#define NGIFQ_OutErrors		(TAG_USER + 0x004E4731)	/* if_oerrors: media/device TX errors   */
+#define NGIFQ_OutNoBuf		(TAG_USER + 0x004E4732)	/* TX drops: send-tag mbuf alloc failed */
+#define NGIFQ_InNoBuf		(TAG_USER + 0x004E4733)	/* RX drops: read re-post mbuf alloc fail */
 /* Per-interface I/O counters a monitor (NetMon) queries. This stack's ifnet/SANA softc
  * do not track most of them; we still answer with a plausible value (0, or the I/O
  * request-pool size) so a tool never reads its own uninitialised buffer as the result. */
@@ -1255,6 +1309,11 @@ LONG SAVEDS RAF3(_QueryInterfaceTagList,
     switch (ti->ti_Tag) {
     /* --- generic (any interface, incl. lo0) --- */
     case IFQ_MTU:              *(LONG *)d  = (LONG)ifp->if_mtu;      break;
+    case NGIFQ_TcpMss: {
+      extern int ng_iface_mss(struct ifnet *);
+      *(LONG *)d = (LONG)ng_iface_mss(ifp);	/* stack computes it, override-aware */
+      break;
+    }
     case IFQ_BPS:              *(LONG *)d  = (LONG)ifp->if_baudrate; break;
     case IFQ_Metric:           *(LONG *)d  = (LONG)ifp->if_metric;   break;
     case IFQ_State:
@@ -1298,11 +1357,27 @@ LONG SAVEDS RAF3(_QueryInterfaceTagList,
        * (bumped as if_iqdrops on the SANA receive path). */
       *(ULONG *)d = (ULONG)ifp->if_iqdrops;
       break;
+    case IFQ_OutputDrops:
+      /* Output drops: packets dropped because the transmit queue was full. */
+      *(ULONG *)d = (ULONG)ifp->if_snd.ifq_drops;
+      break;
+    case NGIFQ_OutErrors:
+      /* Output errors: genuine media/device transmit failures (if_oerrors). */
+      *(ULONG *)d = (ULONG)ifp->if_oerrors;
+      break;
+    case NGIFQ_OutNoBuf:
+      /* TX drops from send-tag mbuf exhaustion -- RX pressure starving TX. */
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_txnobuf : 0;
+      break;
+    case NGIFQ_InNoBuf:
+      /* RX drops from read re-post mbuf exhaustion -- the receive-side twin of
+       * NGIFQ_OutNoBuf; the true mbuf-starvation signal on the download path. */
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_rxnobuf : 0;
+      break;
     case IFQ_Overruns:
     case IFQ_UnknownTypes:
     case IFQ_NumReadRequestsPending:
     case IFQ_NumWriteRequestsPending:
-    case IFQ_OutputDrops:
     case IFQ_IPDrops:
     case IFQ_ARPDrops:
       *(ULONG *)d = 0;
@@ -2058,18 +2133,17 @@ BOOL SAVEDS RAF3(_GetDefaultDomainName,
   return found ? TRUE : FALSE;
 }
 
-/* SetDefaultDomainName (LVO -708): make `buffer` the sole default domain. */
-VOID SAVEDS RAF2(_SetDefaultDomainName,
-		 struct SocketBase *,	libPtr,	a6,
-		 STRPTR,		buffer,	a0)
-#if 0
+/* Make `name` the sole default search domain: drop any existing domains and
+ * install this one. Shared by SetDefaultDomainName (the LVO) and the DHCP
+ * initial-config path (so a DHCP-provided domain populates the resolver's search
+ * list). A no-op on NULL/empty. */
+void
+ng_set_default_domain(const char *name)
 {
-#endif
   struct DomainentNode *dn, *next;
   int nodesize;
 
-  (void)libPtr;
-  if (buffer == NULL)
+  if (name == NULL || *name == '\0')
     return;
 
   LOCK_W_NDB(NDB);
@@ -2083,15 +2157,56 @@ VOID SAVEDS RAF2(_SetDefaultDomainName,
   }
 
   /* Install the new default (node carries its own name string, as adddomainent). */
-  nodesize = sizeof(*dn) + strlen((char *)buffer) + 1;
+  nodesize = sizeof(*dn) + strlen(name) + 1;
   if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) != NULL) {
     dn->dn_EntSize = nodesize - sizeof(struct GenentNode);
     dn->dn_Ent.d_name = (char *)(dn + 1);
-    strcpy((char *)(dn + 1), (char *)buffer);
+    strcpy((char *)(dn + 1), name);
     AddTail((struct List *)&NDB->ndb_Domains, (struct Node *)dn);
   }
 
   UNLOCK_NDB(NDB);
+}
+
+/* Install `name` as the search domain ONLY if none is set yet. Used by the
+ * background DHCP upgrade (link-local -> a lease won later) so it fills an
+ * unconfigured search domain without clobbering an explicit domain= the caller
+ * already set: at that point a non-empty list can only be that explicit domain
+ * (a background upgrade means initial DHCP failed, so there is no initial-DHCP
+ * domain to preserve). The check-and-add is atomic under the write lock, and it
+ * only AddTail()s (never Remove()s/frees), so it is safe against a concurrent
+ * unlocked res_search() walk -- the added node's link is a single atomic write. */
+void
+ng_set_default_domain_if_empty(const char *name)
+{
+  struct DomainentNode *dn;
+  int nodesize;
+
+  if (name == NULL || *name == '\0')
+    return;
+
+  LOCK_W_NDB(NDB);
+  if (((struct DomainentNode *)NDB->ndb_Domains.mlh_Head)->dn_Node.mln_Succ == NULL) {
+    nodesize = sizeof(*dn) + strlen(name) + 1;
+    if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) != NULL) {
+      dn->dn_EntSize = nodesize - sizeof(struct GenentNode);
+      dn->dn_Ent.d_name = (char *)(dn + 1);
+      strcpy((char *)(dn + 1), name);
+      AddTail((struct List *)&NDB->ndb_Domains, (struct Node *)dn);
+    }
+  }
+  UNLOCK_NDB(NDB);
+}
+
+/* SetDefaultDomainName (LVO -708): make `buffer` the sole default domain. */
+VOID SAVEDS RAF2(_SetDefaultDomainName,
+		 struct SocketBase *,	libPtr,	a6,
+		 STRPTR,		buffer,	a0)
+#if 0
+{
+#endif
+  (void)libPtr;
+  ng_set_default_domain((const char *)buffer);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -2538,6 +2653,22 @@ LONG SAVEDS RAF6(_CreateAddrAllocMessageA,
     timeout = 10;
   cidlen = clientid ? (strlen((char *)clientid) + 1) : 0;
 
+  /*
+   * Validate the caller-supplied size tags before they drive the allocation
+   * arithmetic below: a negative value, or a count big enough to overflow the
+   * offset math, would under-reserve (even shrink `total` below sizeof(ng_aam))
+   * and cause a heap overflow when the fixed fields are written. Real DHCP
+   * fields are far under these caps; an out-of-range request is a caller bug.
+   */
+  if (naksz < 0 || routersz < 0 || dnssz < 0 || staticsz < 0 ||
+      hostsz < 0 || domainsz < 0 || bootpsz < 0 ||
+      naksz > 0x10000 || hostsz > 0x10000 || domainsz > 0x10000 ||
+      bootpsz > 0x10000 ||
+      routersz > 0x4000 || dnssz > 0x4000 || staticsz > 0x4000) {
+    writeErrnoValue(libPtr, EINVAL);
+    return (EINVAL);
+  }
+
   /* Single allocation: message + every requested result buffer, 4-byte aligned. */
   total = NG_A4(sizeof(struct ng_aam));
 #define NG_RESV(field_off, bytes) do { field_off = total; total += NG_A4(bytes); } while (0)
@@ -2631,7 +2762,8 @@ struct RoadshowDataNode {
 };
 
 /* Live stack tunables (defined across the BSD core). */
-extern int    ipforwarding, ipsendredirects, subnetsarelocal, tcp_mssdflt, udpcksum;
+extern int    ipforwarding, ipsendredirects, subnetsarelocal, tcp_mssdflt, tcp_iw, udpcksum;
+extern int    tcp_do_sack, tcp_do_rfc3042;
 extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 
 struct ng_rsd_opt { const char *name; UWORD flags; void *data; };
@@ -2640,6 +2772,9 @@ static const struct ng_rsd_opt ng_rsd_opts[] = {
   { "ip.sendredirects",   0, &ipsendredirects },
   { "ip.subnetsarelocal", 0, &subnetsarelocal },
   { "tcp.mssdflt",        0, &tcp_mssdflt     },
+  { "tcp.iw",             0, &tcp_iw          },
+  { "tcp.sack",           0, &tcp_do_sack     },
+  { "tcp.rfc3042",        0, &tcp_do_rfc3042  },
   { "tcp.recvspace",      0, &tcp_recvspace   },
   { "tcp.sendspace",      0, &tcp_sendspace   },
   { "udp.cksum",          0, &udpcksum        },
@@ -3139,7 +3274,13 @@ static UBYTE *dhcp_find(struct dhcp_pkt *pkt, UBYTE code, int *len)
     if (c == 0) continue;			/* pad */
     if (p >= end) break;
     l = *p++;
-    if (c == code) { if (len) *len = l; return p; }
+    if (c == code) {
+      /* Clamp the server-declared length to what's actually left in the buffer so
+       * a malformed option cannot make a caller read past the packet. */
+      if (p + l > end) l = (UBYTE)(end - p);
+      if (len) *len = l;
+      return p;
+    }
     p += l;
   }
   return NULL;
@@ -3307,7 +3448,8 @@ ng_linklocal_acquire(struct Library *sb, const char *ifname,
 #define NG_DHCP_ABORT   2
 
 /* What a won lease carries (all network byte order, 0 = absent). */
-struct ng_lease { ULONG addr, serverid, mask, router, dns0, lease; };
+#define NG_DHCP_MAXDNS 3	/* DNS servers captured from a DHCP DHO_DNS option */
+struct ng_lease { ULONG addr, serverid, mask, router, dns[NG_DHCP_MAXDNS], lease; char domain[128]; };
 
 /*
  * Run one DISCOVER/OFFER/REQUEST/ACK exchange on the already-bound socket s,
@@ -3326,7 +3468,9 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
   long i, r, sent, msgtype;
 
   ng_sain_set(&to, 0xFFFFFFFFUL, DHCP_SERVER_PORT);
-  L->addr = L->serverid = L->mask = L->router = L->dns0 = L->lease = 0;
+  L->addr = L->serverid = L->mask = L->router = L->lease = 0;
+  L->domain[0] = 0;
+  bzero((caddr_t)L->dns, sizeof(L->dns));
   sent = 0; msgtype = DHCPDISCOVER;
   for (i = 0; i < deadline; i++) {
     if (ctx->dc_abort) return NG_DHCP_ABORT;
@@ -3373,10 +3517,23 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
           L->mask = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
         if ((op = dhcp_find(rx, DHO_ROUTERS, &ol)) && ol>=4)
           L->router = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
-        if ((op = dhcp_find(rx, DHO_DNS, &ol)) && ol>=4)
-          L->dns0 = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
+        /* DHO_DNS may carry several servers (4 bytes each); capture up to
+         * NG_DHCP_MAXDNS of them. ol is already clamped to the packet by dhcp_find. */
+        if ((op = dhcp_find(rx, DHO_DNS, &ol)) && ol >= 4) {
+          int di;
+          for (di = 0; (di + 1) * 4 <= ol && di < NG_DHCP_MAXDNS; di++)
+            L->dns[di] = ((ULONG)op[di*4]<<24)|((ULONG)op[di*4+1]<<16)|
+                         ((ULONG)op[di*4+2]<<8)|op[di*4+3];
+        }
         if ((op = dhcp_find(rx, DHO_LEASE_TIME, &ol)) && ol>=4)
           L->lease = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
+        /* DHO_DOMAIN (option 15): the search domain. dhcp_find clamps `ol` to the
+         * packet, and we cap at the buffer, so the copy is bounded both ways. */
+        if ((op = dhcp_find(rx, DHO_DOMAIN, &ol)) && ol > 0) {
+          int k = (ol < (int)sizeof(L->domain) - 1) ? ol : (int)sizeof(L->domain) - 1;
+          bcopy((caddr_t)op, (caddr_t)L->domain, k);
+          L->domain[k] = 0;
+        }
         return NG_DHCP_GOT;
       }
       if (msgtype == DHCPREQUEST && t == DHCPNAK) { msgtype = DHCPDISCOVER; L->addr = 0; i = -1; continue; }
@@ -3422,7 +3579,9 @@ ng_apply_lease(struct Library *sb, const char *ifname, const struct ng_lease *L)
    * configured servers (from the config file, nsn_Dynamic == 0) are preserved.
    */
   ng_flush_dynamic_nameservers();
-  if (L->dns0) { ng_ip2str(L->dns0, dnsstr); (void)d_adddns(sb, dnsstr); }
+  { int di;
+    for (di = 0; di < NG_DHCP_MAXDNS; di++)
+      if (L->dns[di]) { ng_ip2str(L->dns[di], dnsstr); (void)d_adddns(sb, dnsstr); } }
   return 0;
 }
 
@@ -3505,6 +3664,9 @@ ng_dhcp_background(struct Library *sb, long s, struct dhcp_pkt *tx,
       if (rc == NG_DHCP_GOT) {
 	D_LOG("bg_dhcp_ok", L.addr & 0xffff);
 	(void)ng_apply_lease(sb, ifname, &L);	/* upgraded to a real lease -- done */
+	/* Fill the search domain from this late lease IFF none is set (so we never
+	 * clobber an explicit domain=). See ng_set_default_domain_if_empty. */
+	if (L.domain[0]) ng_set_default_domain_if_empty(L.domain);
 	return;
       }
     }
@@ -3592,13 +3754,31 @@ static SAVEDS void ng_dhcp_task(void)
     if (rc == NG_DHCP_ABORT) { aam->aam_Result = AAMR_Aborted; goto reply; }
     if (rc == NG_DHCP_GOT) {
       if (ng_apply_lease(sb, ifname, &L) != 0) { aam->aam_Result = AAMR_AddrChangeFailed; goto reply; }
+      /* Install the DHCP search domain -- INITIAL config only, so a later
+       * background renewal/upgrade (ng_dhcp_background) never re-sets it and
+       * clobbers an explicit domain=. This runs before we ReplyMsg, so the tool
+       * applies any explicit domain= AFTER us: priority explicit > DHCP >
+       * hostname-derived (the last being res_search's fallback). */
+      if (L.domain[0]) ng_set_default_domain(L.domain);
       aam->aam_Address = L.addr;
       aam->aam_ServerAddress = L.serverid;
       aam->aam_SubnetMask = L.mask;
       aam->aam_LeaseTime = L.lease;
       aam->aam_RequestedAddress = 0;
       if (aam->aam_RouterTable && aam->aam_RouterTableSize >= 1) aam->aam_RouterTable[0] = L.router;
-      if (aam->aam_DNSTable && aam->aam_DNSTableSize >= 1) aam->aam_DNSTable[0] = L.dns0;
+      if (aam->aam_DNSTable) {
+        long di;
+        for (di = 0; di < aam->aam_DNSTableSize && di < NG_DHCP_MAXDNS; di++)
+          aam->aam_DNSTable[di] = L.dns[di];
+      }
+      /* Report the domain in the aam too (Roadshow AAM protocol), if the caller
+       * allocated the buffer. Bounded copy. */
+      if (aam->aam_DomainName && aam->aam_DomainNameSize > 0) {
+        long dl = (long)strlen(L.domain);
+        if (dl > aam->aam_DomainNameSize - 1) dl = aam->aam_DomainNameSize - 1;
+        bcopy((caddr_t)L.domain, (caddr_t)aam->aam_DomainName, dl);
+        aam->aam_DomainName[dl] = 0;
+      }
       if (aam->aam_BOOTPMessage && aam->aam_BOOTPMessageSize > 0) {
         long n = aam->aam_BOOTPMessageSize; if (n > (long)sizeof(*rx)) n = sizeof(*rx);
         bcopy((caddr_t)rx, (caddr_t)aam->aam_BOOTPMessage, n);

@@ -133,6 +133,47 @@ static long usec_diff(struct timeval *a, struct timeval *b)
   return (long)(b->tv_secs - a->tv_secs) * 1000000L + ((long)b->tv_micro - (long)a->tv_micro);
 }
 
+/* Sleep ~secs seconds between pings, but wake immediately on Ctrl-C. Returns 1 if
+ * Ctrl-C arrived (caller should stop), else 0. Plain Delay() ignores Ctrl-C, which
+ * is why ping used to hang for a whole interval before quitting. Reuses the
+ * timer.device request (idle here -- timer_now() only runs in the send/reply phase)
+ * for an async TR_ADDREQUEST and waits on its port signal OR the break signal. */
+static int ng_sleep_or_break(long secs)
+{
+  ULONG tsig, sigs;
+
+  if (secs <= 0)		/* nothing to wait for: just report a pending Ctrl-C */
+    return (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) ? 1 : 0;
+
+  if (!g_treq || !g_tport) {	/* no timer.device: sliced Delay, break within ~1/5 s */
+    long ticks = secs * 50;	/* 50 ticks/second */
+    while (ticks > 0) {
+      long chunk = (ticks > 10) ? 10 : ticks;
+      Delay((ULONG)chunk);
+      ticks -= chunk;
+      if (SetSignal(0L, 0L) & SIGBREAKF_CTRL_C) return 1;
+    }
+    return 0;
+  }
+
+  tsig = 1UL << g_tport->mp_SigBit;
+  SetSignal(0L, tsig);		/* clear any stale timer signal before we wait on it */
+  g_treq->tr_node.io_Command = TR_ADDREQUEST;
+  g_treq->tr_time.tv_secs    = secs;
+  g_treq->tr_time.tv_micro   = 0;
+  SendIO((struct IORequest *)g_treq);
+
+  sigs = Wait(tsig | SIGBREAKF_CTRL_C);
+
+  if (sigs & SIGBREAKF_CTRL_C) {
+    AbortIO((struct IORequest *)g_treq);	/* cancel the pending timer... */
+    WaitIO((struct IORequest *)g_treq);		/* ...and reap it off the port */
+    return 1;
+  }
+  WaitIO((struct IORequest *)g_treq);		/* timer fired: reap the reply */
+  return 0;
+}
+
 int main(void)
 {
   struct RDArgs *rda;
@@ -284,7 +325,11 @@ int main(void)
     }
     Flush(Output());
 
-    if (count < 0 || i + 1 < count) Delay((ULONG)interval * 50);	/* ~interval seconds */
+    /* ~interval seconds between pings, but quit at once on Ctrl-C (Delay() would
+     * ignore it and stall for the whole interval). */
+    if (count < 0 || i + 1 < count) {
+      if (ng_sleep_or_break(interval)) { stop = 1; break; }
+    }
   }
 
   Printf((STRPTR)"\n--- %s ping statistics ---\n", (LONG)namebuf);

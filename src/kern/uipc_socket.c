@@ -347,7 +347,8 @@ sofree(so)
 		so->so_head = 0;
 	}
 	sbrelease(&so->so_snd);
-	sorflush(so);
+	if (sorflush(so) != 0)
+		return;		/* a locked reader still owns so_rcv; do not free under it */
 	FREE(so, M_SOCKET);
 }
 
@@ -580,6 +581,13 @@ sosend(so, addr, uio, top, control, flags)
 	int clen = 0, error, dontroute, mlen;
 	spl_t s;
 	int atomic = sosendallatonce(so) || top;
+	/* Base to tsleep on for sblock()/sbwait() below. uio->uio_procp is
+	 * dereferenced before the `uio == NULL` (prepackaged-in-top) check
+	 * further down, so resolve it defensively here: no current caller passes
+	 * a NULL uio, but if one ever does, fall back to this task's base rather
+	 * than dereferencing NULL. */
+	struct SocketBase *procp = uio ? uio->uio_procp
+				       : FindSocketBase(FindTask(NULL));
 
 	if (uio)
 		resid = uio->uio_resid;
@@ -597,7 +605,7 @@ sosend(so, addr, uio, top, control, flags)
 #define	snderr(errno)	{ error = errno; splx(s); goto release; }
 
 restart:
-	if ((error = sblock(&so->so_snd, uio->uio_procp)))
+	if ((error = sblock(&so->so_snd, procp)))
 		goto out;
 	do {
 		s = splnet();
@@ -624,7 +632,7 @@ restart:
 			if (so->so_state & SS_NBIO)
 				snderr(EWOULDBLOCK);
 			sbunlock(&so->so_snd);
-			error = sbwait(&so->so_snd, uio->uio_procp);
+			error = sbwait(&so->so_snd, procp);
 			splx(s);
 			if (error)
 				goto out;
@@ -1113,7 +1121,7 @@ soshutdown(so, how)
 	return (0);
 }
 
-void
+int
 sorflush(so)
 	register struct socket *so;
 {
@@ -1121,9 +1129,45 @@ sorflush(so)
 	register struct protosw *pr = so->so_proto;
 	register spl_t s;
 	struct sockbuf asb;
+	struct SocketBase *base = FindSocketBase(FindTask(NULL));
 
 	sb->sb_flags |= SB_NOINTR;
-	(void) sblock(sb, NULL);
+	/*
+	 * Acquire SB_LOCK before tearing the receive buffer down.
+	 *
+	 * PORT (AmiTCP_NG) safety: the network task (AmiTCP_Task) has no
+	 * SocketBase (base == NULL). If it reaches here -- unwinding a dead
+	 * connection (tcp_close -> in_pcbdetach -> sofree) -- while an app task
+	 * is asleep in soreceive(MSG_WAITALL) still holding SB_LOCK, it cannot
+	 * wait for the lock (no base to tsleep on) and must NOT tear the buffer
+	 * down under the reader: freeing so_rcv's mbufs there is a no-MMU
+	 * use-after-free (the old code discarded the sblock() error and did
+	 * exactly that). Instead wake the reader so it observes the dead
+	 * connection and unwinds, and report failure so sofree() leaves the
+	 * socket alone. With the socket-passing refcount now serialised this
+	 * should not be reachable; if it ever is, leaking one orphaned socket
+	 * is far cheaper than corrupting the mbuf pool.
+	 *
+	 * The divert test lives INSIDE the acquire loop and is re-evaluated
+	 * every pass: for base != NULL (an app task) a signal-interrupted wait
+	 * (EINTR) simply retries, so a Ctrl-C during a teardown that must
+	 * complete never abandons it (nor leaks the socket). For base == NULL
+	 * with the lock free, sblock() takes its non-tsleep fast path and
+	 * returns 0 at once. And should a reader manage to grab SB_LOCK in the
+	 * window between the test and sblock(), the next pass sees it and
+	 * diverts -- so we never spin on tsleep(NULL) (at most one harmless
+	 * DIAGNOSTIC-guarded -1 return before diverting).
+	 */
+	for (;;) {
+		if (base == NULL && (sb->sb_flags & SB_LOCK)) {
+			s = splimp();
+			socantrcvmore(so);
+			splx(s);
+			return (-1);
+		}
+		if (sblock(sb, base) == 0)
+			break;
+	}
 	s = splimp();
 	socantrcvmore(so);
 	sbunlock(sb);
@@ -1133,6 +1177,7 @@ sorflush(so)
 	if (pr->pr_flags & PR_RIGHTS && pr->pr_domain->dom_dispose)
 		(*pr->pr_domain->dom_dispose)(asb.sb_mb);
 	sbrelease(&asb);
+	return (0);
 }
 
 /*
@@ -1184,6 +1229,7 @@ sosetopt(so, level, optname, m0)
 		case SO_USELOOPBACK:
 		case SO_BROADCAST:
 		case SO_REUSEADDR:
+		case SO_REUSEPORT:
 		case SO_OOBINLINE:
 			if (m == NULL || m->m_len < sizeof (int)) {
 				error = EINVAL;
@@ -1302,6 +1348,7 @@ sogetopt(so, level, optname, mp)
 		case SO_DEBUG:
 		case SO_KEEPALIVE:
 		case SO_REUSEADDR:
+		case SO_REUSEPORT:
 		case SO_BROADCAST:
 		case SO_OOBINLINE:
 			*mtod(m, int *) = so->so_options & optname;

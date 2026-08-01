@@ -173,6 +173,8 @@ rip_output(m, so)
 		ip = mtod(m, struct ip *);
 	else {
 		M_PREPEND(m, sizeof(struct ip), M_WAIT);
+		if (m == 0)		/* M_WAIT does not block on this port */
+			return (ENOBUFS);	/* m_prepend already freed the chain */
 		ip = mtod(m, struct ip *);
 		ip->ip_tos = 0;
 		ip->ip_off = 0;

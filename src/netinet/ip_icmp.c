@@ -190,6 +190,16 @@ icmp_error(n, type, code, dest)
 		icmpstat.icps_oldicmp++;
 		goto freeit;
 	}
+	/*
+	 * PORT (AmiTCP_NG) security fix: never generate an ICMP error in
+	 * response to a link-layer broadcast or multicast datagram (RFC 1122
+	 * 3.2.2). The incoming mbuf is tagged M_BCAST/M_MCAST by if_sana. Without
+	 * this, a packet with a bad IP option (or an unreachable port, etc.)
+	 * aimed at our subnet broadcast makes us reflect an ICMP error to the
+	 * spoofable source -- a Smurf-style amplification / backscatter vector.
+	 */
+	if (n->m_flags & (M_BCAST|M_MCAST))
+		goto freeit;
 
 	/*
 	 * First, formulate icmp message

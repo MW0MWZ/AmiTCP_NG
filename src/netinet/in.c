@@ -695,13 +695,14 @@ in_broadcast(in)
  * of its own and falls through to the default gateway, so anything aimed at localhost
  * (ping 127.0.0.1, a local server bound to loopback) silently leaves via the NIC and
  * fails. Called once from ng_stack_process() (kern/amiga_main.c) after the protocols and
- * routing are up and before the self-start's caller is released; gated on the
- * `useloopback` config variable. Returns 0 on success, else an errno.
+ * routing are up and before the self-start's caller is released. Always runs:
+ * loopback is unconditional (the old `useloopback` knob is deprecated -- see
+ * net/sana2arp.c), so 127.0.0.1 works even when no AmiTCP.config is loaded (e.g.
+ * a self-starting drop-in library). Returns 0 on success, else an errno.
  */
 int
 ng_config_loopback(void)
 {
-	extern int useloopback;		/* matches the definition in net/sana2arp.c */
 	extern int socreate(int, struct socket **, int, int);
 	extern int soclose(struct socket *);
 	extern int ifioctl(struct socket *, int, caddr_t);
@@ -710,8 +711,6 @@ ng_config_loopback(void)
 	struct sockaddr_in *sin;
 	int error;
 
-	if (!useloopback)
-		return (0);
 	if ((error = socreate(AF_INET, &so, SOCK_DGRAM, 0)) != 0)
 		return (error);
 

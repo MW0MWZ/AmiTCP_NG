@@ -5,10 +5,6 @@ radix.c
 struct radix_node * rn_search(register caddr_t v,
                               struct radix_node * head);
 
-struct radix_node * rn_search_m(register caddr_t v,
-                                struct radix_node * head,
-                                register caddr_t m);
-
 struct radix_node * rn_match(caddr_t v,
                              struct radix_node * head);
 

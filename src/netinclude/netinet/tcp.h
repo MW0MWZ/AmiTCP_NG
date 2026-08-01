@@ -89,6 +89,10 @@ struct tcphdr {
 #define	TCPOLEN_MAXSEG		4
 #define	TCPOPT_WINDOW		3	/* RFC 1323 window scale */
 #define	TCPOLEN_WINDOW		3
+#define	TCPOPT_SACK_PERMITTED	4	/* RFC 2018 SACK-permitted (SYN only) */
+#define	TCPOLEN_SACK_PERMITTED	2
+#define	TCPOPT_SACK		5	/* RFC 2018 SACK block(s) */
+#define	TCPOLEN_SACK		8	/* bytes per SACK block (2 x tcp_seq); full option = 2 + 8*N */
 #define	TCPOPT_TIMESTAMP	8	/* RFC 1323 timestamps */
 #define	TCPOLEN_TIMESTAMP	10
 #define	TCPOLEN_TSTAMP_APPA	(TCPOLEN_TIMESTAMP+2)	/* appendix A: 2*NOP + TS */

@@ -151,13 +151,20 @@ ng_dnscache_init(void)
 struct hostent *
 ng_dnscache_get(struct SocketBase *libPtr, const char *name, int type, int *neg)
 {
-  UBYTE resp[DNS_CACHE_MAXRESP];
+  UBYTE *resp;
   int len = 0, hit = 0;
   ULONG now;
   struct dns_ent *e;
+  struct hostent *result = NULL;
 
   *neg = 0;
   if (!dns_ready || dns_tab_n <= 0 || name == NULL)
+    return NULL;				/* cache disabled -> no allocation */
+
+  /* Scratch response buffer OFF the caller's (possibly small) task stack. On
+   * allocation failure, just miss the cache (fall through to a real query). */
+  resp = AllocVec(DNS_CACHE_MAXRESP, MEMF_PUBLIC);
+  if (resp == NULL)
     return NULL;
 
   now = dns_now();
@@ -176,9 +183,10 @@ ng_dnscache_get(struct SocketBase *libPtr, const char *name, int type, int *neg)
   ReleaseSemaphore(&dns_lock);
 
   if (hit)					/* replay OUTSIDE the lock */
-    return ng_hostent_from_response(libPtr, resp, len,
-				    (type == T_PTR), (unsigned long *)0);
-  return NULL;
+    result = ng_hostent_from_response(libPtr, resp, len,
+				      (type == T_PTR), (unsigned long *)0);
+  FreeVec(resp);
+  return result;
 }
 
 void

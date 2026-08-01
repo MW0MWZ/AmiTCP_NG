@@ -96,7 +96,7 @@ struct mbuf;
  * which is used for protocol-protocol and system-protocol communication.
  *
  * A protocol is called through the pr_init entry before any other.
- * Thereafter it is called every 200ms through the pr_fasttimo entry and
+ * Thereafter it is called every 40ms through the pr_fasttimo entry and
  * every 500ms through the pr_slowtimo for timer based actions.
  * The system will call the pr_drain entry if it is low on space and
  * this should throw away any non-critical data.
@@ -134,13 +134,20 @@ struct protosw {
 			     struct mbuf *control);
 /* utility hooks */
 	void	(*pr_init)(void);	/* initialization hook */
-	void	(*pr_fasttimo)(void);	/* fast timeout (200ms) */
+	void	(*pr_fasttimo)(void);	/* fast timeout (40ms) */
 	void	(*pr_slowtimo)(void);	/* slow timeout (500ms) */
 	void	(*pr_drain)(void);	/* flush any excess space possible */
 };
 
 #define	PR_SLOWHZ	2		/* 2 slow timeouts per second */
-#define	PR_FASTHZ	5		/* 5 fast timeouts per second */
+#define	PR_FASTHZ	25		/* 25 fast timeouts/sec = 40 ms. This is the TCP
+					 * delayed-ACK granularity (the fast timer's only job);
+					 * kept low so a lone ACK on a sub-millisecond-RTT
+					 * same-subnet link fires in <=40 ms, not the classic
+					 * ~200 ms -- cuts request/response and Nagle/delayed-ACK
+					 * stalls 5x. Used ONLY to drive the fast timer
+					 * (amiga_time.c); NOT in any RTT/RTO math (that is
+					 * PR_SLOWHZ). Cost is a cheap PCB scan 25x/sec. */
 
 /*
  * Values for pr_flags.
@@ -184,7 +191,7 @@ struct protosw {
 #define	PRU_PEERADDR		16	/* fetch peer's address */
 #define	PRU_CONNECT2		17	/* connect two sockets */
 /* begin for protocols internal use */
-#define	PRU_FASTTIMO		18	/* 200ms timeout */
+#define	PRU_FASTTIMO		18	/* 40ms timeout */
 #define	PRU_SLOWTIMO		19	/* 500ms timeout */
 #define	PRU_PROTORCV		20	/* receive from below */
 #define	PRU_PROTOSEND		21	/* send to below */

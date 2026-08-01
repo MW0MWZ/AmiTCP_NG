@@ -97,6 +97,7 @@ struct NetDataBase {
   struct MinList         ndb_Domains;
   LONG			 ndb_AccessCount; /* tmp var, but reduces code size */
   struct AccessItem *	 ndb_AccessTable;
+  ULONG			 ndb_Generation; /* bumped by reset_netdb(); stale-cursor guard */
 };
 
 extern struct NetDataBase *NDB;

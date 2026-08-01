@@ -116,10 +116,15 @@ struct sana_softc {
   VOID           *ss_bufmgnt;	      /* magic cookie for buffer management */
   ULONG           ss_copyin;	      /* SANA2 byte CopyToBuff (RX) call count   */
   ULONG           ss_copyout;	      /* SANA2 byte CopyFromBuff (TX) call count  */
+  ULONG           ss_txnobuf;	      /* TX packets dropped: send-tag mbuf alloc failed */
+  ULONG           ss_rxnobuf;	      /* RX packets dropped: read re-post mbuf alloc failed */
   UWORD		  ss_reqno;	      /* # of requests to allocate */
   UWORD           ss_cflags;	      /* configuration flags */
   UBYTE           ss_offcleanup;      /* set when the driver went offline: sana_poll()
 				       * must deconfigure this interface (route/addr/DNS) */
+  UBYTE           ss_removing;	      /* teardown in progress: sana_up()/sana_rearm_reads()
+				       * must NOT (re-)post reads or re-arm the watchdog, so a
+				       * racing online event can't touch the freed request pool */
   struct IOIPReq *ss_reqs;	      /* allocated requests */
   struct MinList  ss_freereq;	      /* free requests */
 #if	INET

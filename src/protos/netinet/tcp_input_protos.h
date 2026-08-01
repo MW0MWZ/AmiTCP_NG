@@ -7,6 +7,7 @@ tcp_input.c
  * impact. */
 struct tcpcb;
 struct tcpiphdr;
+struct sackblk;
 
 int tcp_reass(register struct tcpcb * tp,
               register struct tcpiphdr * ti,
@@ -20,7 +21,9 @@ void tcp_dooptions(struct tcpcb * tp,
                   struct tcpiphdr * ti,
                   int * ts_present,
                   u_long * ts_val,
-                  u_long * ts_ecr);
+                  u_long * ts_ecr,
+                  struct sackblk * sack,	/* RFC 2018: out -- inbound SACK blocks */
+                  int * nsack);			/* out -- count (0..TCP_MAX_SACK) */
 
 void tcp_pulloutofband(struct socket * so,
                       struct tcpiphdr * ti,

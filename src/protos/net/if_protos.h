@@ -18,8 +18,6 @@ struct ifaddr * ifa_ifwithdstaddr(register struct sockaddr * addr);
 
 struct ifaddr * ifa_ifwithnet(struct sockaddr * addr);
 
-struct ifaddr * ifa_ifwithaf(register int af);
-
 struct ifaddr * ifaof_ifpforaddr(struct sockaddr * addr,
                                  register struct ifnet * ifp);
 

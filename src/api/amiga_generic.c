@@ -831,7 +831,7 @@ LONG SAVEDS RAF3(_ReleaseSocket,
 		 struct SocketBase *,	libPtr, a6,
 		 LONG,			fd,	d0,
 		 LONG,			id,	d1)
-#if 0		 
+#if 0
 {
 #endif
   struct SocketNode *sn;
@@ -839,6 +839,7 @@ LONG SAVEDS RAF3(_ReleaseSocket,
   int error = 0;
 
   CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr); /* many tasks may have access to the socket */
 
   if ((ULONG)id >= FIRSTUNIQUEID && (id = makeId(id)) == -1) {
     error = EINVAL;
@@ -867,19 +868,21 @@ LONG SAVEDS RAF3(_ReleaseSocket,
   sn->sn_Socket = so;
   libPtr->dTable[fd] = NULL;
   FD_CLR(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
-  
+
   Forbid();
   AddTail(&releasedSocketList, (struct Node *)sn);
   Permit();
 
- Return: API_STD_RETURN(error, id);
+ Return:
+  ReleaseSyscallSemaphore(libPtr);
+  API_STD_RETURN(error, id);
 }
 
 LONG SAVEDS RAF3(_ReleaseCopyOfSocket,
 		 struct SocketBase *,	libPtr, a6,
 		 LONG,			fd,	d0,
 		 LONG,			id,	d1)
-#if 0		 
+#if 0
 {
 #endif
   struct SocketNode *sn;
@@ -887,6 +890,7 @@ LONG SAVEDS RAF3(_ReleaseCopyOfSocket,
   int error = 0;
 
   CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr); /* many tasks may have access to the socket */
 
   if ((ULONG)id >= FIRSTUNIQUEID && (id = makeId(id)) == -1) {
     error = EINVAL;
@@ -908,7 +912,9 @@ LONG SAVEDS RAF3(_ReleaseCopyOfSocket,
   AddTail(&releasedSocketList, (struct Node *)sn);
   Permit();
 
- Return: API_STD_RETURN(error, id);
+ Return:
+  ReleaseSyscallSemaphore(libPtr);
+  API_STD_RETURN(error, id);
 }
 
 LONG SAVEDS RAF5(_ObtainSocket,
@@ -927,6 +933,7 @@ LONG SAVEDS RAF5(_ObtainSocket,
   LONG fd;
 
   CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr); /* many tasks may have access to the socket */
 
   if (domain == 0) {
     if (id < FIRSTUNIQUEID) {
@@ -992,8 +999,10 @@ LONG SAVEDS RAF5(_ObtainSocket,
     libPtr->fdCallback(fd, FDCB_FREE);
 
   error = EWOULDBLOCK;
-  
- Return: API_STD_RETURN(error, fd);
+
+ Return:
+  ReleaseSyscallSemaphore(libPtr);
+  API_STD_RETURN(error, fd);
 }
 
 LONG SAVEDS RAF3(_Dup2Socket,

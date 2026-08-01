@@ -154,6 +154,23 @@ int debug_sana = 1;
 /* Global port for all SANA-II network interfaces */
 struct MsgPort *SanaPort = NULL;
 
+/*
+ * Serialises the two consumers of SanaPort's reply messages: the network task
+ * draining completions in sana_poll() via GetMsg(), and a client task freeing
+ * the request pool during interface teardown in sana_unrun() via WaitIO(). The
+ * reply-list node IS io_Message.mn_Node, so if both ran at once one could Remove()
+ * a node the other already unlinked (list corruption), or sana_poll could dispatch
+ * a request sana_unrun is about to DeleteIORequest(). The interleave is real:
+ * splimp()/splnet() are Forbid-based (SysBase->TDNestCnt), and Exec breaks Forbid
+ * across WaitIO()'s internal Wait(), so the net task can run mid-teardown. A
+ * SignalSemaphore (unlike Forbid) SURVIVES Wait(), so the client task holds this
+ * across its whole WaitIO() loop and the net task's GetMsg() is excluded until
+ * teardown completes. No deadlock: the SANA device replies the (aborted) requests
+ * from its own interrupt/task, not from the blocked net task. Held per-poll, not
+ * per-packet, so the RX hot-path cost is negligible.
+ */
+static struct SignalSemaphore SanaPortSem;
+
 /* queue for sana network interfaces */
 struct sana_softc *ssq = NULL;
 
@@ -181,6 +198,8 @@ static void sana_arp_read(struct sana_softc *ssc, struct IOIPReq *req);
 static void sana_online(struct sana_softc *ssc, struct IOIPReq *req);
 static void free_written_packet(struct sana_softc *ssc, struct IOIPReq *req);
 static void sana_start(struct sana_softc *ssc);
+static void sana_rearm_reads(struct sana_softc *ssc);
+static int  sana_watchdog(struct ifnet *ifp);
 static void sana_scrub_inet(struct ifnet *ifp);
 static void sana_offline_cleanup(struct sana_softc *ssc);
 
@@ -216,6 +235,8 @@ sana_init(void)
 {
   assert(!SanaPort);
 
+  InitSemaphore(&SanaPortSem);	/* guards SanaPort consumption (poll vs teardown) */
+
   SanaPort = CreateMsgPort();	/* V36 function, creates a PA_SIGNAL port */
 
   if (SanaPort) {
@@ -241,6 +262,8 @@ sana_deinit(void)
   assert(SanaPort);
 
   while (ssq) {
+    ssq->ss_removing = 1;	/* same teardown guard as sana_remove_interface (defensive:
+				 * the service loop has already stopped, so no re-arm fires) */
     sana_down(ssq);
     if (ssq->ss_if.if_flags & IFF_RUNNING) {
       sana_unrun(ssq);
@@ -275,7 +298,16 @@ BOOL
 sana_poll(void)
 {
   struct IOIPReq * io;
-  spl_t s = splnet();
+  spl_t s;
+
+  /*
+   * Exclude a concurrent interface teardown (sana_unrun's WaitIO loop) from the
+   * shared SanaPort while we drain completions -- see SanaPortSem. Taken before
+   * splnet() so that if it blocks (a teardown is in progress) we wait at SPL0
+   * with no partial state raised.
+   */
+  ObtainSemaphore(&SanaPortSem);
+  s = splnet();
 
   while (io = (struct IOIPReq *)GetMsg(SanaPort)) {
     /* touch the network interface */
@@ -286,6 +318,23 @@ sana_poll(void)
        log(LOG_ERR, "No dispatch function in request for %s\n",
 	   io->ioip_if->ss_name);
      }
+  }
+  ReleaseSemaphore(&SanaPortSem);
+
+  /*
+   * Re-arm any read requests that sana_read() retired under transient mbuf-pool
+   * pressure (it decrements ss_ip.sent/ss_arp.sent and parks the request on
+   * ss_freereq without re-posting). Without this the receive ring bleeds down
+   * during a sustained transfer and RX eventually stalls. Doing it here, after
+   * draining completions (which freed requests) and as mbufs become available,
+   * keeps the ring topped up whenever the device is active. The if_slowtimo
+   * watchdog (sana_watchdog) is the backstop for when the ring has already
+   * bled to zero -- then no completion arrives to wake this poll.
+   */
+  {
+    struct sana_softc *p;
+    for (p = ssq; p != NULL; p = p->ss_next)
+      sana_rearm_reads(p);
   }
 
   net_poll();
@@ -825,6 +874,24 @@ sana_remove_interface(struct ifnet *ifp, int force)
   if (!force && (ifp->if_flags & IFF_UP))
     return EBUSY;			/* in use -- bring it down first */
 
+  /*
+   * Disarm the read-ring re-arm BEFORE releasing the SANA request buffers below.
+   * sana_down()/sana_unrun() free the IOIPReq pool while running OUTSIDE splimp()
+   * (sana_unrun() yields in WaitIO() and leaves the freed requests linked on
+   * ss_freereq). If the if_slowtimo watchdog (sana_watchdog) or a concurrent
+   * sana_poll re-armed reads during that window, sana_send_read() would RemHead a
+   * freed request and BeginIO() it -- a use-after-free. Clearing IFF_UP and the
+   * watchdog under splimp() is atomic against both re-arm paths (sana_rearm_reads
+   * is IFF_UP-gated; if_slowtimo skips a zero if_timer / NULL if_watchdog), so
+   * once we drop splimp() here no re-arm can reach this interface again.
+   */
+  s = splimp();
+  ssc->ss_removing       = 1;		/* also neutralise a racing sana_online()->sana_up() */
+  ssc->ss_if.if_flags   &= ~IFF_UP;
+  ssc->ss_if.if_watchdog = NULL;
+  ssc->ss_if.if_timer    = 0;
+  splx(s);
+
   /* Take it offline and release its SANA request buffers (as sana_deinit). */
   sana_down(ssc);
   if (ssc->ss_if.if_flags & IFF_RUNNING)
@@ -1016,15 +1083,39 @@ static void
 sana_unrun(struct sana_softc *ssc)
 {
   struct IOIPReq *req, *next;
-  
+
+  /*
+   * Hold SanaPortSem across the whole WaitIO()/free loop so the network task's
+   * sana_poll() cannot GetMsg() (and dispatch, or Remove) these reply messages
+   * while we drain and DeleteIORequest() them. WaitIO() Wait()s -- which breaks
+   * the caller's Forbid -- but the semaphore survives that, keeping the net task
+   * excluded until every request is reaped. (The device replies the aborted
+   * requests from its own context, so WaitIO() still completes -- no deadlock.)
+   *
+   * Tradeoff: for this loop's duration sana_poll is blocked, pausing completion
+   * draining for ALL SANA interfaces, not just the one being removed. Acceptable
+   * because removal is a rare admin action and every request here was already
+   * AbortSanaIO()'d by sana_down(), so its completion is prompt.
+   */
+  ObtainSemaphore(&SanaPortSem);
+
   for ( next = ssc->ss_reqs; (req = next) ;) {
     next = req -> ioip_next;
     WaitIO((struct IORequest *)req);
+    /* Free the mbufs this request still holds. The normal completion path
+     * (sana_read()/free_written_packet()) frees these, but teardown bypasses it,
+     * so a posted read leaks ioip_reserved and an in-flight write leaks ioip_packet.
+     * WaitIO() above guarantees the device is finished with them; idle free-list
+     * requests have both NULL. */
+    if (req->ioip_reserved) m_freem(req->ioip_reserved);
+    if (req->ioip_packet)   m_freem(req->ioip_packet);
     DeleteIORequest(req);
   }
   ssc->ss_reqs = next;
-  
+
   ssc->ss_if.if_flags &= ~IFF_RUNNING;
+
+  ReleaseSemaphore(&SanaPortSem);
 }
 
 /*
@@ -1041,6 +1132,20 @@ sana_ioctl(register struct ifnet *ifp, int cmd, caddr_t data)
   
   spl_t s = splimp();
   int error = 0;
+
+  /*
+   * Reject any ioctl on an interface being torn down (ss_removing set under
+   * splimp by sana_remove_interface). SIOCSIFADDR -> sana_run() would otherwise
+   * re-create the request pool and re-online the device on a softc about to be
+   * freed; SIOCSIFFLAGS -> sana_up() would re-raise it. Removal runs in a client
+   * task that is not serialised against this one, so honour the flag here too --
+   * this closes the sana_run() resurrection path that the sana_up() guard alone
+   * does not cover.
+   */
+  if (ssc->ss_removing) {
+    splx(s);
+    return ENXIO;
+  }
 
   switch (cmd) {
 
@@ -1091,10 +1196,10 @@ sana_ioctl(register struct ifnet *ifp, int cmd, caddr_t data)
  * send read requests with given types, dispatcher & c  
  * MUST be called at splimp()
  */
-static inline WORD 
+static inline WORD
 sana_send_read(struct sana_softc *ssc, WORD count, ULONG type, ULONG mtu,
 	       void (*dispatch)(struct sana_softc *, struct IOIPReq *),
-	       UWORD command, UBYTE flags)
+	       UWORD command, UBYTE flags, UBYTE quiet)
 {
   struct IOIPReq *req = NULL;
   WORD i;
@@ -1115,7 +1220,12 @@ sana_send_read(struct sana_softc *ssc, WORD count, ULONG type, ULONG mtu,
  no_resources:
   if (req)
     AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
-  log(LOG_ERR, "sana_up: could not queue enough read requests\n");
+  /* `quiet` suppresses this on the steady-state re-arm path (sana_rearm_reads),
+   * which retries every sana_poll during pool pressure and would otherwise flood
+   * the log; sana_up() (config time) still reports it. ss_rxnobuf already counts
+   * the runtime failures. */
+  if (!quiet)
+    log(LOG_ERR, "sana: could not queue enough read requests\n");
   return i;
 }
 
@@ -1127,6 +1237,15 @@ static void
 sana_up(struct sana_softc *ssc)
 {
   spl_t s = splimp();
+
+  /* If the interface is being torn down (ss_removing set under splimp by
+   * sana_remove_interface), do NOT re-raise IFF_UP, post reads, or re-arm the
+   * watchdog: a sana_online() dispatched from a racing S2EVENT_ONLINE completion
+   * must not resurrect a doomed interface whose request pool is being freed. */
+  if (ssc->ss_removing) {
+    splx(s);
+    return;
+  }
   ssc->ss_if.if_flags |= IFF_UP;
   
   /* Send read requests to device driver */
@@ -1134,11 +1253,11 @@ sana_up(struct sana_softc *ssc)
   /* IP */
   ssc->ss_ip.sent += 
     sana_send_read(ssc, ssc->ss_ip.reqno - ssc->ss_ip.sent, ssc->ss_ip.type,
-		   ssc->ss_if.if_mtu, sana_ip_read, CMD_READ, 0);
+		   ssc->ss_if.if_mtu, sana_ip_read, CMD_READ, 0, 0);
 
   ssc->ss_arp.sent += 
     sana_send_read(ssc, ssc->ss_arp.reqno - ssc->ss_arp.sent, ssc->ss_arp.type,
-		   ARP_MTU, sana_arp_read, CMD_READ, 0);
+		   ARP_MTU, sana_arp_read, CMD_READ, 0, 0);
 
 #endif /* INET */
 #if	ISO
@@ -1150,11 +1269,67 @@ sana_up(struct sana_softc *ssc)
 #if 0
   ssc->ss_rawsent += 
     sana_send_read(ssc, ssc->ss_rawreqno - ssc->ss_rawsent, 0,
-		   ssc->ss_if.if_mtu, sana_raw_read, 
-		   S2_READORPHAN, SANA2_IOF_RAW);
+		   ssc->ss_if.if_mtu, sana_raw_read,
+		   S2_READORPHAN, SANA2_IOF_RAW, 0);
 #endif
+  /*
+   * Arm the read-ring re-arm watchdog. if_slowtimo() (net/if.c, driven by the
+   * ~1 s timer in amiga_time.c) calls sana_watchdog once if_timer counts down to
+   * 0; the watchdog tops the read rings back up and re-arms if_timer. This is the
+   * backstop that recovers a receive ring which has bled to zero under mbuf-pool
+   * pressure -- the case where no device completion arrives to drive sana_poll().
+   */
+  ssc->ss_if.if_watchdog = sana_watchdog;
+  ssc->ss_if.if_timer    = 1;
   splx(s);
   return;
+}
+
+/*
+ * sana_rearm_reads(): top the SANA-II receive rings back up to their configured
+ * depth (ss_ip.reqno / ss_arp.reqno). sana_read() retires a read whose re-post
+ * failed under transient mbuf-pool pressure -- it decrements *sent and parks the
+ * request on ss_freereq WITHOUT re-posting -- so without a re-arm the ring bleeds
+ * monotonically down under a sustained transfer until RX stalls with no recovery.
+ * Re-post the shortfall as mbufs become available; sana_send_read() posts as many
+ * as the pool currently allows (returns the count actually posted) and we retry
+ * on the next call. Holds splimp(): the request lists and *sent are shared with
+ * the interrupt-time completion path. Safe to nest under a caller's splimp().
+ */
+static void
+sana_rearm_reads(struct sana_softc *ssc)
+{
+  spl_t s = splimp();
+
+  if ((ssc->ss_if.if_flags & IFF_UP) && !ssc->ss_removing) {
+#if	INET
+    if (ssc->ss_ip.sent < ssc->ss_ip.reqno)
+      ssc->ss_ip.sent +=
+	sana_send_read(ssc, ssc->ss_ip.reqno - ssc->ss_ip.sent, ssc->ss_ip.type,
+		       ssc->ss_if.if_mtu, sana_ip_read, CMD_READ, 0, 1);
+
+    if (ssc->ss_arp.sent < ssc->ss_arp.reqno)
+      ssc->ss_arp.sent +=
+	sana_send_read(ssc, ssc->ss_arp.reqno - ssc->ss_arp.sent, ssc->ss_arp.type,
+		       ARP_MTU, sana_arp_read, CMD_READ, 0, 1);
+#endif	/* INET */
+  }
+  splx(s);
+}
+
+/*
+ * sana_watchdog(): the per-interface if_slowtimo watchdog (~1 s tick). Re-arm any
+ * retired reads, then re-arm if_timer so it fires again next tick. Called from
+ * if_slowtimo() with splimp() already held (sana_rearm_reads nests its own).
+ */
+static int
+sana_watchdog(struct ifnet *ifp)
+{
+  struct sana_softc *ssc = (struct sana_softc *)ifp;
+
+  sana_rearm_reads(ssc);
+  ssc->ss_if.if_timer = 1;		/* keep firing every if_slowtimo tick */
+  return 0;
 }
 
 #if __SASC
@@ -1260,7 +1435,14 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
 
   switch (req->ioip_Error) {
   case 0:
-    if (req->ioip_s2.ios2_Req.io_Flags & SANA2IOF_BCAST) 
+    /* A driver that completes a read with io_Error == 0 but never ran CopyToBuff
+     * (m_copy_to_mbuf returned FALSE -- e.g. a rejected over/undersized or zero-
+     * length frame) leaves ioip_packet, and so m, NULL. Writing m->m_flags then
+     * would be a wild write near address 0 on this no-MMU 68k. Nothing to hand
+     * up; the read is re-armed below. */
+    if (m == NULL)
+      break;
+    if (req->ioip_s2.ios2_Req.io_Flags & SANA2IOF_BCAST)
       m->m_flags |= M_BCAST;
     if (req->ioip_s2.ios2_Req.io_Flags & SANA2IOF_MCAST)
       m->m_flags |= M_MCAST;
@@ -1300,8 +1482,11 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
     m = NULL;
     break;
   default:
-    if (debug_sana && req->ioip_Error != IOERR_ABORTED) 
-      sana2perror(banner, (struct IOSana2Req *)req);
+    if (req->ioip_Error != IOERR_ABORTED) {
+      ssc->ss_if.if_ierrors++;		/* a genuine receive error (not a teardown abort) */
+      if (debug_sana)
+	sana2perror(banner, (struct IOSana2Req *)req);
+    }
     m_freem(m);
     m = NULL;
   }
@@ -1314,8 +1499,9 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
       splx(s);
       return m;
     }
+    ssc->ss_rxnobuf++;			/* read re-post mbuf alloc failed -- an RX no-buffer drop */
     log(LOG_ERR, "sana_read (%s): not enough mbufs\n", ssc->ss_name);
-  } 
+  }
 
   /* do not resend, free used resources */
   (*sent)--;
@@ -1506,6 +1692,7 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
   /* Check if we are up and running... */
   if ((ssc->ss_if.if_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING)) {
     error = ENETDOWN;
+    ifp->if_oerrors++;
     goto bad;
   }
 
@@ -1546,8 +1733,12 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
 
     /* Send to loopback if we do not hear our broadcasts */
     if ((ssc->ss_if.if_flags & IFF_SIMPLEX) && (m->m_flags & M_BCAST)) {
+      /* m_copy returns NULL under mbuf exhaustion; looutput() derefs its
+       * mbuf unconditionally, so skip the loopback copy if it failed
+       * (the real broadcast still goes out below). */
       mcopy = m_copy(m, 0, (int)M_COPYALL);
-      (void) looutput(&ssc->ss_if, mcopy, dst, rt);
+      if (mcopy != NULL)
+	(void) looutput(&ssc->ss_if, mcopy, dst, rt);
     }
     /* Low-delay IP gets a higher IORequest priority. */
     pri = (IPTOS_LOWDELAY & mtod(m, struct ip *)->ip_tos) ? 1 : 0;
@@ -1592,8 +1783,9 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
   default: 
     log(LOG_ERR, "%s%ld: can't handle af%ld\n",
 	ssc->ss_if.if_name, ssc->ss_if.if_unit, dst->sa_family);
-    error = EAFNOSUPPORT; 
-    goto bad; 
+    error = EAFNOSUPPORT;
+    ifp->if_oerrors++;
+    goto bad;
   }
 
   /*
@@ -1624,7 +1816,8 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
    * per-burst drop that used to collapse cwnd.
    */
   if (!(tag = m_get(M_DONTWAIT, MT_DATA))) {
-    error = ENOBUFS;			/* genuine mbuf exhaustion */
+    ssc->ss_txnobuf++;			/* send-tag mbuf alloc failed -- a no-buffer drop */
+    error = ENOBUFS;
     goto bad;
   }
   st = mtod(tag, struct sana_sendtag *);
@@ -1636,8 +1829,7 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
   tag->m_next = m;			/* tag -> real packet */
 
   if (IF_QFULL(&ssc->ss_if.if_snd)) {
-    IF_DROP(&ssc->ss_if.if_snd);
-    ifp->if_oerrors++;
+    IF_DROP(&ssc->ss_if.if_snd);	/* counted as if_snd.ifq_drops (queue-full drop) */
     m_freem(tag);			/* frees the tag AND the packet (m_next) */
     splx(s);
     return (ENOBUFS);
@@ -1652,7 +1844,6 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
   return 0;
 
  bad:
-  ifp->if_oerrors++;
   splx(s);
   if (m)
     m_freem(m);
@@ -1674,8 +1865,11 @@ free_written_packet(struct sana_softc *ssc, struct IOIPReq *req)
     req->ioip_packet = NULL;
   }
   req->ioip_dispatch = NULL;
-  if (debug_sana && req->ioip_Error)
-    sana2perror("sana_output", (struct IOSana2Req *)req);
+  if (req->ioip_Error && req->ioip_Error != IOERR_ABORTED) {
+    ssc->ss_if.if_oerrors++;		/* a genuine media/device transmit error */
+    if (debug_sana)
+      sana2perror("sana_output", (struct IOSana2Req *)req);
+  }
   AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
   /* This write freed a request -- drain the next packet parked on if_snd, if
    * any. This is what lets a full transmit window flow without the pool-empty

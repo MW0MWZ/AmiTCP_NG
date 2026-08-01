@@ -148,6 +148,31 @@ LONG /* SAVEDS */ RAF3(_SetErrnoPtr,
   return -1;
 }
 
+#if DIAGNOSTIC
+/*
+ * Called from the CHECK_TASK macros (amiga_libcallentry.h) at every library-vector
+ * entry in a DIAGNOSTIC build. Warns when the CALLER's task stack is nearly
+ * exhausted: there is no MMU/guard page, so a protocol descent (~1.5 KB deepest)
+ * that runs off the bottom would silently corrupt whatever task's memory sits
+ * below -- this turns that into a diagnosable log line. Reads the TRUE SP (a
+ * local's address floats by the frame size under -fomit-frame-pointer); reading it
+ * here, one frame below the vector, is fine -- it only makes the estimate a hair
+ * more conservative.
+ */
+#define NG_LOW_STACK_MARGIN 1024	/* warn below ~one deepest-descent of headroom */
+void ng_low_stack_check(void)
+{
+  char *sp;
+  struct Task *t = SysBase->ThisTask;
+
+  __asm__ __volatile__ ("move.l %%sp,%0" : "=r"(sp));
+  if (t && sp < (char *)t->tc_SPLower + NG_LOW_STACK_MARGIN)
+    log(LOG_WARNING, "AmiTCP_NG: low stack (%ld bytes) in task %s",
+	(long)(sp - (char *)t->tc_SPLower),
+	t->tc_Node.ln_Name ? (STRPTR)t->tc_Node.ln_Name : (STRPTR)"?");
+}
+#endif
+
 VOID SAVEDS RAF4(_Syslog,
 		 struct SocketBase *,	libPtr, 	a6,
 		 ULONG,			pri,		d0,
@@ -157,8 +182,10 @@ VOID SAVEDS RAF4(_Syslog,
 {
 #endif
   int saved_errno;
-  char fmt_cpy[1024];
-  register char *p = fmt_cpy;
+  char fallback[128];		/* used only if the heap is exhausted */
+  char *fmt_cpy;
+  ULONG bufsize;
+  register char *p;
 
   CHECK_TASK_VOID();
 
@@ -175,38 +202,51 @@ VOID SAVEDS RAF4(_Syslog,
   if ((pri & LOG_FACMASK) == 0)
     pri |= libPtr->LogFacility;
 
-  /* 
-   * Build the new format string
-   */
-  if (libPtr->LogTag) {
-    p += sprintf(p, libPtr->LogTag);
-  }
-  if (libPtr->LogStat & LOG_PID) {
-    p += sprintf(p, "[%lx]", libPtr->thisTask);
-  }
-  if (libPtr->LogTag) {
-    *p++ = ':';
-    *p++ = ' ';
-  }
+  /* Assemble off the CALLER's (possibly small) task stack: syslog() is a public
+   * vector and a 1 KB stack buffer is a poor citizen on a ~4 KB stack. Fall back
+   * to a small stack buffer only if the heap is exhausted, so logging still
+   * works (truncated) under memory pressure. Freed before we return. */
+  fmt_cpy = (char *)AllocVec(1024, MEMF_PUBLIC);
+  if (fmt_cpy != NULL) bufsize = 1024;
+  else { fmt_cpy = fallback; bufsize = sizeof(fallback); }
+  p = fmt_cpy;
+
   /*
-   * Substitute error message for %m.
+   * Build the message into fmt_cpy, bounded at every write so an over-long
+   * LogTag or format string cannot overflow this fixed stack buffer (the
+   * message is truncated instead). Leave one byte for the NUL terminator.
    */
   {
+    char *end = fmt_cpy + bufsize - 1;
     char ch, *t1;
     const char *t2;
 
-    for (t1 = p; (ch = *fmt); ++fmt) {
-      if (ch == '%') {
-	if (fmt[1] == '%') {
-	  ++fmt;
-	  *t1++ = ch;
-	}
-	else if (fmt[1] == 'm') {
-	  ++fmt;
-	  for (t2 = __sys_errlist[saved_errno]; (*t1 = *t2++); ++t1)
-	    ;
-	  continue;
-	}
+    if (libPtr->LogTag)			/* copy as DATA, never a format string */
+      for (t2 = libPtr->LogTag; *t2 && p < end; )
+	*p++ = *t2++;
+    if (libPtr->LogStat & LOG_PID) {
+      char pidbuf[16];
+      sprintf(pidbuf, "[%lx]", libPtr->thisTask);	/* fixed format, <= 16 */
+      for (t2 = pidbuf; *t2 && p < end; )
+	*p++ = *t2++;
+    }
+    if (libPtr->LogTag) {
+      if (p < end) *p++ = ':';
+      if (p < end) *p++ = ' ';
+    }
+    /* Copy fmt, expanding %m to the errno string; keep %% and other %X for vlog. */
+    for (t1 = p; (ch = *fmt) && t1 < end; ++fmt) {
+      if (ch == '%' && fmt[1] == 'm') {
+	++fmt;
+	for (t2 = __sys_errlist[saved_errno]; *t2 && t1 < end; )
+	  *t1++ = *t2++;
+	continue;
+      }
+      if (ch == '%' && fmt[1] == '%') {
+	++fmt;
+	if (t1 < end) *t1++ = '%';
+	if (t1 < end) *t1++ = '%';
+	continue;
       }
       *t1++ = ch;
     }
@@ -214,6 +254,8 @@ VOID SAVEDS RAF4(_Syslog,
   }
 
   vlog(pri, fmt_cpy, ap);
+  if (fmt_cpy != fallback)
+    FreeVec(fmt_cpy);
 }
 
 VOID SAVEDS RAF4(_SetSocketSignals,

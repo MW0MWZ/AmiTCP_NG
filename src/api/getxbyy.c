@@ -528,6 +528,7 @@ VOID SAVEDS RAF2(_setnetent,
   (void)stay_open;
   LOCK_R_NDB(NDB);
   libPtr->netentCursor = NDB->ndb_Networks.mlh_Head;
+  libPtr->netentGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -553,8 +554,11 @@ struct netent * SAVEDS RAF1(_getnetent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->netentCursor == NULL)		/* implicit setnetent() */
+  if (libPtr->netentCursor == NULL ||		/* implicit setnetent(), or */
+      libPtr->netentGen != NDB->ndb_Generation) {	/* stale after reset_netdb() */
     libPtr->netentCursor = NDB->ndb_Networks.mlh_Head;
+    libPtr->netentGen = NDB->ndb_Generation;
+  }
   node = (struct NetentNode *)libPtr->netentCursor;
   if (node->nn_Node.mln_Succ == NULL) {		/* tail sentinel -> end */
     UNLOCK_NDB(NDB);
@@ -578,6 +582,7 @@ VOID SAVEDS RAF2(_setprotoent,
   (void)stay_open;
   LOCK_R_NDB(NDB);
   libPtr->protoentCursor = NDB->ndb_Protocols.mlh_Head;
+  libPtr->protoentGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -603,8 +608,11 @@ struct protoent * SAVEDS RAF1(_getprotoent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->protoentCursor == NULL)
+  if (libPtr->protoentCursor == NULL ||
+      libPtr->protoentGen != NDB->ndb_Generation) {
     libPtr->protoentCursor = NDB->ndb_Protocols.mlh_Head;
+    libPtr->protoentGen = NDB->ndb_Generation;
+  }
   node = (struct ProtoentNode *)libPtr->protoentCursor;
   if (node->pn_Node.mln_Succ == NULL) {
     UNLOCK_NDB(NDB);
@@ -628,6 +636,7 @@ VOID SAVEDS RAF2(_setservent,
   (void)stay_open;
   LOCK_R_NDB(NDB);
   libPtr->serventCursor = NDB->ndb_Services.mlh_Head;
+  libPtr->serventGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -653,8 +662,11 @@ struct servent * SAVEDS RAF1(_getservent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->serventCursor == NULL)
+  if (libPtr->serventCursor == NULL ||
+      libPtr->serventGen != NDB->ndb_Generation) {
     libPtr->serventCursor = NDB->ndb_Services.mlh_Head;
+    libPtr->serventGen = NDB->ndb_Generation;
+  }
   node = (struct ServentNode *)libPtr->serventCursor;
   if (node->sn_Node.mln_Succ == NULL) {
     UNLOCK_NDB(NDB);

@@ -136,8 +136,22 @@ extern const char wrongTaskErrorFmt[];
     extern BOOL ng_stack_ensure_running(void);				\
     if (!ng_stack_running) (void)ng_stack_ensure_running(); }
 
+/* DIAGNOSTIC-only: warn when a library vector is entered with little headroom on
+ * the CALLER's task stack. The deepest protocol descent from a vector is ~1.5 KB
+ * and there is no guard page (no MMU), so an overrun silently corrupts whatever
+ * sits below the stack -- possibly another task. Implemented as ONE function (in
+ * amiga_generic2.c) rather than inlined, so the per-vector cost is a single JSR
+ * instead of bloating every vector body. Compiles out when DIAGNOSTIC is off. */
+#if DIAGNOSTIC
+extern void ng_low_stack_check(void);
+#define NG_STACK_CHECK() ng_low_stack_check()
+#else
+#define NG_STACK_CHECK() ((void)0)
+#endif
+
 #define CHECK_TASK()					\
   NG_ENSURE_STACK();					\
+  NG_STACK_CHECK();					\
   if (libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\
@@ -148,6 +162,7 @@ extern const char wrongTaskErrorFmt[];
 
 #define CHECK_TASK_NULL()				\
   NG_ENSURE_STACK();					\
+  NG_STACK_CHECK();					\
   if (libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\
@@ -160,6 +175,7 @@ extern const char wrongTaskErrorFmt[];
 
 #define CHECK_TASK_VOID()				\
   NG_ENSURE_STACK();					\
+  NG_STACK_CHECK();					\
   if (libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\

@@ -115,6 +115,10 @@ static char sccsid[] = "@(#)res_query.c	5.11 (Berkeley) 3/6/91";
 #else
 #define MAXPACKET	1024
 #endif
+
+#ifndef MAXDNSRCH
+#define MAXDNSRCH	6	/* max domains searched for an unqualified name (as BIND/glibc) */
+#endif
 	
 /*
  * Formulate a normal query, send, and await answer.
@@ -245,13 +249,72 @@ res_search(struct SocketBase *	libPtr,
 	 *	  and RES_DNSRCH is set.
 	 */
 	if ((n == 0 && _res.options & RES_DEFNAMES) ||
-	   (n != 0 && *--cp != '.' && _res.options & RES_DNSRCH))
+	   (n != 0 && *--cp != '.' && _res.options & RES_DNSRCH)) {
 
-	  for (domain = (struct DomainentNode *)NDB->ndb_Domains.mlh_Head;
-	       domain->dn_Node.mln_Succ;
-	       domain = (struct DomainentNode *)domain->dn_Node.mln_Succ) {
-	    ret = res_querydomain(libPtr, name, domain->dn_Ent.d_name,
-				  class, type, answer, anslen);
+	  /*
+	   * CONCURRENCY: the search list (NDB->ndb_Domains) can be replaced out from
+	   * under us at any moment -- SetDefaultDomainName() and every DHCP (re)lease
+	   * take the NDB write lock, Remove()+free() the domain nodes, and install new
+	   * ones. res_querydomain() below blocks on the network for seconds, so we must
+	   * NOT hold a domain node pointer, or the NDB lock, across it: a concurrent
+	   * free would turn the walk into a use-after-free. So every access to a shared
+	   * node happens under LOCK_R_NDB and only copies a name into a local buffer;
+	   * the blocking query then runs against that copy, lock released.
+	   */
+
+	  /*
+	   * Lowest-priority search source: if no domain has been configured
+	   * (ndb_Domains is empty) and the name is unqualified, fall back to the
+	   * domain implied by our own hostname -- resolv.conf-style: host_name after
+	   * its first label (host "amiga.bar" -> search "bar"). This only fires when
+	   * neither an explicit domain= nor a DHCP-supplied domain populated the
+	   * search list, so it can never override them.
+	   */
+	  {
+	    int empty;
+	    LOCK_R_NDB(NDB);
+	    empty = (((struct DomainentNode *)NDB->ndb_Domains.mlh_Head)
+			->dn_Node.mln_Succ == NULL);
+	    UNLOCK_NDB(NDB);
+
+	    if (n == 0 && empty) {
+	      extern char host_name[];
+	      const char *hd = host_name;
+	      while (*hd && *hd != '.') hd++;		/* skip the first label */
+	      if (*hd == '.' && hd[1] &&
+	          (ret = res_querydomain(libPtr, name, (char *)(hd + 1),
+	                                 class, type, answer, anslen)) > 0)
+	        return (ret);
+	    }
+	  }
+
+	  {
+	    int i;
+	    for (i = 0; i < MAXDNSRCH; i++) {
+	      char dname[MAXDNAME];
+	      int k;
+
+	      /*
+	       * Copy the i-th search domain's name under the lock, re-walking from the
+	       * head each pass so no node pointer is ever held across the unlock/query.
+	       * At most MAXDNSRCH domains, so the re-walk is trivial; a concurrent
+	       * mutation between passes may reorder which name we see next, but can
+	       * never make us dereference freed memory.
+	       */
+	      LOCK_R_NDB(NDB);
+	      domain = (struct DomainentNode *)NDB->ndb_Domains.mlh_Head;
+	      for (k = 0; k < i && domain->dn_Node.mln_Succ; k++)
+	        domain = (struct DomainentNode *)domain->dn_Node.mln_Succ;
+	      if (domain->dn_Node.mln_Succ == NULL || domain->dn_Ent.d_name == NULL) {
+	        UNLOCK_NDB(NDB);
+	        break;				/* reached the end of the search list */
+	      }
+	      strncpy(dname, domain->dn_Ent.d_name, sizeof(dname) - 1);
+	      dname[sizeof(dname) - 1] = '\0';
+	      UNLOCK_NDB(NDB);
+
+	      ret = res_querydomain(libPtr, name, dname,
+				    class, type, answer, anslen);
 		if (ret > 0)
 			return (ret);
 		/*
@@ -275,6 +338,8 @@ res_search(struct SocketBase *	libPtr,
 		if ((h_errno != HOST_NOT_FOUND && h_errno != NO_DATA) ||
 		    (_res.options & RES_DNSRCH) == 0)
 			break;
+	    }
+	  }
 	}
 	/*
 	 * If the search/default failed, try the name as fully-qualified,

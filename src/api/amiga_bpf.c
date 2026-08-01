@@ -10,6 +10,15 @@
  * data_waiting, else 0), or a negative errno -- into Roadshow's convention: the
  * value on success, or -1 with errno set on the caller's own SocketBase.
  *
+ * Like the socket vectors (amiga_sendrecv.c), each holds the syscall semaphore
+ * across the ng_bpf_* call (CHECK_TASK for the lazy stack self-start + task
+ * check, then ObtainSyscallSemaphore/ReleaseSyscallSemaphore). This is required,
+ * not optional: bpf_read blocks in tsleep(), which asserts the caller holds the
+ * semaphore (DIAGNOSTIC) and otherwise returns -1 -- reported back as a bogus
+ * one-byte read of an unfilled buffer -- and every vector touches bpf-channel
+ * state shared with the stack task. tsleep releases and re-obtains the semaphore
+ * around the sleep itself, so holding it across a blocking read composes cleanly.
+ *
  * The register assignments come straight from the published SFD
  * (roadshow-ref bsdsocket_lib.sfd); note the deliberately different orders for
  * bpf_set_notify_mask (d1,d0) and bpf_set_interrupt_mask (d0,d1). The channel
@@ -48,7 +57,12 @@ LONG SAVEDS RAF2(_bpf_open,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_open((int)channel));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_open((int)channel);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF2(_bpf_close,
@@ -57,7 +71,12 @@ LONG SAVEDS RAF2(_bpf_close,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_close((int)channel));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_close((int)channel);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF4(_bpf_read,
@@ -68,7 +87,12 @@ LONG SAVEDS RAF4(_bpf_read,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_read((int)channel, (caddr_t)buffer, (int)len, libPtr));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_read((int)channel, (caddr_t)buffer, (int)len, libPtr);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF4(_bpf_write,
@@ -79,7 +103,12 @@ LONG SAVEDS RAF4(_bpf_write,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_write((int)channel, (caddr_t)buffer, (int)len, libPtr));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_write((int)channel, (caddr_t)buffer, (int)len, libPtr);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF3(_bpf_set_notify_mask,
@@ -89,7 +118,12 @@ LONG SAVEDS RAF3(_bpf_set_notify_mask,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_set_notify_mask((int)channel, (u_long)signal_mask));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_set_notify_mask((int)channel, (u_long)signal_mask);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF3(_bpf_set_interrupt_mask,
@@ -99,7 +133,11 @@ LONG SAVEDS RAF3(_bpf_set_interrupt_mask,
 #if 0
 {
 #endif
-  int r = ng_bpf_set_interrupt_mask((int)channel, (u_long)signal_mask);
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_set_interrupt_mask((int)channel, (u_long)signal_mask);
+  ReleaseSyscallSemaphore(libPtr);
   /*
    * Make a blocking bpf_read() actually break on these signals. bpf_read()
    * blocks in tsleep(), which already returns EINTR on any signal in this task's
@@ -130,7 +168,12 @@ LONG SAVEDS RAF4(_bpf_ioctl,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_ioctl((int)channel, (u_long)command, (caddr_t)buffer));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_ioctl((int)channel, (u_long)command, (caddr_t)buffer);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }
 
 LONG SAVEDS RAF2(_bpf_data_waiting,
@@ -139,5 +182,10 @@ LONG SAVEDS RAF2(_bpf_data_waiting,
 #if 0
 {
 #endif
-  BPF_RETURN(libPtr, ng_bpf_data_waiting((int)channel));
+  int r;
+  CHECK_TASK();
+  ObtainSyscallSemaphore(libPtr);
+  r = ng_bpf_data_waiting((int)channel);
+  ReleaseSyscallSemaphore(libPtr);
+  BPF_RETURN(libPtr, r);
 }

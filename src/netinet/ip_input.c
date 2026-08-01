@@ -261,6 +261,19 @@ struct	ip *ip_reass();
  * to admit the newest arrival. ip_nfrags is kept in sync in ip_freef().
  */
 #define IP_MAXFRAGPACKETS 8
+/*
+ * The IP_MAXFRAGPACKETS cap bounds the number of distinct in-flight datagrams,
+ * but not the fragments WITHIN one datagram: a single ip_id fed a stream of
+ * tiny, non-overlapping, never-completing fragments would grow one queue
+ * without bound (min 8-byte frag granularity => up to ~8192 mbufs for one
+ * 64KB datagram). Cap the per-datagram fragment count too. 64 covers a full
+ * 65535-byte datagram fragmented at any MTU at/above ~1100 bytes (Ethernet's
+ * 1500 needs ~45); only a near-maximal datagram over an unusually small path
+ * MTU would exceed it, and then it simply times out (ipq_ttl) and the peer
+ * retransmits. An all-tiny-fragment flood is bounded to IP_MAXFRAGPACKETS*64
+ * mbufs.
+ */
+#define IP_MAXFRAGSPERPACKET 64
 int	ip_nfrags = 0;			/* current number of reassembly queues */
 
 struct	sockaddr_in ipaddr = { sizeof(ipaddr), AF_INET };
@@ -542,6 +555,7 @@ ip_reass(ip, fp)
 		fp->ipq_next = fp->ipq_prev = (struct ipasfrag *)fp;
 		fp->ipq_src = ((struct ip *)ip)->ip_src;
 		fp->ipq_dst = ((struct ip *)ip)->ip_dst;
+		fp->ipq_nfrags = 0;
 		q = (struct ipasfrag *)fp;
 		goto insert;
 	}
@@ -592,17 +606,42 @@ ip_reass(ip, fp)
 			m_adj(dtom(q), i);
 			break;
 		}
-		q = q->ipf_next;
-		m_freem(dtom(q->ipf_prev));
-		ip_deq(q->ipf_prev);
+		{
+			/*
+			 * Drop the fully-covered fragment. ip_deq() reads this
+			 * node's own ipf_prev/ipf_next to splice it out of the
+			 * list, so it MUST run BEFORE m_freem() frees that mbuf.
+			 * The original order (free, then ip_deq) was a read-after-
+			 * free -- benign today only because m_free() leaves the
+			 * overlaid IP header intact and splnet blocks reallocation,
+			 * but a genuine use-after-free if the allocator ever scrubs
+			 * or asynchronously frees payload.
+			 */
+			struct ipasfrag *p = q;
+			q = q->ipf_next;
+			ip_deq(p);
+			fp->ipq_nfrags--;	/* dequeued a fully-covered frag */
+			m_freem(dtom(p));
+		}
 	}
 
 insert:
+	/*
+	 * PORT (AmiTCP_NG) hardening: reject once this datagram already holds
+	 * the per-packet fragment cap. Bounds a single-ip_id tiny-fragment
+	 * flood that IP_MAXFRAGPACKETS (a per-queue count, not per-fragment)
+	 * does not cover. The partial reassembly is left intact and times out
+	 * normally via ipq_ttl; the peer retransmits if it was legitimate.
+	 */
+	if (fp->ipq_nfrags >= IP_MAXFRAGSPERPACKET)
+		goto dropfrag;
+
 	/*
 	 * Stick new segment in its place;
 	 * check for complete reassembly.
 	 */
 	ip_enq(ip, q->ipf_prev);
+	fp->ipq_nfrags++;
 	next = 0;
 	for (q = fp->ipq_next; q != (struct ipasfrag *)fp; q = q->ipf_next) {
 		if (q->ip_off != next)
@@ -917,7 +956,12 @@ ip_dooptions(m)
 				    sizeof(struct in_addr) > ipt->ipt_len)
 					goto bad;
 				ia = ifptoia(m->m_pkthdr.rcvif);
-				*sin = IA_SIN(ia)->sin_addr;
+				/* sin = cp+ipt_ptr-1 may be ODD (attacker-controlled);
+				 * a struct store here is an Address Error trap on
+				 * 68000/010. bcopy (CopyMem) is alignment-safe, as the
+				 * RR/LSRR handlers above already use. */
+				bcopy((caddr_t)&(IA_SIN(ia)->sin_addr), (caddr_t)sin,
+				    sizeof(struct in_addr));
 				ipt->ipt_ptr += sizeof(struct in_addr);
 				break;
 
@@ -925,7 +969,8 @@ ip_dooptions(m)
 				if (ipt->ipt_ptr + sizeof(n_time) +
 				    sizeof(struct in_addr) > ipt->ipt_len)
 					goto bad;
-				ipaddr.sin_addr = *sin;
+				bcopy((caddr_t)sin, (caddr_t)&ipaddr.sin_addr,
+				    sizeof(struct in_addr));	/* sin may be odd -- see above */
 				if (ifa_ifwithaddr((SA)&ipaddr) == 0)
 					continue;
 				ipt->ipt_ptr += sizeof(struct in_addr);

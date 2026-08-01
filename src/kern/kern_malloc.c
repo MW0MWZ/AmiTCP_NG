@@ -125,19 +125,31 @@ bsd_free(void *addr)
 }
 
 /*
- * bsd_realloc() cannot be used for reallocating
- * last freed block for obvious reasons
- */
-
-/*
- * PORT (AmiTCP_NG): bsd_realloc() is not used anywhere in the stack. Provide an
- * AllocVec-based stub so no libnix malloc-family symbol is referenced (see the
- * note on bsd_malloc above). It does NOT preserve the old contents -- acceptable
- * only because it is never called; revisit if a caller ever appears.
+ * PORT (AmiTCP_NG): a correct realloc on top of AllocVec, which DOES preserve the
+ * old contents. AllocVec records the block size in the ULONG immediately before the
+ * returned pointer (that is what FreeVec reads to free it), so the old payload size
+ * is that recorded value minus the header ULONG. We copy the smaller of the old
+ * payload and the new size into a fresh block, then free the old one. Callers:
+ * setup_accesscontroltable() (kern/accesscontrol.h) shrinks the access-control table
+ * with this, and RELIES on the contents surviving -- an earlier version that returned
+ * a fresh uninitialised block silently corrupted that table.
  */
 void *
 bsd_realloc(void * mem, unsigned long size)
 {
-  (void)mem;
-  return AllocVec((ULONG)size, MEMF_PUBLIC);
+  void *nblk;
+
+  if (mem == NULL)
+    return AllocVec((ULONG)size, MEMF_PUBLIC);	/* realloc(NULL, n) == malloc(n) */
+  if (size == 0) {
+    FreeVec(mem);				/* realloc(p, 0) == free(p)      */
+    return NULL;
+  }
+  nblk = AllocVec((ULONG)size, MEMF_PUBLIC);
+  if (nblk != NULL) {
+    ULONG oldpayload = ((ULONG *)mem)[-1] - (ULONG)sizeof(ULONG);
+    CopyMem(mem, nblk, (oldpayload < size) ? oldpayload : (ULONG)size);
+    FreeVec(mem);				/* on failure the old block is left intact */
+  }
+  return nblk;
 }

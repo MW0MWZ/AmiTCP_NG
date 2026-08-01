@@ -91,9 +91,9 @@ RCS_ID_C="$Id: if_loop.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
  *               ip_input() as if it had arrived from the network.
  *   loioctl()   handles SIOCSIFADDR etc. (bringing the interface up/addressed).
  *
- * NOTE: lo0 exists as soon as useloopback=YES, but it has no ADDRESS until
- * something does SIOCSIFADDR 127.0.0.1 on it (ifconfig lo0 localhost). Until then,
- * bind(127.0.0.1) fails with EADDRNOTAVAIL -- a gotcha worth remembering.
+ * NOTE: lo0 is now always addressed with 127.0.0.1 at self-start by
+ * ng_config_loopback() (unconditionally -- the old useloopback knob is gone), so
+ * bind(127.0.0.1) and localhost traffic work out of the box.
  */
 
 #include <conf.h>

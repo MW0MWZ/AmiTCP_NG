@@ -382,7 +382,17 @@ mbdeinit(void)
 /*
  * Allocate memory for mbufs.
  * and place on the mbuf free list.
- * The canwait argument is currently ignored.
+ *
+ * canwait (M_WAIT/M_DONTWAIT) is DELIBERATELY ignored: AllocMem() here never
+ * blocks, and this codebase runs the whole stack at task level, so growing the
+ * pool on demand -- even for an M_DONTWAIT caller whose free list is empty --
+ * is both safe and load-bearing. Refusing to grow on M_DONTWAIT (the strict
+ * BSD semantics) would make the hot tcp_output()/ip_output() path (all
+ * M_DONTWAIT) return ENOBUFS under bursts, driving tcp_quench() to collapse
+ * cwnd -- the exact upstream throughput bug the on-demand growth exists to
+ * avoid. The one hard rule this trades on: mbufs MUST NOT be allocated from a
+ * real interrupt handler (AllocMem() is illegal there); the SANA RX path
+ * upholds this by pre-allocating at task level and only filling at interrupt.
  *
  * MUST be called at splimp!
  */
@@ -412,7 +422,11 @@ m_alloc(int howmany, int canwait)
     return FALSE;
   }
 
-  size = MSIZE * (howmany + 1) + sizeof(struct memHeader);
+  /* Compute in ULONG throughout: MSIZE and howmany are int, so the product
+   * MSIZE*(howmany+1) is signed-int arithmetic and is technically UB once it
+   * exceeds INT_MAX -- the guard above keeps the true value under ULONG_MAX,
+   * but relying on twos-complement wraparound is not portable. */
+  size = (ULONG)MSIZE * ((ULONG)howmany + 1) + sizeof(struct memHeader);
 
   /*
    * check if allowed to allocate more
@@ -466,7 +480,9 @@ m_alloc(int howmany, int canwait)
 /*
  * Allocate some number of mbuf clusters
  * and place on cluster free list.
- * The canwait argument is currently ignored.
+ * canwait is DELIBERATELY ignored -- see m_alloc() above for the rationale
+ * (task-level-only, AllocMem() never blocks, on-demand growth is load-bearing
+ * for throughput; never allocate mbufs from a real interrupt handler).
  * MUST be called at splimp.
  */
 BOOL
@@ -734,8 +750,15 @@ m_copym(m, off0, len, wait)
 		n->m_len = MIN(len, m->m_len - off);
 
 		if (m->m_flags & M_EXT) {
+			spl_t s;
 			n->m_data = m->m_data + off;
+			/* Bumping the shared cluster's refcount must be atomic vs
+			 * MCLFREE's decrement-and-free (which is splimp-protected);
+			 * this is reachable unlocked via the mbuf_copym() library
+			 * vector, so protect it the same way. */
+			s = splimp();
 			m->m_ext.ext_buf->mcl.mcl_refcnt++;
+			splx(s);
 			n->m_ext = m->m_ext;
 			n->m_flags |= M_EXT;
 		} else

@@ -225,6 +225,95 @@ udp_input(m, iphlen)
 	}
 
 	/*
+	 * Broadcast / multicast: deliver a COPY to EVERY matching socket
+	 * (4.4BSD). The 4.3-Reno single-lookup path below hands the datagram
+	 * to only ONE socket, so a second listener on the same broadcast or
+	 * multicast port (two DHCP clients, NetBIOS name service, mDNS,
+	 * routed, ...) never sees it. We gate on the link-level M_BCAST/M_MCAST
+	 * that the receive driver (if_sana.c) set from SANA2IOF_BCAST/MCAST --
+	 * real broadcast/multicast UDP always arrives on the broadcast/multicast
+	 * MAC, and this keeps the unicast hot path free of the per-datagram
+	 * in_broadcast() interface-list walk that stock 4.4BSD does. Same flags
+	 * ip_input.c uses to reason about bcast/mcast.
+	 */
+	if (m->m_flags & (M_BCAST | M_MCAST)) {
+		struct socket *last;
+
+		/*
+		 * Construct sockaddr format source address.
+		 */
+		udp_in.sin_port = uh->uh_sport;
+		udp_in.sin_addr = ip->ip_src;
+		/*
+		 * Strip IP+UDP header once; the copies and the final append all
+		 * present just the payload. iphlen == sizeof(struct ip) here
+		 * (options were stripped above), so this matches the unicast strip.
+		 */
+		iphlen += sizeof(struct udphdr);
+		m->m_len -= iphlen;
+		m->m_pkthdr.len -= iphlen;
+		m->m_data += iphlen;
+
+		last = NULL;
+		for (inp = udb.inp_next; inp != &udb; inp = inp->inp_next) {
+			if (inp->inp_lport != uh->uh_dport)
+				continue;
+			if (inp->inp_laddr.s_addr != INADDR_ANY) {
+				if (inp->inp_laddr.s_addr != ip->ip_dst.s_addr)
+					continue;
+			}
+			if (inp->inp_faddr.s_addr != INADDR_ANY) {
+				if (inp->inp_faddr.s_addr != ip->ip_src.s_addr ||
+				    inp->inp_fport != uh->uh_sport)
+					continue;
+			}
+
+			if (last != NULL) {
+				struct mbuf *n;
+
+				if ((n = m_copy(m, 0, M_COPYALL)) != NULL) {
+					if (sbappendaddr(&last->so_rcv,
+					    (struct sockaddr *)&udp_in,
+					    n, (struct mbuf *)0) == 0) {
+						m_freem(n);
+						udpstat.udps_fullsock++;
+					} else
+						sorwakeup(last);
+				}
+			}
+			last = inp->inp_socket;
+			/*
+			 * Stop at the first match unless the socket allows
+			 * address/port reuse -- else we would walk every pcb for
+			 * the common single-listener case. Sockets sharing a
+			 * bcast/mcast port must set SO_REUSEPORT (or SO_REUSEADDR
+			 * for a multicast bind); in_pcbbind enforces the matching
+			 * both-opt-in rule at bind time.
+			 */
+			if ((last->so_options & (SO_REUSEPORT | SO_REUSEADDR)) == 0)
+				break;
+		}
+
+		if (last == NULL) {
+			/*
+			 * No matching socket; drop silently -- never send an
+			 * ICMP port-unreachable for a broadcast/multicast
+			 * datagram (this is the M_MCAST no-port exemption; the
+			 * unicast path below only sees unicast now).
+			 */
+			udpstat.udps_noportbcast++;
+			goto bad;
+		}
+		if (sbappendaddr(&last->so_rcv, (struct sockaddr *)&udp_in,
+		    m, (struct mbuf *)0) == 0) {
+			udpstat.udps_fullsock++;
+			goto bad;
+		}
+		sorwakeup(last);
+		return;
+	}
+
+	/*
 	 * Locate pcb for datagram.
 	 */
 	inp = udp_last_inpcb;
@@ -239,9 +328,15 @@ udp_input(m, iphlen)
 		udpstat.udpps_pcbcachemiss++;
 	}
 	if (inp == 0) {
-		/* don't send ICMP response for broadcast packet */
 		udpstat.udps_noport++;
-		if (m->m_flags & M_BCAST) {
+		/*
+		 * Never send an ICMP port-unreachable for a broadcast/multicast
+		 * datagram. With the fan-out block above this is now defence in
+		 * depth -- any M_BCAST/M_MCAST frame already returned there and
+		 * cannot reach here -- but keep the guard so a future change that
+		 * lets one through still can't emit a bogus ICMP to a bcast src.
+		 */
+		if (m->m_flags & (M_BCAST | M_MCAST)) {
 			udpstat.udps_noportbcast++;
 			goto bad;
 		}
@@ -402,6 +497,20 @@ udp_output(inp, m, addr, control)
 	 * for UDP and IP headers.
 	 */
 	M_PREPEND(m, sizeof(struct udpiphdr), M_WAIT);
+	if (m == 0) {			/* M_WAIT does not block on this port */
+		error = ENOBUFS;
+		/* Undo the temporary connect done above for a sendto(addr):
+		 * mirror the success path (below) or we leave the PCB connected
+		 * and, worse, splx(s) is never called -- task switching stays
+		 * disabled. m_prepend already freed the chain, so release: just
+		 * m_freem(NULL) (no-op). */
+		if (addr) {
+			in_pcbdisconnect(inp);
+			inp->inp_laddr = laddr;
+			splx(s);
+		}
+		goto release;
+	}
 
 	/*
 	 * Fill in mbuf with extended UDP header
@@ -483,8 +592,18 @@ udp_usrreq(so, req, m, addr, control)
 		if (error)
 			break;
 		error = soreserve(so, udp_sendspace, udp_recvspace);
-		if (error)
+		if (error) {
+			/*
+			 * soreserve() failed (mbuf pressure): the inpcb that
+			 * in_pcballoc() just linked onto udb and attached to
+			 * so->so_pcb must be detached, or it leaks on the udb
+			 * list with a dangling inp_socket once the socket layer
+			 * frees `so`. udp_detach() does splnet + the last_inpcb
+			 * guard + in_pcbdetach (which clears so->so_pcb).
+			 */
+			udp_detach((struct inpcb *) so->so_pcb);
 			break;
+		}
 		((struct inpcb *) so->so_pcb)->inp_ip.ip_ttl = udp_ttl;
 		break;
 

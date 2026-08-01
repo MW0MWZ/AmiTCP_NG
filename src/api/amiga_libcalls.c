@@ -392,7 +392,7 @@ again:
 		break;
 	}
 	if (*cp == '.') {
-		if (pp >= parts + 4)
+		if (pp >= parts + 3)	/* +3 not +4: the final *pp++ below writes one more */
 			return (INADDR_NONE);
 		*pp++ = val, cp++;
 		goto again;

@@ -76,7 +76,7 @@ RCS_ID_C="$Id: tcp_timer.c,v 1.8 1993/06/04 11:16:15 jraja Exp $";
  * KEEPALIVE (detect a dead peer / connection-establishment timeout), and 2MSL
  * (linger in TIME_WAIT). tcp_slowtimo() runs every 500 ms (from amiga_time.c via
  * the protosw pr_slowtimo hook) and decrements each connection's timers, calling
- * tcp_timers() when one expires. tcp_fasttimo() runs every 200 ms for delayed
+ * tcp_timers() when one expires. tcp_fasttimo() runs every 40 ms for delayed
  * ACKs. The retransmit backoff table and the round-trip-timeout computation live
  * here. See TCP/IP Illustrated Vol 2 chapter 25 (timers) and 21 (RTO).
  */
@@ -135,7 +135,7 @@ tcp_fasttimo()
 		 * caller set but could not send (TF_ACKNOW). Including TF_ACKNOW is a
 		 * safety net: the every-other-segment rule (TCP_SETDELACK) can raise
 		 * TF_ACKNOW, and every setter is expected to call tcp_output itself, but
-		 * this guarantees the ~200ms ceiling holds even if some path does not.
+		 * this guarantees the ~40ms ceiling holds even if some path does not.
 		 */
 		if ((tp = (struct tcpcb *)inp->inp_ppcb) &&
 		    (tp->t_flags & (TF_DELACK | TF_ACKNOW))) {
@@ -247,6 +247,39 @@ tcp_timers(tp, timer)
 	 * to a longer retransmit interval and retransmit one segment.
 	 */
 	case TCPT_REXMT:
+		/*
+		 * Catch-all: a retransmit timeout for QUEUED DATA at a genuinely
+		 * closed window must PROBE the peer, not back off to ETIMEDOUT. A
+		 * retransmit is dropped past a zero-window edge anyway, and RFC
+		 * 1122 requires indefinite persist for a live, full-buffered
+		 * receiver. Convert to persist here so that whatever armed REXMT
+		 * while snd_wnd was 0 -- a SACK hole retransmit, the out:
+		 * backstop, or the cumulative-ack arm during recovery, where the
+		 * usual "window 0 => already persisting" invariant is broken by
+		 * PERSIST being suppressed -- can never drop the connection.
+		 *
+		 * Guards, both essential:
+		 *  - t_state >= ESTABLISHED: before the handshake completes
+		 *    snd_wnd is still its bzero'd 0 (no window learned yet, not a
+		 *    real "buffer full" signal); without this the FIRST SYN /
+		 *    SYN-ACK retransmit would wrongly convert to persist and go
+		 *    out at the wrong sequence number, breaking connect().
+		 *  - so_snd.sb_cc > 0: persist only makes sense with queued data
+		 *    to probe with (this is stock BSD's own persist condition). A
+		 *    bare SYN or a lone outstanding FIN has sb_cc == 0; those must
+		 *    stay on the normal REXMT path (retransmit-and-get-acked),
+		 *    not persist forever with nothing to send.
+		 * Clearing REXMT first keeps tcp_setpersist() off its
+		 * REXMT-still-armed panic.
+		 */
+		if (tp->t_state >= TCPS_ESTABLISHED &&
+		    tp->t_inpcb->inp_socket->so_snd.sb_cc > 0 &&
+		    tp->snd_wnd == 0 && SEQ_LT(tp->snd_una, tp->snd_max)) {
+			tp->t_timer[TCPT_REXMT] = 0;
+			tp->t_rxtshift = 0;
+			tcp_setpersist(tp);
+			break;
+		}
 		if (++tp->t_rxtshift > TCP_MAXRXTSHIFT) {
 			tp->t_rxtshift = TCP_MAXRXTSHIFT;
 			tcpstat.tcps_timeoutdrop++;
@@ -273,6 +306,17 @@ tcp_timers(tp, timer)
 			tp->t_srtt = 0;
 		}
 		tp->snd_nxt = tp->snd_una;
+		/*
+		 * A retransmit timeout abandons RFC 6675 SACK recovery: the SACK
+		 * scoreboard cannot be trusted across a timeout (the peer may have
+		 * reneged on data it SACKed), so discard it and slow-start-retransmit
+		 * from snd_una (snd_nxt was just pulled back above).
+		 */
+		if (tp->t_flags & TF_SACK_RECOVER) {
+			tp->t_flags &= ~(TF_SACK_RECOVER | TF_SACK_RESCUE);
+			tp->snd_numsackblks = 0;
+			tp->snd_highrxt = tp->snd_una;
+		}
 		/*
 		 * If timing a segment in this window, stop the timer.
 		 */

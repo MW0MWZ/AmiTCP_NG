@@ -155,7 +155,6 @@ static ULONG sanamask = 0,
   breakmask = 0;
 
 UBYTE *taskname = NULL;
-ULONG EnableDebug = 0;
 BOOL  initialized = FALSE;
 /* PORT (AmiTCP_NG): TRUE once the stack subsystems are up. Set here (defined
  * once) so both main() (program build) and ng_stack_ensure_running() (library
@@ -428,7 +427,7 @@ ng_ram_tier(void)
   }
   ng_detected_ram = total;		/* publish for GetNetStatus DEBUG (SBTC_NG_DETECTED_RAM) */
 
-  udp_sendspace = 9216;			/* really the max datagram size; unchanged */
+  udp_sendspace = 9216;			/* max single datagram; baseline, raised on big-RAM tiers below */
 
   if (total == 0 || total <= 1024UL * 1024) {
     /* <= 1 MB (e.g. a 512 KB A500): lean, must still boot. Pool ceiling BELOW
@@ -451,14 +450,16 @@ ng_ram_tier(void)
     mbconf.maxmem = 1024;
     sb_max        = 256UL * 1024;
     tcp_sendspace = tcp_recvspace = 90 * 1460;	/* 131400 (~128 KB), MSS-aligned */
-    udp_recvspace = 41600;
+    udp_recvspace = 128UL * 1024;		/* ~90 full datagrams of burst absorption */
+    udp_sendspace = 32UL * 1024;		/* allow larger single datagrams (e.g. NFS) */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_16MB;
   } else if (total <= 64UL * 1024 * 1024) {
     /* 16-64 MB: ~256 KB buffers/windows. */
     mbconf.maxmem = 4096;
     sb_max        = 512UL * 1024;
     tcp_sendspace = tcp_recvspace = 180 * 1460;	/* 262800 (~256 KB), MSS-aligned */
-    udp_recvspace = 41600;
+    udp_recvspace = 192UL * 1024;		/* ~130 full datagrams of burst absorption */
+    udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
   } else if (total <= 128UL * 1024 * 1024) {
     /* 64-128 MB: ~512 KB windows -- enough to fill ~100-150 Mbit at internet RTT (and a
@@ -469,7 +470,8 @@ ng_ram_tier(void)
     mbconf.maxmem = 8192;
     sb_max        = 1024UL * 1024;
     tcp_sendspace = tcp_recvspace = 359 * 1460;	/* 524140 (~512 KB), MSS-aligned */
-    udp_recvspace = 41600;
+    udp_recvspace = 256UL * 1024;		/* ~170-250 datagrams; UDP has no window to fill, so this caps out */
+    udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
   } else {
     /* 128 MB+ (big PiStorm / Vampire, "memory to burn"): ~1 MB windows. Beyond this the
@@ -480,7 +482,8 @@ ng_ram_tier(void)
     mbconf.maxmem = 16384;
     sb_max        = 2048UL * 1024;
     tcp_sendspace = tcp_recvspace = 718 * 1460;	/* 1048280 (~1 MB), MSS-aligned */
-    udp_recvspace = 41600;
+    udp_recvspace = 256UL * 1024;		/* ~170-250 datagrams; UDP has no window to fill, so this caps out */
+    udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
   }
   ng_ram_ceiling = tcp_recvspace;	/* fixed ceiling for the link-speed auto-tune */

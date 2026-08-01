@@ -43,6 +43,7 @@ RCS_ID_C="$Id: sana2config.c,v 3.2 1994/02/03 19:10:09 ppessi Exp $";
 #include <conf.h>
 
 #include <sys/param.h>
+#include <sys/mbuf.h>		/* mbconf -- the mbuf pool ceiling, to bound the ring */
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <net/if.h>
@@ -400,33 +401,67 @@ ssconfig(struct sana_softc *ifp, struct ssconfig *ifc)
   
   ifp->ss_ip.type = args->a_iptype ? *args->a_iptype : wd->wd_iptype;
   /*
-   * PORT (AmiTCP_NG): size the SANA-II receive ring to the RAM tier, mirroring the
-   * transmit if_snd sizing in net/if_sana.c. The stock wire default posts only 16
-   * CMD_READ buffers; on a fast link (accelerated machine / gigabit driver) a burst
-   * that overruns the ring is dropped at the driver -> TCP retransmit -> throughput
-   * collapse (GitHub issue #1 -- the receive-side mirror of the transmit tail-drop
-   * fixed earlier). Scale the ring to about one receive window of MSS-sized frames
-   * (tcp_recvspace / MTU; tcp_recvspace is set per tier by ng_ram_tier at init,
-   * before any interface is configured), floored at the wire default so small
-   * machines stay lean, and capped so pinned receive-buffer memory stays bounded.
-   * An explicit iprequests= (a_ipno) from the interface config always wins.
+   * PORT (AmiTCP_NG): size the SANA-II request rings (receive AND transmit) to this
+   * link, on BOTH axes the rest of the stack tunes -- RAM and interface speed. The
+   * stock wire defaults post only 16 CMD_READ / 32 CMD_WRITE buffers; on a fast link
+   * a burst that overruns a ring is dropped (a read overrun -> driver drop -> TCP
+   * retransmit -> throughput collapse, GitHub issue #1; a write overrun -> the if_snd
+   * send queue backs up behind the ring and drops ACKs -> download stalls). Size each
+   * ring to about one link window of MSS-sized frames.
+   *
+   * The window comes from ng_effective_window(if_baudrate): the link-speed target
+   * clamped to the RAM ceiling (or a config tcp.sendspace/recvspace override). We use
+   * if_baudrate directly, NOT the tcp_sendspace/recvspace globals, because this runs
+   * inside iface_make() BEFORE AddInterfaceTagList's global auto-tune has stored the
+   * speed-based window -- reading the globals here would see only the RAM-tier value.
+   * Floored at the per-wire default so small/slow machines stay lean, capped so pinned
+   * request memory stays bounded. An explicit iprequests=/writerequests= always wins.
    */
-  if (args->a_ipno) {
-    reqtotal += ifp->ss_ip.reqno = *args->a_ipno;
-  } else {
-    extern u_long tcp_recvspace;
-    long mtu  = ifp->ss_if.if_mtu ? (long)ifp->ss_if.if_mtu : 1500;  /* real MTU, like if_snd */
-    long ipno = (long)(tcp_recvspace / (u_long)mtu);   /* ~one window in MSS-sized frames */
-    if (ipno < wd->wd_ipno) ipno = wd->wd_ipno;   /* never below the wire default (16) */
-    if (ipno > 256)         ipno = 256;           /* bound pinned receive memory     */
-    reqtotal += ifp->ss_ip.reqno = ipno;
+  {
+    extern u_long ng_effective_window(u_long);
+    long mtu = ifp->ss_if.if_mtu ? (long)ifp->ss_if.if_mtu : 1500;  /* real MTU, like if_snd */
+    long win = (long)(ng_effective_window((u_long)ifp->ss_if.if_baudrate) / (u_long)mtu);
+
+    /*
+     * Cap the ring to the mbuf POOL ceiling as well as the link window. Each
+     * posted read PERMANENTLY pins ~one cluster (mbconf.mclbytes); the pool
+     * (mbconf.maxmem KB, RAM-tiered) must also back the transmit ring, the socket
+     * buffers and the protocol working set, so hold the ring to about a quarter of
+     * the pool. Without this, a fast NIC on a modest-RAM machine sizes a ring the
+     * pool can never fill -- ioip_alloc_mbuf() then fails persistently and the ring
+     * stays populated only by the re-arm watchdog retrying every poll. The floors
+     * below still guarantee the per-wire minimum.
+     */
+    if (mbconf.mclbytes) {
+      long poolcap = (long)((mbconf.maxmem * 1024UL / 4UL) / mbconf.mclbytes);
+      if (win > poolcap)
+	win = poolcap;
+    }
+
+    /* receive ring */
+    if (args->a_ipno) {
+      reqtotal += ifp->ss_ip.reqno = *args->a_ipno;
+    } else {
+      long ipno = win;
+      if (ipno < wd->wd_ipno) ipno = wd->wd_ipno;   /* never below the wire default (16) */
+      if (ipno > 256)         ipno = 256;           /* bound pinned receive memory     */
+      reqtotal += ifp->ss_ip.reqno = ipno;
+    }
+
+    ifp->ss_arp.type = args->a_arptype ? *args->a_arptype : wd->wd_arptype;
+    reqtotal += ifp->ss_arp.reqno = args->a_arpno ? *args->a_arpno : wd->wd_arpno;
+    ifp->ss_arp.hrd = args->a_arphdr ? *args->a_arphdr : wd->wd_arphdr;
+
+    /* transmit ring (was a flat wd_writeno; now the same link-window basis as reads) */
+    if (args->a_writeno) {
+      reqtotal += *args->a_writeno;
+    } else {
+      long wno = win;
+      if (wno < wd->wd_writeno) wno = wd->wd_writeno; /* never below the wire default (32) */
+      if (wno > 256)            wno = 256;            /* bound pinned transmit memory    */
+      reqtotal += wno;
+    }
   }
-
-  ifp->ss_arp.type = args->a_arptype ? *args->a_arptype : wd->wd_arptype;
-  reqtotal += ifp->ss_arp.reqno = args->a_arpno ? *args->a_arpno : wd->wd_arpno;
-  ifp->ss_arp.hrd = args->a_arphdr ? *args->a_arphdr : wd->wd_arphdr;
-
-  reqtotal += args->a_writeno ? *args->a_writeno : wd->wd_writeno;
 
   if (reqtotal > 65535)
     reqtotal = 65535;

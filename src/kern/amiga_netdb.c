@@ -212,19 +212,23 @@ ndb_parse_f ndb_parse_funs[] = {
 struct NetDataBase *
 alloc_netdb(struct NetDataBase *ndb)
 {
-  if (ndb || 
-      (ndb = bsd_malloc(sizeof (*NDB), M_NETDB, M_WAITOK))) {  
-    struct MinList *gl;
+  struct MinList *gl;
 
-    InitSemaphore(&ndb->ndb_Lock);
-    for (gl = (struct MinList *)&ndb->ndb_Hosts;
-	 gl <= (struct MinList *)&ndb->ndb_Domains;        
-	 gl++)
-      NewList((struct List *)gl);
-    
-  }
-  
+  /* Allocate the struct unless the caller supplied one. bsd_malloc() is AllocVec()
+   * here and M_WAITOK does NOT wait -- it returns NULL on OOM -- so bail out before
+   * dereferencing ndb below (previously it fell through and wrote *ndb == NULL). */
+  if (ndb == NULL &&
+      (ndb = bsd_malloc(sizeof (*NDB), M_NETDB, M_WAITOK)) == NULL)
+    return NULL;
+
+  InitSemaphore(&ndb->ndb_Lock);
+  for (gl = (struct MinList *)&ndb->ndb_Hosts;
+       gl <= (struct MinList *)&ndb->ndb_Domains;
+       gl++)
+    NewList((struct List *)gl);
+
   ndb->ndb_AccessCount = 0;
+  ndb->ndb_Generation = 0;
   if ((ndb->ndb_AccessTable =
        bsd_malloc(TMPACTSIZE, M_NETDB, M_WAITOK)) == NULL) {
     bsd_free(ndb, M_NETDB);
@@ -234,26 +238,28 @@ alloc_netdb(struct NetDataBase *ndb)
 }
 
 /*
- * Free a NetDataBase
- * Caller must have a write lock on NDB
+ * Free the CONTENTS of a NetDataBase -- every list node and the access-control
+ * table -- but NOT the NetDataBase struct itself, and so NOT its embedded
+ * ndb_Lock semaphore. This is what lets reset_netdb() clear the live NDB in
+ * place, while holding NDB's own ndb_Lock, without freeing the very struct and
+ * semaphore it is holding. The list heads are left as valid empty MinLists.
  */
 void
-free_netdb(struct NetDataBase *ndb)
+free_netdb_contents(struct NetDataBase *ndb)
 {
   struct GenentNode *gn;
   struct MinList *gl;
 
   for (gl = (struct MinList *)&ndb->ndb_Hosts;
-       gl <= (struct MinList *)&ndb->ndb_Domains;        
+       gl <= (struct MinList *)&ndb->ndb_Domains;
        gl++)
-    while (gn = (struct GenentNode *)RemHead((struct List *)gl)) 
+    while (gn = (struct GenentNode *)RemHead((struct List *)gl))
       bsd_free(gn, M_NETDB);
 
   if (ndb->ndb_AccessTable != NULL) {
     bsd_free(ndb->ndb_AccessTable, M_NETDB);
     ndb->ndb_AccessTable = NULL;
   }
-  bsd_free(ndb, M_NETDB);
 }
 
 #ifdef DEBUG
@@ -1011,11 +1017,18 @@ LONG reset_netdb(struct CSource *cs,
      */
     struct MinList *gl, *ol;
 
-    setup_accesscontroltable(NDB);
+    /* Terminate + shrink the access-control table of the freshly-parsed database
+     * (newnetdb) -- it is the one installed into NDB below. (Was wrongly run on the
+     * old NDB, which is about to be freed, leaving the new table unterminated so
+     * controlaccess() walked off its end.) */
+    setup_accesscontroltable(newnetdb);
 
-    /* Now clear the old lists of the NDB */
+    /* Now clear the old lists of the NDB, in place. free_netdb_contents() (NOT
+     * free_netdb()) frees the nodes and the old access table but keeps the NDB
+     * struct -- and its ndb_Lock, which we are holding right now -- alive; the
+     * new lists are transplanted into these emptied heads just below. */
     LOCK_W_NDB(NDB);
-    free_netdb(NDB);
+    free_netdb_contents(NDB);
 
     /*
      * Transfer the lists of the new (temporary) database
@@ -1036,13 +1049,35 @@ LONG reset_netdb(struct CSource *cs,
     /*
      * Perhaps ugly...
      */
-    newnetdb->ndb_AccessTable = NULL; 
+    newnetdb->ndb_AccessTable = NULL;
+
+    /*
+     * Bump the generation: free_netdb_contents() above freed every node the
+     * old lists held, so any getnetent()/getprotoent()/getservent() cursor a
+     * client left pointing into them now dangles. The iterators compare this
+     * generation against the value stamped into their cursor and silently
+     * rewind to the new list head on a mismatch, rather than walking freed
+     * memory (a reset issued from another task -- e.g. the ARexx port -- while
+     * a client is mid-iteration was a genuine use-after-free).
+     */
+    NDB->ndb_Generation++;
 
     UNLOCK_NDB(NDB);
   } else {
-    free_netdb(newnetdb);
+    /* Parse failed: discard the temporary database's contents. Only its contents
+     * -- the struct itself is freed once, below, on both paths (freeing it here
+     * too, as the old free_netdb() did, double-freed it). */
+    free_netdb_contents(newnetdb);
   }
 
-  bsd_free(newnetdb, M_NETDB);	/* free the temporary database */
+  /*
+   * Free the temporary database's struct on both paths. On SUCCESS its lists were
+   * transplanted into NDB (newnetdb's own heads now dangle at NDB-owned nodes) and
+   * its access table was handed off, so only the empty struct shell remains here --
+   * do NOT route the success path through free_netdb_contents(newnetdb): that would
+   * double-free the transplanted nodes. On FAILURE the contents were already freed
+   * just above, so this frees only the struct.
+   */
+  bsd_free(newnetdb, M_NETDB);
   return retval;
 }

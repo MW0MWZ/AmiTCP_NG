@@ -333,10 +333,9 @@ static char *
 				       name and return) */
       if ((n = dn_expand((u_char *)answer->buf,
 			 (u_char *)eom, (u_char *)cp, (u_char *)bp,
-			 buflen)) < 0) {
-	cp += n;
-	continue;
-      }
+			 buflen)) < 0)
+	break;			/* malformed PTR name -> stop (n==-1; cp+=n would
+				 * rewind and re-parse header bytes as a name). */
       cp += n;
       HS->host.h_name = bp;   /* well, rewrites name pointer if there were
 				 returned questions also... */
@@ -584,9 +583,12 @@ ng_gethostbyaddr_impl(struct SocketBase *libPtr, const UBYTE *addr, int len, int
   char * qbuf;
   struct hostent * anshost = NULL;
 
-  if (type != AF_INET)
+  /* Reject a bogus length: for AF_INET the only valid addr length is 4. len
+   * comes straight from the public gethostbyaddr() vector, and is used below as
+   * a bcopy/bcmp length -- an over-large value overruns the library's heap. */
+  if (type != AF_INET || len != sizeof(struct in_addr))
     return ((struct hostent *) NULL);
-  
+
   /*
    * Search local database (first) is usens not FIRST
    */

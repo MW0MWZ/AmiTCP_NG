@@ -111,6 +111,15 @@
  */
 #define	IPPORT_RESERVED		1024
 #define	IPPORT_USERRESERVED	5000
+/*
+ * PORT (AmiTCP_NG): range for automatic (bind-to-port-0) local port
+ * allocation. The old code rolled through IPPORT_RESERVED..IPPORT_USERRESERVED
+ * (~3976 ports, easily exhausted by a busy client and overlapping registered
+ * service ports an app might want to bind). Use the IANA dynamic/private range
+ * instead: IPPORT_ANONMIN..65535 (the u_short ceiling), ~16384 ports clear of
+ * the well-known/registered space.
+ */
+#define	IPPORT_ANONMIN		49152
 
 /*
  * Internet address (a structure for historical reasons)

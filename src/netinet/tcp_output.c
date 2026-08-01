@@ -173,6 +173,8 @@ tcp_output(tp)
 					 * the legacy USE_ALIGNED_COPIES build path is ever revived. */
 	unsigned optlen, hdrlen;
 	int idle, sendalot;
+	int sack_rxmit = 0;		/* this segment is an RFC 6675 hole retransmit */
+	tcp_seq sack_seq = 0;		/* its sequence number (the hole start) */
 
 	/*
 	 * Determine length of data that should be transmitted,
@@ -190,6 +192,16 @@ tcp_output(tp)
 		tp->snd_cwnd = tp->t_maxseg;
 again:
 	sendalot = 0;
+	/*
+	 * sack_rxmit / sack_seq describe THIS segment only, and the RFC 6675
+	 * recovery block below sets them afresh (or leaves them clear for a
+	 * rule-2 new-data send). Reset them every iteration: without this a
+	 * hole retransmit that set sendalot (hole tail not yet IsLost) could
+	 * loop back into the rule-2 branch carrying a stale sack_rxmit == 1,
+	 * shipping new snd_max data under the old hole's sequence number.
+	 */
+	sack_rxmit = 0;
+	sack_seq = 0;
 	off = tp->snd_nxt - tp->snd_una;
 	win = min(tp->snd_wnd, tp->snd_cwnd);
 
@@ -232,6 +244,112 @@ again:
 		len = tp->t_maxseg;
 		sendalot = 1;
 	}
+
+	/*
+	 * RFC 6675 SACK loss recovery. Override the sequential (off,len) chosen
+	 * above with what NextSeg() says to send, filling the network up to
+	 * snd_cwnd octets (the pipe estimate). A hole (rule 1) is retransmitted
+	 * from its own start (seq = sack_seq) and bypasses the SWS/Nagle checks
+	 * below via goto send -- recovery retransmits must not be delayed. New
+	 * data (rule 2) is offered at snd_max, re-gated to (cwnd - pipe) so we
+	 * fill exactly the room the pipe allows rather than the raw cwnd; because
+	 * snd_nxt == snd_max throughout SACK recovery (hole retransmits do not
+	 * advance it), off == snd_nxt - snd_una for that case and the normal
+	 * snd_nxt path handles the sequencing. INERT until B2b-2 sets
+	 * TF_SACK_RECOVER.
+	 */
+	if (tp->t_flags & TF_SACK_RECOVER) {
+		u_long pipe = tcp_sack_pipe(tp);
+		tcp_seq hs, he;
+		int rx;
+
+		len = 0;
+		sendalot = 0;
+		if (pipe < tp->snd_cwnd) {
+			if (tcp_sack_nextseg(tp, &hs, &he, &rx) && rx) {
+				sack_rxmit = 1;			/* retransmit a hole */
+				sack_seq = hs;
+				off = (int)(hs - tp->snd_una);
+				len = (long)(he - hs);
+			} else {				/* rule 2: new data */
+				long room = (long)tp->snd_cwnd - (long)pipe;
+
+				off = (int)(tp->snd_max - tp->snd_una);
+				len = (long)min(so->so_snd.sb_cc,
+				    (u_long)tp->snd_wnd) - off;
+				if (len > room)
+					len = room;
+				/*
+				 * Rule 3 (rescue): no lost hole and no new data,
+				 * but a hole remains that IsLost() has not yet
+				 * flagged. Retransmit it once (TF_SACK_RESCUE) so
+				 * recovery makes progress instead of stalling to an
+				 * RTO. The snd_highrxt advance below (shared with
+				 * rule 1) keeps it from repeating within the episode.
+				 */
+				if (len <= 0 &&
+				    (tp->t_flags & TF_SACK_RESCUE) == 0 &&
+				    tcp_sack_rescue(tp, &hs, &he)) {
+					sack_rxmit = 1;
+					sack_seq = hs;
+					off = (int)(hs - tp->snd_una);
+					len = (long)(he - hs);
+					tp->t_flags |= TF_SACK_RESCUE;
+				}
+			}
+			if (len > (long)tp->t_maxseg) {
+				len = tp->t_maxseg;
+				sendalot = 1;
+			}
+			if (len < 0)
+				len = 0;
+		}
+		/*
+		 * #102: a persist probe (t_force) fired during recovery with the
+		 * peer's window closed, and the pipe/cwnd-gated rules above sent
+		 * nothing (pipe >= cwnd, or no hole left to retransmit). Force a
+		 * one-octet retransmit from snd_una -- by definition the first
+		 * octet the peer has not acked (a hole; snd_una is never inside a
+		 * SACK block) -- purely to poll the closed window (RFC 1122).
+		 * Without it a lost window-reopen update could wedge the
+		 * connection with no timer able to re-probe. It reuses the
+		 * sack_rxmit path (keeps snd_nxt == snd_max, only nudges HighRxt
+		 * forward) and, running only when the rules produced nothing,
+		 * carries no sendalot loop. Gated on snd_wnd == 0 so an unrelated
+		 * OOB-driven t_force on an OPEN window still obeys congestion
+		 * control. One octet, not a full segment: at a zero window the
+		 * receiver drops anything past its edge, so a bigger probe only
+		 * wastes wire on the lossy links recovery implies.
+		 */
+		if (len == 0 && tp->t_force && tp->snd_wnd == 0 &&
+		    SEQ_LT(tp->snd_una, tp->snd_max)) {
+			sack_rxmit = 1;
+			sack_seq = tp->snd_una;
+			off = 0;
+			len = 1;
+			if (len > (long)so->so_snd.sb_cc)	/* only a FIN outstanding */
+				len = (long)so->so_snd.sb_cc;
+		}
+		if (len > 0) {
+			/*
+			 * We bypass the SWS/window block below via goto send, so
+			 * do the two things it would otherwise do for this segment:
+			 * refresh the RECEIVE-window advertisement (win is reused
+			 * for that further down), and clear a stale TH_FIN that
+			 * tcp_outflags may have seeded -- a hole/partial retransmit
+			 * that isn't the tail of the stream must not carry FIN (and
+			 * carrying it would trip the snd_nxt-- FIN kludge, breaking
+			 * the snd_nxt == snd_max recovery invariant).
+			 */
+			win = sbspace(&so->so_rcv);
+			if (SEQ_LT((sack_rxmit ? sack_seq : tp->snd_nxt) + len,
+			    tp->snd_una + so->so_snd.sb_cc))
+				flags &= ~TH_FIN;
+			goto send;
+		}
+		/* else fall through -- no data, but an ACK may still be due */
+	}
+
 	if (SEQ_LT(tp->snd_nxt + len, tp->snd_una + so->so_snd.sb_cc))
 		flags &= ~TH_FIN;
 
@@ -319,8 +437,43 @@ again:
 	 */
 	if (so->so_snd.sb_cc && tp->t_timer[TCPT_REXMT] == 0 &&
 	    tp->t_timer[TCPT_PERSIST] == 0) {
-		tp->t_rxtshift = 0;
-		tcp_setpersist(tp);
+		if ((tp->t_flags & TF_SACK_RECOVER) == 0) {
+			/*
+			 * Only start the zero-window persist timer for a genuinely
+			 * closed window. Outside SACK recovery, a "sent nothing"
+			 * outcome with data queued and no timer running is the
+			 * persist case (window shrank / stayed closed).
+			 */
+			tp->t_rxtshift = 0;
+			tcp_setpersist(tp);
+		} else if (SEQ_LT(tp->snd_una, tp->snd_max)) {
+			/*
+			 * SACK recovery, data still outstanding, nothing sent this
+			 * call, and NO timer left running -- the recovery backstop
+			 * of last resort (catches every no-send return, including
+			 * the wedge where a PERSIST probe self-cleared above when
+			 * the peer's window reopened). WHY nothing was sent decides
+			 * which timer to arm:
+			 *  - snd_wnd == 0: the peer's window is genuinely closed.
+			 *    Prefer persist over REXMT: an un-forced REXMT also sends
+			 *    nothing at a zero window and just backs off to ETIMEDOUT,
+			 *    dropping a live-but-full receiver, whereas persist keeps
+			 *    the connection alive. When a lost hole exists the
+			 *    persist-forced call retransmits it (window-exempt) and so
+			 *    probes the window; with pipe >= cwnd and no hole the
+			 *    forced call may not emit a probe yet and leans on the
+			 *    peer's in-flight SACKs to drain pipe (residual, task
+			 *    #102) -- but it never wrongly drops the connection. Safe:
+			 *    REXMT == 0 here, so tcp_setpersist() cannot double-arm.
+			 *  - otherwise pipe >= cwnd (pacing-limited): arm REXMT, whose
+			 *    RTO abandons recovery and retransmits from snd_una.
+			 */
+			if (tp->snd_wnd == 0) {
+				tp->t_rxtshift = 0;
+				tcp_setpersist(tp);
+			} else
+				tp->t_timer[TCPT_REXMT] = tp->t_rxtcur;
+		}
 	}
 
 	/*
@@ -369,6 +522,20 @@ send:
 			opt[optlen++] = TCPOLEN_WINDOW;		/* 3 */
 			opt[optlen++] = tp->request_r_scale;
 		}
+		/*
+		 * RFC 2018 SACK-permitted. Advertise in a SYN, and in a SYN-ACK
+		 * only if the peer offered it first (TF_SACK_PERMIT, set by
+		 * tcp_dooptions on their SYN). Gated on TF_REQ_SACK. Two leading
+		 * NOPs pad it to a 4-byte unit (like the timestamp option) so
+		 * optlen stays a multiple of 4.
+		 */
+		if ((tp->t_flags & TF_REQ_SACK) &&
+		    ((flags & TH_ACK) == 0 || (tp->t_flags & TF_SACK_PERMIT))) {
+			opt[optlen++] = TCPOPT_NOP;
+			opt[optlen++] = TCPOPT_NOP;
+			opt[optlen++] = TCPOPT_SACK_PERMITTED;	/* kind 4 */
+			opt[optlen++] = TCPOLEN_SACK_PERMITTED;	/* len 2 */
+		}
 	}
 
 	/*
@@ -396,6 +563,57 @@ send:
 		optlen += TCPOLEN_TSTAMP_APPA;		/* 12 */
 	}
 
+	/*
+	 * RFC 2018 SACK blocks. Report our out-of-order data (most-recent block
+	 * first, as tcp_sack.c keeps it) so the peer retransmits only the holes.
+	 * Emitted ONLY on a pure ACK (len == 0), never a SYN/RST: the block bytes
+	 * are variable and t_maxseg accounts only for the fixed timestamp overhead,
+	 * so putting them on a full data segment would exceed the MSS -- on a pure
+	 * ACK there is no such conflict, and a receiver in loss recovery is sending
+	 * exactly these (dup/forced) pure ACKs. Header NOP,NOP,kind,len keeps optlen
+	 * 4-aligned; the two network-order tcp_seq words per block are written with
+	 * bcopy (optbuf is not long-aligned; a direct store faults on a 68000). Fit
+	 * as many blocks as the remaining 40-byte option area allows.
+	 */
+	if ((tp->t_flags & TF_SACK_PERMIT) && len == 0 &&
+	    (flags & (TH_SYN|TH_RST)) == 0 &&
+	    (tp->rcv_numsacks > 0 || (tp->t_flags & TF_DSACK))) {
+		int avail = (int)sizeof optbuf - (int)optlen - 4;	/* minus NOP,NOP,kind,len */
+		int maxblk = avail / TCPOLEN_SACK;
+		int dsack = (tp->t_flags & TF_DSACK) ? 1 : 0;	/* RFC 2883: D-SACK is block #1 */
+		int nblk = tp->rcv_numsacks;
+		int total, b;
+
+		if (dsack > maxblk)			/* no room for even the D-SACK block */
+			dsack = 0;
+		if (nblk > maxblk - dsack)		/* fill remaining slots with normal blocks */
+			nblk = maxblk - dsack;
+		if (nblk < 0)
+			nblk = 0;
+		total = dsack + nblk;
+		if (total > 0) {
+			opt[optlen++] = TCPOPT_NOP;
+			opt[optlen++] = TCPOPT_NOP;
+			opt[optlen++] = TCPOPT_SACK;			/* kind 5 */
+			opt[optlen++] = (u_char)(2 + total * TCPOLEN_SACK);
+			if (dsack) {			/* D-SACK block first (RFC 2883 sec.4) */
+				tcp_seq s = htonl(tp->rcv_dsackblk.start);
+				tcp_seq e = htonl(tp->rcv_dsackblk.end);
+				bcopy((caddr_t)&s, (caddr_t)(opt + optlen),     sizeof s);
+				bcopy((caddr_t)&e, (caddr_t)(opt + optlen + 4), sizeof e);
+				optlen += TCPOLEN_SACK;
+			}
+			for (b = 0; b < nblk; b++) {
+				tcp_seq s = htonl(tp->sackblks[b].start);
+				tcp_seq e = htonl(tp->sackblks[b].end);
+				bcopy((caddr_t)&s, (caddr_t)(opt + optlen),     sizeof s);
+				bcopy((caddr_t)&e, (caddr_t)(opt + optlen + 4), sizeof e);
+				optlen += TCPOLEN_SACK;			/* 8 per block */
+			}
+		}
+		tp->t_flags &= ~TF_DSACK;	/* one-shot: reported (or dropped for space) */
+	}
+
 	hdrlen += optlen;
 #if DIAGNOSTIC
 	if (max_linkhdr + hdrlen > MHLEN)
@@ -407,6 +625,16 @@ send:
 	 * be transmitted, and initialize the header from
 	 * the template for sends on this connection.
 	 */
+	/*
+	 * Defensive: off must never index before the send-buffer head. With
+	 * the sack_rxmit exclusion on the snd_nxt-- FIN kludge below this can
+	 * no longer go negative, but clamp anyway so any future accounting
+	 * slip fails closed (m_copydata copies a real buffer byte) instead of
+	 * leaving m_copydata's guard skip the copy while m_len is still bumped
+	 * -- which would ship an uninitialised mbuf byte on the wire.
+	 */
+	if (off < 0)
+		off = 0;
 	if (len) {
 		if (tp->t_force && len == 1)
 			tcpstat.tcps_sndprobe++;
@@ -481,11 +709,19 @@ send:
 	 * Fill in fields, remembering maximum advertised
 	 * window for use in delaying messages about window sizes.
 	 * If resending a FIN, be sure not to use a new sequence number.
+	 *
+	 * Skip this for a sack_rxmit send: its wire sequence is sack_seq, not
+	 * snd_nxt (see ti_seq below), so decrementing snd_nxt does nothing for
+	 * this segment -- but the sack_rxmit accounting branch never restores
+	 * it, so snd_nxt would be left permanently at snd_max-1. A later ACK
+	 * that reopens a zero window then computes off = snd_nxt - snd_una < 0
+	 * and, absent the clamp above, ships an uninitialised byte at an
+	 * already-acked sequence (remote stale-memory disclosure).
 	 */
-	if (flags & TH_FIN && tp->t_flags & TF_SENTFIN && 
+	if (!sack_rxmit && (flags & TH_FIN) && (tp->t_flags & TF_SENTFIN) &&
 	    tp->snd_nxt == tp->snd_max)
 		tp->snd_nxt--;
-	ti->ti_seq = htonl(tp->snd_nxt);
+	ti->ti_seq = htonl(sack_rxmit ? sack_seq : tp->snd_nxt);
 	ti->ti_ack = htonl(tp->rcv_nxt);
 	if (optlen) {
 		aligned_bcopy((caddr_t)opt, (caddr_t)(ti + 1), optlen);
@@ -536,7 +772,41 @@ send:
 	 * In transmit state, time the transmission and arrange for
 	 * the retransmit.  In persist state, just set snd_max.
 	 */
-	if (tp->t_force == 0 || tp->t_timer[TCPT_PERSIST] == 0) {
+	if (sack_rxmit) {
+		/*
+		 * RFC 6675 hole retransmit: advance HighRxt over the sequence
+		 * space just resent (NOT snd_nxt/snd_max -- this data was already
+		 * sent once, and new data still goes out at snd_max). Arm the
+		 * retransmit timer as a backstop if it is not running, but do NOT
+		 * time RTT: a retransmitted segment's ack is ambiguous (Karn).
+		 */
+		/*
+		 * Advance HighRxt only over what actually went out: an mbuf
+		 * shortage above can force len to 0 (a header-only segment), and
+		 * jumping HighRxt past unsent bytes would stop NextSeg() ever
+		 * re-offering them.
+		 */
+		if (len > 0 && SEQ_GT(sack_seq + len, tp->snd_highrxt))
+			tp->snd_highrxt = sack_seq + len;
+		/*
+		 * Arm a timer for this hole retransmit -- but never alongside a
+		 * running PERSIST (REXMT and PERSIST must not both be armed;
+		 * tcp_setpersist() panics otherwise). A hole retransmit ignores
+		 * snd_wnd (RFC 6675 rule 1), so it can go out at a closed window;
+		 * when it does, arm PERSIST rather than REXMT -- a REXMT firing at
+		 * a zero window would abandon recovery and back off to ETIMEDOUT
+		 * (the tcp_timer catch-all converts it, but persisting straight
+		 * away avoids a wasted RTO). Window open: arm REXMT as usual.
+		 */
+		if (tp->t_timer[TCPT_REXMT] == 0 && tp->snd_nxt != tp->snd_una &&
+		    tp->t_timer[TCPT_PERSIST] == 0) {
+			if (tp->snd_wnd == 0) {
+				tp->t_rxtshift = 0;
+				tcp_setpersist(tp);
+			} else
+				tp->t_timer[TCPT_REXMT] = tp->t_rxtcur;
+		}
+	} else if (tp->t_force == 0 || tp->t_timer[TCPT_PERSIST] == 0) {
 		tcp_seq startseq = tp->snd_nxt;
 
 		/*
@@ -609,6 +879,22 @@ send:
 #endif
 	if (error) {
 out:
+		/*
+		 * A send was attempted but nothing reached the wire (an mbuf
+		 * shortage before the segment was built, or an ip_output error).
+		 * This path returns without falling through the no-send tail
+		 * above, so apply the same backstop here: if data is outstanding
+		 * and no timer is running, arm the retransmit timer -- otherwise
+		 * a recovery-entry (or any send) that fails under memory pressure
+		 * could be left with no timer and wedge. A send was attempted, so
+		 * REXMT (retry) is the right timer, not persist; and the PERSIST==0
+		 * guard leaves a genuine zero-window persist probe untouched (and
+		 * avoids any tcp_setpersist double-arm).
+		 */
+		if (so->so_snd.sb_cc && tp->t_timer[TCPT_REXMT] == 0 &&
+		    tp->t_timer[TCPT_PERSIST] == 0 &&
+		    SEQ_LT(tp->snd_una, tp->snd_max))
+			tp->t_timer[TCPT_REXMT] = tp->t_rxtcur;
 		if (error == ENOBUFS) {
 			tcp_quench(tp->t_inpcb, 0);
 			return (0);
@@ -621,6 +907,8 @@ out:
 		return (error);
 	}
 	tcpstat.tcps_sndtotal++;
+	if (tp->t_flags & TF_SACK_RECOVER)
+		tp->prr_out += len;		/* RFC 6937 PRR: octets sent this recovery */
 
 	/*
 	 * Data sent (as far as we can tell).

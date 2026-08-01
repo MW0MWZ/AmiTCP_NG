@@ -79,6 +79,7 @@ struct ipq {
 	struct	ipasfrag *ipq_next,*ipq_prev;
 					/* to ip headers of fragments */
 	struct	in_addr ipq_src,ipq_dst;
+	u_short	ipq_nfrags;		/* fragments currently queued (PORT: frag-flood cap) */
 };
 
 /*

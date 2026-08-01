@@ -493,7 +493,7 @@ vcsprintf(struct CSource *cs, const char *fmt, va_list ap)
   char *p, ch, padc;
   u_long ul;
   int n, base, lflag, tmp, width, precision, leftjustify;
-  char buf[sizeof(long) * NBBY / 3 + 2]; /* A long in base 8, plus '\0'. */
+  char buf[sizeof(long) * NBBY + 2]; /* wide enough for base 2 (binary) + sign + '\0' */
 
   if (cs->CS_Length && cs->CS_CurChr < cs->CS_Length) {
 

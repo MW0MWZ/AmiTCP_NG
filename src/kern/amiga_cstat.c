@@ -133,19 +133,6 @@ ultoa(unsigned long ul,char *buffer)
   return(len);
 }
 
-int
-ltoa(long l, char *buffer)
-{
-  int len=0;
-
-  if(l<0){
-    *buffer++='-';
-    l=-l;
-    len++;
-  }
- return (len + ultoa((unsigned long)l, buffer));
-}
-
 /*
  * Allocate big enough buffer for reply
  */
@@ -564,7 +551,7 @@ cstat_rtflags(struct CSource *res, const char *format, register int f)
   }
 }
 
-extern char *host_name;
+extern char host_name[];		/* an ARRAY (gethostnamadr.c), not a pointer */
 extern size_t host_namelen;
 extern int sethostname(const char * name, size_t namelen);
 extern struct Library *SocketBase; /* base opened by NETTRACE */

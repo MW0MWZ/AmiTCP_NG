@@ -142,14 +142,14 @@ dn_expand(const u_char *msg, const u_char *eomorig, const u_char *comp_dn,
 				return (-1);
 			checked += n + 1;
 			while (--n >= 0) {
+				if (cp >= eomorig)	/* out of range */
+					return(-1);	/* check BEFORE deref: no 1-byte over-read */
 				if ((c = *cp++) == '.') {
 					if (dn + n + 2 >= eom)
 						return (-1);
 					*dn++ = '\\';
 				}
 				*dn++ = c;
-				if (cp >= eomorig)	/* out of range */
-					return(-1);
 			}
 			break;
 

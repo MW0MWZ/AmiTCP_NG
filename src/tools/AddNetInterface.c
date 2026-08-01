@@ -61,6 +61,7 @@ struct Library *SocketBase;
 #define NGCT_WriteRequests      (TU + 0x004E4702UL)
 #define NGCT_TcpSendspace       (TU + 0x004E4703UL)
 #define NGCT_TcpRecvspace       (TU + 0x004E4704UL)
+#define NGCT_TcpMssdflt         (TU + 0x004E4705UL)
 #define SM_Up                   3
 #define RTA_DefaultGateway      (TU + 1603)
 #define CAAMTA_RouterTableSize  (TU + 2006)
@@ -173,6 +174,7 @@ struct ifcfg {
   long mtu;                  /* mtu=           (0 = use the device's reported MTU)      */
   long sendspace;            /* tcp.sendspace= (0 = use the stack's RAM-tiered default) */
   long recvspace;            /* tcp.recvspace= (0 = use the stack's RAM-tiered default) */
+  long mssdflt;              /* tcp.mssdflt=   (0 = auto: interface MTU - 40)           */
 };
 
 /* Parse a non-negative decimal from val, stopping at the first non-digit. */
@@ -225,6 +227,9 @@ static void parse_line(char *line, struct ifcfg *cfg)
    * sb_max in the stack without risking an absurd allocation. */
   else if (ci_eq(kw, "tcp.sendspace")) { cfg->sendspace = ng_atol(val); if (cfg->sendspace > 1048576) cfg->sendspace = 1048576; }
   else if (ci_eq(kw, "tcp.recvspace")) { cfg->recvspace = ng_atol(val); if (cfg->recvspace > 1048576) cfg->recvspace = 1048576; }
+  /* tcp.mssdflt= (bytes): off-subnet MSS cap; 0 = auto (interface MTU - 40). Cap at
+   * 65535 -- t_maxseg is a u_short in the stack, so a larger value would truncate. */
+  else if (ci_eq(kw, "tcp.mssdflt"))   { cfg->mssdflt = ng_atol(val); if (cfg->mssdflt > 65535) cfg->mssdflt = 65535; }
   /* unknown keywords are ignored (forward-compatible, like Roadshow) */
 }
 
@@ -235,7 +240,7 @@ static int read_cfg(const char *path, struct ifcfg *cfg)
   BPTR  fh;
 
   cfg->unit = 0; cfg->dhcp = 0; cfg->have_address = 0; cfg->nns = 0; cfg->initdelay = 0;
-  cfg->ipreq = 0; cfg->wreq = 0; cfg->mtu = 0; cfg->sendspace = 0; cfg->recvspace = 0;
+  cfg->ipreq = 0; cfg->wreq = 0; cfg->mtu = 0; cfg->sendspace = 0; cfg->recvspace = 0; cfg->mssdflt = 0;
   cfg->device[0] = cfg->address[0] = cfg->netmask[0] = cfg->gateway[0] = cfg->domain[0] = '\0';
 
   fh = Open((STRPTR)path, MODE_OLDFILE);
@@ -307,6 +312,7 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
    * static path, so they go in the shared prefix. 0 = unset -> keep the default. */
   if (cfg->sendspace > 0) { ct[nc].ti_Tag = NGCT_TcpSendspace; ct[nc].ti_Data = (ULONG)cfg->sendspace; nc++; }
   if (cfg->recvspace > 0) { ct[nc].ti_Tag = NGCT_TcpRecvspace; ct[nc].ti_Data = (ULONG)cfg->recvspace; nc++; }
+  if (cfg->mssdflt   > 0) { ct[nc].ti_Tag = NGCT_TcpMssdflt;   ct[nc].ti_Data = (ULONG)cfg->mssdflt;   nc++; }
   if (cfg->mtu       > 0) { ct[nc].ti_Tag = IFC_MTU;           ct[nc].ti_Data = (ULONG)cfg->mtu;       nc++; }
 
   if (cfg->dhcp) {
@@ -343,6 +349,10 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
         Printf((STRPTR)"%s: up, address %ld.%ld.%ld.%ld (DHCP)\n", (LONG)ifname,
                (a>>24)&0xFF, (a>>16)&0xFF, (a>>8)&0xFF, a&0xFF);
       }
+      /* An explicit domain= in the config overrides the DHCP-supplied search
+       * domain (the library already applied that during BeginInterfaceConfig).
+       * Priority: explicit domain= > DHCP > hostname-derived. */
+      if (cfg->domain[0]) v_setdomain(cfg->domain);
       r = 0;
     } else {
       if (!quiet) Printf((STRPTR)"%s: DHCP failed (result %ld)\n", (LONG)ifname, aam->aam_Result);

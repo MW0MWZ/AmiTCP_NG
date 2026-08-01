@@ -56,6 +56,16 @@ extern struct Library *SocketBase;
 #define IFQ_Address		(IFQ_BASE + 14)
 #define IFQ_NetMask		(IFQ_BASE + 17)
 #define IFQ_State		(IFQ_BASE + 19)
+#define IFQ_BadData		(IFQ_BASE + 10)	/* input errors (if_ierrors)          */
+#define IFQ_OutputDrops		(IFQ_BASE + 35)	/* output-queue-full drops (if_snd.ifq_drops) */
+#define IFQ_InputDrops		(IFQ_BASE + 36)	/* input-queue-full drops (if_iqdrops)*/
+/* AmiTCP_NG-private (match amiga_roadshow_compat.c): split the TX failure modes. */
+#define NGIFQ_OutErrors		(NG_TU + 0x004E4731)	/* if_oerrors: media/device TX errors  */
+#define NGIFQ_OutNoBuf		(NG_TU + 0x004E4732)	/* TX drops: send-tag mbuf alloc failed */
+#define NGIFQ_InNoBuf		(NG_TU + 0x004E4733)	/* RX drops: read re-post mbuf alloc fail */
+/* AmiTCP_NG-private: the stack-computed effective TCP MSS for the interface
+ * (override-aware). MUST match NGIFQ_TcpMss in src/api/amiga_roadshow_compat.c. */
+#define NGIFQ_TcpMss		(NG_TU + 0x004E4730)
 
 /* ---- vector wrappers ------------------------------------------------------- */
 static long __attribute__((unused)) ng_errno(void) {						/* Errno -162 */

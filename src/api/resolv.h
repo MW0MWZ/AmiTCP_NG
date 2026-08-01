@@ -92,7 +92,6 @@ extern int res_mkquery(struct SocketBase *,
 extern int res_querydomain(struct SocketBase *, const char *, const char *,
 			   int, int, u_char *, int);
 extern int res_send(struct SocketBase *, const char *, int, char *, int);
-extern void _res_close(struct SocketBase *);
 
 extern u_short _getshort(u_char *);
 extern u_long _getlong(u_char *);

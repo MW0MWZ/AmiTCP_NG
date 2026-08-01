@@ -153,6 +153,12 @@ struct SocketBase {
   struct MinNode *	netentCursor;
   struct MinNode *	protoentCursor;
   struct MinNode *	serventCursor;
+/* -- NDB generation each cursor above was stamped at (see reset_netdb()). A
+ * mismatch against NDB->ndb_Generation means the cursor points into a freed
+ * list and must be rewound to the current head before use. -- */
+  ULONG			netentGen;
+  ULONG			protoentGen;
+  ULONG			serventGen;
 };
 
 /* 

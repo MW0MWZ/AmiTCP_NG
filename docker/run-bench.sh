@@ -14,6 +14,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 G="$ROOT/emu/hdd/System/Workbench3.2"
 CPU="${CPU:-68000}"
 TIMEOUT="${TIMEOUT:-170}"
+# The A2065 is a Zorro II card, so the guest machine MUST have a Zorro bus -- an
+# A600/A1200 QuickStart has none and a2065.device never autoconfigures (interface
+# never comes up -> rxbench connect() gets EHOSTUNREACH). Default to an A4000; the
+# CPU var still overrides the emulated CPU speed for throughput runs.
+MODEL="${MODEL:-A4000}"
+ROM="${ROM:-/work/emu/rom/kicka4000.rom}"
 
 # CPU flags: 68000 = the plain model; anything else = unthrottled + JIT.
 CPUARGS=()
@@ -72,7 +78,7 @@ docker run --rm --name amiberry-net --network amitcp-net \
   export DISPLAY=:99 SDL_AUDIODRIVER=dummy LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe HOME=/tmp/abhome
   mkdir -p /tmp/abhome; sleep 2
   cd /opt/amiberry
-  timeout $((TIMEOUT-20)) ./build/amiberry --model A600 -r /work/emu/rom/kickCDTVa1000a500a2000a600.rom \
+  timeout $((TIMEOUT-20)) ./build/amiberry --model $MODEL -r $ROM \
      -s filesystem2=rw,DH0:System:/work/emu/hdd/System/Workbench3.2,0 \
      ${CPUARGS[*]} -s a2065=slirp -G >/dev/null 2>&1" >/dev/null 2>&1 &
 ABPID=$!

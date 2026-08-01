@@ -30,93 +30,55 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 
 ## Features
 
-- **BSD sockets** — the full `bsdsocket.library` API (TCP, UDP, raw), a drop-in
-  Roadshow ABI so existing Amiga network software works unchanged.
-- **Protocols** — TCP, UDP, ICMP (including `ping`), IP with routing, and ARP.
-- **Interfaces** — any SANA-II network device, plus software loopback (`lo0`).
+- **BSD sockets** — the full `bsdsocket.library` API (TCP, UDP, raw) with a
+  drop-in Roadshow ABI, so existing Amiga network software works unchanged.
+- **Protocols** — TCP, UDP, ICMP (`ping`), IP with routing and broadcast, and ARP.
+- **Interfaces** — any SANA-II network device plus software loopback (`lo0`,
+  always on), so `127.0.0.1` and same-host traffic work out of the box.
 - **Address configuration** — DHCP client, static, or **RFC 3927 IPv4
   link-local** (ZeroConf) auto-assignment when no DHCP server answers.
 - **Name resolution** — DNS resolver (`gethostbyname`, `getaddrinfo`, reentrant
-  `gethostby*_r`, …) with a RAM-tiered **DNS response cache**.
-- **Modern TCP** — **RFC 1323 window scaling + timestamps**; socket buffers, the
-  mbuf pool and the DNS cache size to installed RAM, and timestamps gate on the
-  CPU (68020+). Initial sequence numbers are randomised per connection
-  (**RFC 6528**, a keyed HalfSipHash of the connection tuple), hardening TCP
-  against off-path spoofing and blind connection injection.
-- **Packet capture (BPF)** — a Berkeley Packet Filter subsystem (the `bpf_*`
-  vectors): open a channel, bind it to an interface, set a filter, and read
-  captured frames — or inject your own — the raw-packet engine a `tcpdump`/`pcap`
-  port needs.
+  `gethostby*_r`, …) with a **search domain** and a RAM-tiered response cache.
+- **Modern TCP** — **SACK** loss recovery (RFC 2018/6675, with D-SACK, PRR and
+  NewReno), **RFC 1323** window scaling + timestamps, and an **RFC 6928** initial
+  window (IW10). Socket buffers, mbuf pool, SANA-II rings and DNS cache all size
+  to installed RAM and link speed; timestamps gate on the CPU (68020+).
+- **Security-hardened** — randomised initial sequence numbers (**RFC 6528**),
+  **RFC 5961** challenge-ACK rate limiting, broadcast/fragment DoS guards, and a
+  whole-codebase memory-safety review.
+- **Packet capture (BPF)** — the `bpf_*` vectors: open a channel, filter, and
+  read or inject raw frames — the engine a `tcpdump`/`pcap` port needs.
 - **Roadshow-compatible tooling** — the extension API plus the full command set
   (`Online`, `Offline`, `AddNetInterface`, `ShowNetStatus`, `ping`, …) and an
   Amiga Installer.
 
 ## Status
 
-- Builds, links, and **runs on emulated AmigaOS 3.2**, installing a working
-  self-starting `LIBS:bsdsocket.library`.
-- **Real-network validated** on an emulated Commodore A2065 NIC over SLIRP: a
-  live DNS round-trip, a full **DHCP lease** (`DISCOVER→OFFER→REQUEST→ACK`), and
-  **ICMP `ping`** (to the gateway and to loopback).
-- **Validated on real 68k hardware** (PiStorm accelerator + `wifipi.device`):
-  interface bring-up, DHCP lease, default-route install, DNS, `ping`, and
-  end-to-end connectivity over a 100 Mbit WiFi link — where the link-speed window
-  auto-tuning roughly doubled single-stream throughput.
-- **Roadshow-compatible extension API** implemented (address conversion,
-  DNS-server management, interface configuration/query/enumeration, routing,
-  network statistics + system status, RoadshowData tunables, kernel `mbuf`
-  access, the `get*ent` database iterators, `getaddrinfo`/`getnameinfo`,
-  reentrant `gethostby*`, the host-name query **`gethostname()`**, and a working
-  **DHCP client**), plus its capability flags.
-- **Zero-configuration networking (RFC 3927).** When DHCP finds no server, the
-  interface automatically self-assigns an IPv4 link-local address
-  (`169.254.x.y`) — ARP-probed for uniqueness, announced, and defended against
-  conflicts — so a cable between two Amigas, or any DHCP-less LAN, just works
-  with no manual configuration. It keeps retrying DHCP in the background and
-  upgrades to a real lease the moment a server appears — see
-  [docs/BUILDING.md](docs/BUILDING.md#zero-configuration-rfc-3927-link-local).
-- **A complete set of Roadshow-compatible command-line tools**, name-, argument-,
-  and output-compatible so Roadie, NetMon and existing scripts drive the stack
-  unchanged: `Online`, `Offline`, `AddNetInterface`, `ConfigureNetInterface`,
-  `AddNetRoute`, `DeleteNetRoute`, `RemoveNetInterface`, `NetShutdown`,
-  `GetNetStatus`, `ShowNetStatus`, and `ping`.
-- **Machine-adaptive TCP performance.** Full **RFC 1323 window scaling and
-  timestamps**, so a single connection can scale past the old 64 KB /
-  round-trip wall. The stack sizes itself to the hardware at start-up: socket
-  buffers, the SANA-II receive ring, and the mbuf pool tier to installed **RAM**
-  (and the TCP window is then sized to each NIC's **link speed**, never above that
-  RAM ceiling), and the CPU-costly timestamp option is gated on the **processor**
-  (on for 68020+, off for a bare 68000/68010). Both are negotiated per connection and
-  degrade cleanly against peers that don't offer them. Per-interface tuning knobs
-  — `iprequests`/`writerequests`, `mtu`, and `tcp.sendspace`/`tcp.recvspace` — are
-  honoured when set, and `GetNetStatus DEBUG` shows the RAM it detected, each NIC's
-  link speed, and the window it chose. More tuning still to come — see
+- Builds, links, and **runs on emulated AmigaOS 3.2** and **real 68k hardware**,
+  installing a working self-starting `LIBS:bsdsocket.library`.
+- **Emulator-validated** (A2065 over SLIRP): a DNS round-trip, a full **DHCP
+  lease** (`DISCOVER→OFFER→REQUEST→ACK`), **ICMP `ping`**, same-host **UDP
+  broadcast / loopback** discovery, and **BPF** capture + injection.
+- **Real-hardware-validated** (PiStorm + `wifipi.device`): interface bring-up,
+  DHCP lease, default-route install, DNS, `ping`, and end-to-end connectivity
+  over a 100 Mbit WiFi link — where link-speed window auto-tuning roughly doubled
+  single-stream throughput.
+- **Roadshow-compatible** — the full extension API and capability flags, plus a
+  complete command set (`Online`, `Offline`, `AddNetInterface`,
+  `ConfigureNetInterface`, `AddNetRoute`, `DeleteNetRoute`, `RemoveNetInterface`,
+  `NetShutdown`, `GetNetStatus`, `ShowNetStatus`, `ping`) — name-, argument- and
+  output-compatible, so Roadie, NetMon and existing scripts drive the stack
+  unchanged. Ships with an Amiga Installer (install / uninstall / preview).
+- **Self-tuning, with knobs** — socket buffers, SANA-II rings, the mbuf pool and
+  DNS cache size to installed RAM and link speed; per-interface (`iprequests`,
+  `writerequests`, `mtu`) and stack-wide (`tcp.sendspace`/`recvspace`,
+  `tcp.mssdflt`, `tcp.iw`) overrides are honoured, and `ShowNetStatus <iface>`
+  reports the effective MSS and a six-way in/out error/drop breakdown. See
   [docs/BUILDING.md](docs/BUILDING.md#throughput-and-memory).
-- **Randomised TCP sequence numbers (RFC 6528).** Each connection's initial
-  sequence number is a keyed HalfSipHash of its address/port 4-tuple plus a
-  per-boot secret, instead of a predictable global counter — hardening TCP
-  against off-path spoofing and blind connection injection. The keyed hash is
-  light (add/rotate/xor, no multiplies) and suited to a 68000; the secret is a
-  best-effort boot seed, as this class of machine has no hardware RNG.
-- **DNS response caching.** A small, RAM-tiered cache in front of the resolver
-  remembers successful lookups (honouring each record's TTL) and definitive
-  "host not found" results, so repeated `gethostbyname` / `getaddrinfo` calls
-  are served without a network round-trip. Sized to installed RAM (8–128
-  entries), automatic, no configuration — see
-  [docs/BUILDING.md](docs/BUILDING.md#dns-response-cache).
-- **An Amiga Installer** with install / uninstall / preview modes, automatic
-  upgrade-vs-full-install detection, and a chooseable install location.
-- **Berkeley Packet Filter (`bpf_*`) is implemented** — open a channel, bind it
-  to an interface, and capture or inject raw frames (the `tcpdump`/`pcap`
-  engine), with the `SBTC_NUM_PACKET_FILTER_CHANNELS` capability so tools can
-  discover it. Validated over an emulated A2065 NIC: live capture of ARP/IP in
-  both directions, and injection confirmed by capturing the injected frame back.
-- **CPU-tuned release builds.** A standard **68000** build that runs on every
-  68k Amiga, plus **68020**- and **68040**-optimised variants that emit
-  CPU-specific code; pick the archive matching your machine.
-- A few advanced surfaces remain deliberately deferred (IP filter `ipf_*`,
-  monitor hooks, server API) — see
-  [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md).
+- **CPU-tuned release builds** — a portable **68000** build plus **68020** and
+  **68040** variants; pick the archive matching your machine.
+- A few advanced surfaces stay deferred (IP filter `ipf_*`, monitor hooks,
+  server API) — see [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md).
 
 ## Installing
 
@@ -259,6 +221,12 @@ To override, set `tcp.sendspace=`/`tcp.recvspace=` in a `DEVS:NetInterfaces` int
 config (this is stack-wide — the last interface configured wins) or
 `TCP_SENDSPACE=`/`TCP_RECVSPACE=` in `AmiTCP.config`. Run **`GetNetStatus DEBUG`** to see
 the RAM the stack detected and the window it chose.
+
+Two more stack-wide TCP tunables use the same mechanism (`tcp.<name>=` in an interface
+config, or the upper-case `<NAME>=` in `AmiTCP.config`): **`tcp.mssdflt`** /
+`TCP_MSSDFLT` — the off-subnet MSS cap in bytes (`0` = auto: interface MTU − 40); and
+**`tcp.iw`** / `TCP_INITIALWINDOW` — the initial congestion window in segments (`10` =
+RFC 6928 default, `4` = RFC 3390, `1` = legacy single-segment slow-start).
 
 ## Build & test
 

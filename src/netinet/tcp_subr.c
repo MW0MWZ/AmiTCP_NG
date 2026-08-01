@@ -121,10 +121,13 @@ RCS_ID_C="$Id: tcp_subr.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
 
 /* patchable/settable parameters for tcp */
 int	tcp_ttl = TCP_TTL;
-int 	tcp_mssdflt = TCP_MSS;
-int 	tcp_rttdflt = TCPTV_SRTTDFLT / PR_SLOWHZ;
+int 	tcp_mssdflt = 0;	/* 0 = auto (egress MTU - 40); >0 = explicit off-subnet MSS cap */
+int	tcp_iw = 10;		/* RFC 6928 initial congestion window in segments (IW10, matches
+				 * modern peers). 1 = legacy 4.4BSD single-segment slow-start.
+				 * Effective cwnd = min(tcp_iw*MSS, max(2*MSS, 14600)); see tcp_mss(). */
 int	tcp_do_rfc1323 = 1;	/* offer RFC 1323 window scaling in our SYNs (0 disables) */
 int	tcp_do_rfc1323_tstmp = 0;	/* offer RFC 1323 timestamps; CPU-gated at init (ng_cpu_tune) */
+int	tcp_do_sack = 1;	/* offer RFC 2018 SACK-permitted in our SYNs (0 disables) */
 
 extern	struct inpcb *tcp_last_inpcb;
 
@@ -299,26 +302,44 @@ tcp_newtcpcb(inp)
 		return ((struct tcpcb *)0);
 	bzero((caddr_t)tp, sizeof(*tp));
 	tp->seg_next = tp->seg_prev = (struct tcpiphdr *)tp;
-	tp->t_maxseg = tcp_mssdflt;
+	/* Pre-handshake guess (tcp_mss() replaces it once the peer's MSS is known).
+	 * tcp_mssdflt 0 = auto -> use the concrete TCP_MSS fallback here (no MTU yet);
+	 * clamp >65535 to TCP_MSS too, since t_maxseg is a u_short and would truncate
+	 * (a 65536 cap would become 0 -> zero-size segments). */
+	tp->t_maxseg = (tcp_mssdflt > 0 && tcp_mssdflt <= 65535) ? tcp_mssdflt : TCP_MSS;
 
 	tp->t_flags = 0;		/* sends options! */
 	if (tcp_do_rfc1323)
 		tp->t_flags |= TF_REQ_SCALE;	/* offer window scaling in our SYN */
 	if (tcp_do_rfc1323_tstmp)
 		tp->t_flags |= TF_REQ_TSTMP;	/* offer timestamps in our SYN (CPU-gated) */
+	if (tcp_do_sack)
+		tp->t_flags |= TF_REQ_SACK;	/* offer SACK-permitted in our SYN (RFC 2018) */
 	tp->t_inpcb = inp;
 	/*
 	 * Init srtt to TCPTV_SRTTBASE (0), so we can tell that we have no
-	 * rtt estimate.  Set rttvar so that srtt + 2 * rttvar gives
-	 * reasonable initial retransmit time.
+	 * rtt estimate yet. RFC 6298 sec.2.1: until the first RTT measurement,
+	 * the initial RTO is 1 second (TCPTV_RTOBASE) -- the stock 4.4BSD 6s
+	 * (and its 12s rttvar-derived backoff base) is far too slow to recover
+	 * a lost SYN or first segment on a lossy link. Seed t_rttvar so that
+	 * TCP_REXMTVAL == srtt(0) + t_rttvar == TCPTV_MIN (1s) too, so the
+	 * retransmit backoff doubles cleanly from 1s (RFC 6298 sec.5.5) rather
+	 * than jumping. On the first measurement tcp_xmit_timer overwrites both
+	 * (srtt==0 gate), setting rttvar = R/2 per RFC 6298 sec.2.2.
 	 */
 	tp->t_srtt = TCPTV_SRTTBASE;
-	tp->t_rttvar = tcp_rttdflt * PR_SLOWHZ << 2;
+	tp->t_rttvar = TCPTV_MIN;
 	tp->t_rttmin = TCPTV_MIN;
-	TCPT_RANGESET(tp->t_rxtcur, 
-	    ((TCPTV_SRTTBASE >> 2) + (TCPTV_SRTTDFLT << 2)) >> 1,
-	    TCPTV_MIN, TCPTV_REXMTMAX);
-	tp->snd_cwnd = TCP_MAXWIN;
+	TCPT_RANGESET(tp->t_rxtcur, TCPTV_RTOBASE, TCPTV_MIN, TCPTV_REXMTMAX);
+	/* Conservative one-segment initial window as a placeholder: tcp_mss()
+	 * raises snd_cwnd to the real initial window once the peer's MSS is known
+	 * (on every normal handshake). Seeding it off t_maxseg rather than the old
+	 * TCP_MAXWIN matters only if that reseed is ever skipped -- today it never
+	 * is (the reseed's TF_NOOPT gate is dead, TF_NOOPT is never set), but a
+	 * full-cwnd placeholder reaching first-send would be a burst; t_maxseg is
+	 * always safe. snd_ssthresh = TCP_MAXWIN stays: "uncongested until proven
+	 * otherwise" is the correct BSD default. */
+	tp->snd_cwnd = tp->t_maxseg;
 	tp->snd_ssthresh = TCP_MAXWIN;
 	inp->inp_ip.ip_ttl = tcp_ttl;
 	inp->inp_ppcb = (caddr_t)tp;

@@ -52,9 +52,6 @@ void sbcheck(register struct sockbuf * sb);
 void sbappendrecord(register struct sockbuf * sb,
                    register struct mbuf * m0);
 
-void sbinsertoob(register struct sockbuf * sb,
-                register struct mbuf * m0);
-
 int sbappendaddr(register struct sockbuf * sb,
                  struct sockaddr * asa,
                  struct mbuf * m0,

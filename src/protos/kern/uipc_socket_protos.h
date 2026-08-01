@@ -44,7 +44,7 @@ int soreceive(register struct socket * so,
 int soshutdown(register struct socket * so,
                register int how);
 
-void sorflush(register struct socket * so);
+int sorflush(register struct socket * so);
 
 int sosetopt(register struct socket * so,
              int level,

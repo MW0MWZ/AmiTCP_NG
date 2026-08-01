@@ -165,24 +165,6 @@ rn_search(v, head)
 	return x;
 }
 
-struct radix_node *
-rn_search_m(v, head, m)
-	struct radix_node *head;
-	register caddr_t v, m;
-{
-	register struct radix_node *x;
-
-	for (x = head; x->rn_b >= 0;) {
-		if ((x->rn_bmask & m[x->rn_off]) &&
-		    (x->rn_bmask & v[x->rn_off]))
-			x = x->rn_r;
-		else
-			x = x->rn_l;
-	}
-	return x;
-}
-
-
 static int gotOddMasks = 0;
 static char maskedKey[MAXKEYLEN] = {0};
 
@@ -196,6 +178,17 @@ rn_match(v, head)
 	caddr_t cplim, mstart;
 	struct radix_node *saved_t;
 	int off = t->rn_off, vlen = *(u_char *)cp, matched_off;
+
+	/*
+	 * PORT (AmiTCP_NG) note: if vlen (v's self-declared length byte) is
+	 * shorter than off, the exact-match loop below is skipped and this can
+	 * return a false host match. Not memory-unsafe as written (the loop is
+	 * bounded by cp<cplim) -- unlike rn_delete, which has a real vlen<head_off
+	 * OOB and is guarded. Not reachable today: every live caller builds keys
+	 * with a fixed, correct length (sin_len=16 > off=4). A proper fix would
+	 * also have to address the bit-descent loop's uniform-key-length
+	 * assumption; revisit if route_output/route_usrreq are reactivated.
+	 */
 
 	/*
 	 * Open code rn_search(v, head) to avoid overhead of extra
@@ -249,9 +242,9 @@ on1:
 		if ((m = t->rn_mklist)) {
 			/*
 			 * After doing measurements here, it may
-			 * turn out to be faster to open code
-			 * rn_search_m here instead of always
-			 * copying and masking.
+			 * turn out to be faster to open code the
+			 * masked radix search inline here instead
+			 * of always copying and masking.
 			 */
 			off = min(t->rn_off, matched_off);
 			mstart = maskedKey + off;
@@ -306,6 +299,14 @@ rn_insert(v, head, dupentry, nodes)
 	struct radix_node nodes[2];
 {
 	int head_off = head->rn_off, vlen = (int)*((u_char *)v);
+	/*
+	 * PORT (AmiTCP_NG) note: a vlen < head_off key skips the compare loop
+	 * below and yields a false *dupentry. Logic-only, not memory-unsafe, and
+	 * not reachable today (live keys are fixed 16-byte sockaddrs). Left as-is
+	 * deliberately: rn_insert must never return NULL and its *dupentry
+	 * contract is relied on by every caller, so a safe early-out here is a
+	 * bigger change than this dormant path warrants. See rn_match's note.
+	 */
 	register struct radix_node *t = rn_search(v, head);
 	register caddr_t cp = v + head_off;
 	register int b;
@@ -565,9 +566,9 @@ rn_delete(v, netmask, head)
 	struct radix_mask *m, *saved_m, **mp;
 	struct radix_node *dupedkey, *saved_tt = tt;
 
-	if (tt == 0 ||
+	if (tt == 0 || vlen < head_off ||
 	    Bcmp(v + head_off, tt->rn_key + head_off, vlen - head_off))
-		return (0);
+		return (0);	/* vlen<head_off would underflow the Bcmp length -> OOB */
 	/*
 	 * Delete our route from mask lists.
 	 */

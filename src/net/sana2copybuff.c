@@ -305,6 +305,17 @@ static SAVEDS BOOL RAF3(m_copy_to_mbuf,
 
   to->ioip_if->ss_copyin++;		/* SANA2CopyStats: byte CopyToBuff (RX) */
 
+  /*
+   * Reject a NULL preallocated chain or a zero-length frame up front. Without
+   * this, a NULL m (no reserved chain) would be dereferenced by the DIAGNOSTIC
+   * check just below and by the post-loop `f = m->m_next` -- a wild read/write
+   * near address 0 on this no-MMU 68k; and a zero-length frame (n == 0) skips the
+   * copy loop entirely and would then be promoted upstream as a bogus 0-length
+   * packet. Runs at device-interrupt time, so keep it branch-cheap.
+   */
+  if (m == NULL || n == 0)
+    return FALSE;
+
 #if DIAGNOSTIC
   if (!(m->m_flags & M_PKTHDR)) {
     log(LOG_ERR, "m_copy_to_buff: mbuf chain has no header");

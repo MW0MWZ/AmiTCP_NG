@@ -656,6 +656,13 @@ sbappend(sb, m)
 	 * (all removals are front-removals) -- so sb_mb == 0 is the reliable "empty"
 	 * test, and a stale sb_mbtail is never read while sb_mb != 0. sbcompress()
 	 * updates sb_mbtail to the new last mbuf.
+	 *
+	 * INVARIANT (enforced only by sbcheck() under SOCKBUF_DEBUG, see below): the
+	 * receive buffer is FRONT-removed only. If a future change ever removes from
+	 * the middle or tail of a receive buffer -- e.g. an sbdrop() on so_rcv, which
+	 * today is called only on so_snd -- it MUST update sb_mbtail, or the next
+	 * sbappend() will link onto a freed mbuf (silent heap corruption on this
+	 * no-MMU target). Keep receive removals front-only, or maintain the tail.
 	 */
 	n = sb->sb_mb ? sb->sb_mbtail : (struct mbuf *)0;
 #ifdef USE_M_EOR
@@ -734,64 +741,6 @@ sbappendrecord(sb, m0)
 	}
 #endif
 	sbcompress(sb, m, m0);
-}
-
-/*
- * As above except that OOB data
- * is inserted at the beginning of the sockbuf,
- * but after any other OOB data.
- */
-void
-sbinsertoob(sb, m0)
-	register struct sockbuf *sb;
-	register struct mbuf *m0;
-{
-	register struct mbuf *m;
-	register struct mbuf **mp;
-
-	if (m0 == 0)
-		return;
-	for (mp = &sb->sb_mb; (m = *mp); mp = &((*mp)->m_nextpkt)) {
-	    again:
-		switch (m->m_type) {
-
-		case MT_OOBDATA:
-			continue;		/* WANT next train */
-
-		case MT_CONTROL:
-			if ((m = m->m_next))
-				goto again;	/* inspect THIS train further */
-		}
-		break;
-	}
-	/*
-	 * Put the first mbuf on the queue.
-	 * Note this permits zero length records.
-	 */
-	sballoc(sb, m0);
-	m0->m_nextpkt = *mp;
-	*mp = m0;
-	m = m0->m_next;
-	m0->m_next = 0;
-#ifdef USE_M_EOR
-	if (m && (m0->m_flags & M_EOR)) {
-		m0->m_flags &= ~M_EOR;
-		m->m_flags |= M_EOR;
-	}
-#endif
-	/*
-	 * OOB is inserted at *mp, which may be in the MIDDLE of the buffer (before the
-	 * normal-data record). sbcompress() will set sb_mbtail to this OOB record's last
-	 * mbuf -- correct only if the OOB record ended up last. If records follow it
-	 * (m0->m_nextpkt != 0) the real tail is unchanged, so restore it. When the buffer
-	 * was empty, m0->m_nextpkt == 0 and we keep sbcompress's value.
-	 */
-	{
-		register struct mbuf *savetail = sb->sb_mbtail;
-		sbcompress(sb, m, m0);
-		if (m0->m_nextpkt)
-			sb->sb_mbtail = savetail;
-	}
 }
 
 /*
@@ -943,10 +892,11 @@ sbcompress(sb, m, n)
 	}
 #endif
 	/*
-	 * n is now the last mbuf linked into this record. Every append path either
-	 * compresses into the LAST record (sbappend/sbappendrecord) -- so n is the
-	 * buffer tail -- or is the middle-insert sbinsertoob(), which restores
-	 * sb_mbtail itself. Record the tail here for O(1) sbappend.
+	 * n is now the last mbuf linked into this record. Both callers of
+	 * sbcompress (sbappend, sbappendrecord) compress into the LAST record,
+	 * so n is the buffer tail. Record it here for O(1) sbappend.
+	 * (sbappendaddr/sbappendcontrol set sb_mbtail themselves and never
+	 * reach here.)
 	 */
 	sb->sb_mbtail = n;
 }

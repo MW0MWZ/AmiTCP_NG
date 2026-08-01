@@ -167,9 +167,6 @@ unsigned long vsprintf(char * buf, const char * fmt, va_list);
 unsigned long vcsprintf(struct CSource* buf, const char * fmt, va_list);
 char * csprintn(u_long n, int base, char *buf, int buflen);
 int  ultoa(unsigned long ul, char *buffer);
-int  ltoa(long l, char *buffer);
-
-#define itoa(i,buffer) ltoa((long)i,buffer)
 
 #ifndef AMIGA_SUBR_H
 #include <kern/amiga_subr.h>

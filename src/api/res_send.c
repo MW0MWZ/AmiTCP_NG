@@ -74,9 +74,14 @@ static char sccsid[] = "@(#)res_send.c	6.27 (Berkeley) 2/24/91";
 #include <kern/amiga_subr.h>     
 #include <kern/amiga_netdb.h>     
 
-#ifndef AMITCP /* AmiTCP has this in the SocketBase */     
-static int res_sock = -1;	/* socket used for communications */
-#endif
+/*
+ * res_sock is the PER-TASK resolver socket: resolv.h maps `res_sock` to
+ * libPtr->res_socket (a SocketBase field, initialised to -1 per task in
+ * amiga_api.c), so concurrent resolves in different tasks each use their own
+ * socket -- there is no shared socket to race. (A dead `#ifndef AMITCP` file-
+ * static used to sit here; it never compiled in this AMITCP build but made the
+ * socket look shared, so it was removed.)
+ */
 
 /* constant */
 static const struct sockaddr no_addr = { sizeof(struct sockaddr), AF_INET, {0} };
@@ -105,12 +110,12 @@ res_send(struct SocketBase *	libPtr,
 	char *cp;
 	fd_set dsmask;
 	struct timeval timeout;
-	struct NameserventNode *ns;
+	int nsi;			/* index of the nameserver being queried */
 	struct sockaddr_in host;
 	HEADER *hp = (HEADER *) buf;
 	HEADER *anhp = (HEADER *) answer;
 	u_char terrno = ETIMEDOUT;
-#define JUNK_SIZE 512
+#define JUNK_SIZE 128	/* read-and-discard drain chunk; small to keep the caller-stack frame down */
 	char junk[JUNK_SIZE]; /* buffer for trash data */
 
 #ifdef RES_DEBUG
@@ -120,23 +125,51 @@ res_send(struct SocketBase *	libPtr,
 
 	v_circuit = (_res.options & RES_USEVC) || buflen > PACKETSZ;
 	id = hp->id;
+
+	/* Defensive: the name database is created at stack init and never cleared,
+	 * so NDB is non-NULL for the whole life of the API here. Guard anyway (as
+	 * ng_flush_dynamic_nameservers does) so a future teardown that frees NDB
+	 * could never fault the LOCK_R_NDB(NDB) / ndb_NameServers walk below. */
+	if (NDB == NULL) {
+		writeErrnoValue(libPtr, ECONNREFUSED);
+		return (-1);
+	}
+
 	/*
 	 * Send request, RETRY times, or until successful
 	 */
 	for (try = 0; try < _res.retry; try++) {
 	  nscount = 0;
-	  for (ns = (struct NameserventNode *)NDB->ndb_NameServers.mlh_Head;
-	       ns->nsn_Node.mln_Succ;
-	       ns = (struct NameserventNode *)ns->nsn_Node.mln_Succ) {
+	  for (nsi = 0; ; nsi++) {
+	    struct NameserventNode *nn;
+	    int k;
+	    /*
+	     * Fetch the nsi-th nameserver's address under LOCK_R_NDB, re-walking from
+	     * the list head each pass, so no ndb_NameServers node is ever dereferenced
+	     * across the blocking socket I/O below. RemoveDomainNameServer() and
+	     * ng_flush_dynamic_nameservers() (DHCP offline/teardown) take the write lock
+	     * and Remove()+free() these nodes -- holding a node pointer across a send/recv
+	     * would be a use-after-free. Only the copied host.sin_addr crosses the unlock;
+	     * a `goto usevc` retry reuses it (nsi unchanged), so it needs no re-fetch.
+	     */
+	    LOCK_R_NDB(NDB);
+	    nn = (struct NameserventNode *)NDB->ndb_NameServers.mlh_Head;
+	    for (k = 0; k < nsi && nn->nsn_Node.mln_Succ; k++)
+	      nn = (struct NameserventNode *)nn->nsn_Node.mln_Succ;
+	    if (nn->nsn_Node.mln_Succ == NULL) {
+	      UNLOCK_NDB(NDB);
+	      break;			/* reached the end of the nameserver list */
+	    }
+	    host.sin_addr = nn->nsn_Ent.ns_addr;
+	    UNLOCK_NDB(NDB);
 	    nscount++;
 #ifdef RES_DEBUG
 			printf("Querying server #%d address = %s\n", nscount,
-			      inet_ntoa(ns->nsn_Ent.ns_addr));
+			      inet_ntoa(host.sin_addr));
 #endif /* RES_DEBUG */
 	    host.sin_len = sizeof(host);
 	    host.sin_family = AF_INET;
 	    host.sin_port = NAMESERVER_PORT;
-	    host.sin_addr = ns->nsn_Ent.ns_addr;
 	    aligned_bzero_const(&host.sin_zero, sizeof(host.sin_zero));
 	usevc:
 		if (v_circuit) {
@@ -213,7 +246,9 @@ res_send(struct SocketBase *	libPtr,
 				 */
 				if (terrno == ECONNRESET && !connreset) {
 					connreset = 1;
-					ns--;
+					goto usevc;	/* retry the SAME server once; host.sin_addr
+							 * still holds it and nsi is unchanged, so
+							 * this reuses the address, no re-fetch. */
 				}
 				continue;
 			}
@@ -438,7 +473,7 @@ wait:
 		 * close the socket.
 		 */
 		if ((v_circuit &&
-		    ((_res.options & RES_USEVC) == 0 || ns != 0)) ||
+		    ((_res.options & RES_USEVC) == 0 || 1 /* was ns!=0, always true */)) ||
 		    (_res.options & RES_STAYOPEN) == 0) {
 			(void) CloseSocket(libPtr, res_sock);
 			res_sock = -1;
@@ -460,18 +495,3 @@ wait:
 	return (-1);
 }
 
-/*
- * This routine is for closing the socket if a virtual circuit is used and
- * the program wants to close it.  This provides support for endhostent()
- * which expects to close the socket.
- *
- * This routine is not expected to be user visible.
- */
-void
-_res_close(struct SocketBase * libPtr)
-{
-	if (res_sock != -1) {
-		(void) CloseSocket(libPtr, res_sock);
-		res_sock = -1;
-	}
-}

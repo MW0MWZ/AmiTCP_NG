@@ -69,7 +69,7 @@ RCS_ID_C="$Id: amiga_time.c,v 1.15 1993/06/04 11:16:15 jraja Exp $";
  * amiga_time.c --- the stack's clock: protocol timers on timer.device.
  *
  * A BSD kernel drives its network timers from periodic clock interrupts: two
- * software timers, a FAST one every 200 ms (pr_fasttimo -- e.g. TCP delayed ACKs)
+ * software timers, a FAST one every 40 ms (pr_fasttimo -- e.g. TCP delayed ACKs)
  * and a SLOW one every 500 ms (pr_slowtimo -- TCP retransmit/keepalive/2MSL, IP
  * fragment-reassembly expiry, ARP entry expiry, interface watchdogs). AmiTCP_NG
  * has no clock interrupt to hook, so it synthesises those ticks from Exec's

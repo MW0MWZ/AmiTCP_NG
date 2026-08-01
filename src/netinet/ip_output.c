@@ -142,6 +142,94 @@ RCS_ID_C="$Id: ip_output.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 struct mbuf *ip_insertoptions();
 
 /*
+ * Emit a limited broadcast (ip_dst == 255.255.255.255).
+ *
+ * A limited broadcast is same-segment, link-layer only -- it is NEVER routed.
+ * So it must not go anywhere near the routing table: we flood it out of every
+ * UP, broadcast-capable interface directly. This makes it independent of a
+ * default route (a limited broadcast matches no connected route, so the old
+ * routed path returned EHOSTUNREACH whenever no default route existed -- the
+ * cause of "discovery works only sometimes") and independent of which address
+ * happens to head in_ifaddr (our self-start addresses lo0 first).
+ *
+ * Every interface's own output routine makes the IFF_SIMPLEX software-loopback
+ * copy, so local sockets bound to the destination port still receive it. The
+ * whole packet is identical on every interface, so it is finalised (source,
+ * checksum) once and m_copy()'d per interface. Consumes m.
+ */
+static int
+ip_broadcast_flood(m, flags, hlen)
+	register struct mbuf *m;
+	int flags, hlen;
+{
+	register struct ip *ip = mtod(m, struct ip *);
+	register struct in_ifaddr *ia, *primary = (struct in_ifaddr *)0;
+	struct sockaddr_in bdst;
+	int error = 0, nsent = 0;
+
+	if ((flags & IP_ALLOWBROADCAST) == 0) {
+		m_freem(m);
+		return (EACCES);
+	}
+	/* Source + primary egress: first UP broadcast-capable interface (skip lo0). */
+	for (ia = in_ifaddr; ia; ia = ia->ia_next)
+		if ((ia->ia_ifp->if_flags & IFF_BROADCAST) &&
+		    (ia->ia_ifp->if_flags & IFF_UP)) {
+			primary = ia;
+			break;
+		}
+	if (primary == (struct in_ifaddr *)0) {
+		m_freem(m);
+		return (ENETUNREACH);
+	}
+	/*
+	 * A broadcast is never fragmented; if it will not fit the egress MTU,
+	 * fail synchronously (EMSGSIZE) as the routed path did, rather than
+	 * silently dropping it at the driver. ip_len is still host order here.
+	 */
+	if ((u_short)ip->ip_len > (u_short)primary->ia_ifp->if_mtu) {
+		m_freem(m);
+		return (EMSGSIZE);
+	}
+	if (ip->ip_src.s_addr == INADDR_ANY)
+		ip->ip_src = IA_SIN(primary)->sin_addr;
+	m->m_flags |= M_BCAST;
+	/* Finalise the header once; every interface copy is identical. */
+	ip->ip_len = htons((u_short)ip->ip_len);
+	ip->ip_off = htons((u_short)ip->ip_off);
+	ip->ip_sum = 0;
+	ip->ip_sum = in_cksum(m, hlen);
+
+	aligned_bzero_const((caddr_t)&bdst, sizeof bdst);
+	bdst.sin_family = AF_INET;
+	bdst.sin_len = sizeof bdst;
+	bdst.sin_addr.s_addr = INADDR_BROADCAST;
+
+	for (ia = in_ifaddr; ia; ia = ia->ia_next) {
+		register struct ifnet *ifp = ia->ia_ifp;
+		struct mbuf *mc;
+		int e;
+
+		if ((ifp->if_flags & IFF_BROADCAST) == 0 ||
+		    (ifp->if_flags & IFF_UP) == 0)
+			continue;
+		if ((mc = m_copy(m, 0, (int)M_COPYALL)) == (struct mbuf *)0) {
+			error = ENOBUFS;
+			continue;
+		}
+		e = (*ifp->if_output)(ifp, mc, (struct sockaddr *)&bdst,
+		    (struct rtentry *)0);
+		if (e)
+			error = e;
+		nsent++;
+	}
+	m_freem(m);			/* free the finalised template */
+	if (nsent == 0 && error == 0)
+		error = ENETUNREACH;
+	return (error);
+}
+
+/*
  * IP output.  The packet in mbuf chain m contains a skeletal IP
  * header (with len, off, ttl, proto, tos, src, dst).
  * The mbuf chain containing the packet will be freed.
@@ -184,6 +272,15 @@ ip_output(m0, opt, ro, flags)
 		hlen = ip->ip_hl << 2;
 		ipstat.ips_localout++;
 	}
+	/*
+	 * Limited broadcast (255.255.255.255) is same-segment / link-layer only and
+	 * is NEVER routed -- flood it out every broadcast-capable interface directly,
+	 * with no routing-table lookup (so it needs no default route and does not
+	 * depend on interface / in_ifaddr ordering). Not for forwarded packets.
+	 */
+	if ((flags & IP_FORWARDING) == 0 &&
+	    ip->ip_dst.s_addr == (u_long)INADDR_BROADCAST)
+		return (ip_broadcast_flood(m, flags, hlen));
 	/*
 	 * Route packet.
 	 */
@@ -340,6 +437,7 @@ ip_output(m0, opt, ro, flags)
 		mhip->ip_len = htons((u_short)(len + mhlen));
 		m->m_next = m_copy(m0, off, len);
 		if (m->m_next == 0) {
+			m_free(m);		/* not yet linked into the m0 chain -- else it leaks */
 			error = ENOBUFS;	/* ??? */
 			goto sendorfree;
 		}
@@ -401,14 +499,18 @@ ip_insertoptions(m, opt, phlen)
 	unsigned optlen;
 
 	optlen = opt->m_len - sizeof(p->ipopt_dst);
-	if (optlen + (u_short)ip->ip_len > IP_MAXPACKET)
+	if (optlen + (u_short)ip->ip_len > IP_MAXPACKET) {
+		*phlen = sizeof(struct ip);	/* m unchanged -> real header is the base */
 		return (m);		/* XXX should fail */
+	}
 	if (p->ipopt_dst.s_addr)
 		ip->ip_dst = p->ipopt_dst;
 	if (m->m_flags & M_EXT || m->m_data - optlen < m->m_pktdat) {
 		MGETHDR(n, M_DONTWAIT, MT_HEADER);
-		if (n == 0)
+		if (n == 0) {
+			*phlen = sizeof(struct ip);	/* m unchanged -> base header */
 			return (m);
+		}
 		n->m_pkthdr.len = m->m_pkthdr.len + optlen;
 		m->m_len -= sizeof(struct ip);
 		m->m_data += sizeof(struct ip);

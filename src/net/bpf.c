@@ -694,6 +694,11 @@ bpf_setf(d, fp)
 	}
 
 	s = splimp();
+	if (!d->bd_inuse) {		/* channel closed while the filter was built */
+		splx(s);
+		FREE(fcode, M_TEMP);
+		return (EINVAL);
+	}
 	old = d->bd_filter;
 	oldlen = d->bd_filterlen;
 	d->bd_filter = fcode;
@@ -723,6 +728,10 @@ bpf_setif(d, ifr)
 		return (ENXIO);
 
 	s = splimp();
+	if (d->bd_sbuf == NULL) {	/* buffers not allocated (a failed BIOCSBLEN) */
+		splx(s);
+		return (ENXIO);
+	}
 	bpf_attachd(d, ifp);
 	bpf_reset(d);
 	splx(s);
@@ -1010,6 +1019,16 @@ bpf_catchpacket(d, m, pktlen, snaplen)
 	 * afresh in the free buffer. With no free buffer the reader is behind,
 	 * so drop the packet.
 	 */
+	/*
+	 * A failed BIOCSBLEN can leave the channel attached with no store
+	 * buffer (bpf_allocbufs frees and NULLs bd_sbuf on failure but leaves
+	 * bd_inuse set). Writing through a NULL bd_sbuf below would be a wild
+	 * store (no MMU), so drop and count instead.
+	 */
+	if (d->bd_sbuf == NULL) {
+		d->bd_dcount++;
+		return;
+	}
 	curlen = BPF_WORDALIGN(d->bd_slen);
 	if (curlen + totlen > d->bd_bufsize) {
 		if (d->bd_fbuf == NULL) {

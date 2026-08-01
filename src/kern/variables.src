@@ -270,7 +270,7 @@ USENS=USENAMESERVER ;	1 ;	How to use name server. Possible values are:\n@table @
 extern LONG usens;
 { VAR_ENUM, VF_RW, NULL, &usens, (notify_f)"NO,FIRST,SECOND" }
 #
-ULO=USELOOPBACK ;	1 ;	If true use the local loop device for local traffic.
+ULO=USELOOPBACK ;	1 ;	DEPRECATED and ignored -- local traffic always uses loopback.
 extern LONG useloopback;
 { VAR_ENUM, VF_RW, NULL, &useloopback, boolean_enum }
 #
@@ -281,6 +281,14 @@ extern ULONG tcp_sendspace;
 TCPRCV=TCP_RECVSPACE ;	1 ;	Default size of the receiving socket buffer (TCP).
 extern ULONG tcp_recvspace;
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_recvspace, NULL }
+#
+TCPMSS=TCP_MSSDFLT ;	1 ;	Off-subnet TCP MSS cap in bytes (0 = auto: interface MTU - 40).
+extern int tcp_mssdflt;
+{ VAR_LONG, VF_RW, NULL, (LONG*)&tcp_mssdflt, NULL }
+#
+TCPIW=TCP_INITIALWINDOW ;	1 ;	Initial TCP congestion window in segments (RFC 6928 default 10; 1 = legacy).
+extern int tcp_iw;
+{ VAR_LONG, VF_RW, NULL, (LONG*)&tcp_iw, NULL }
 #
 CON=CONSOLENAME ;	1 ;	Filename for the log console.
 extern STRPTR consolename ;	 int logname_changed(void *pt, LONG new);

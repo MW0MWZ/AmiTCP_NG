@@ -61,6 +61,14 @@
 /*
  * Tcp control block, one per tcp; fields:
  */
+/* RFC 2018 selective-ACK block: a contiguous run of received data [start,end). */
+struct sackblk {
+	tcp_seq	start;
+	tcp_seq	end;
+};
+#define	TCP_MAX_SACK	4		/* max SACK blocks we track / can report (receiver) */
+#define	TCP_MAX_SACK_SND 16		/* max SACKed islands we track on the send side (RFC 6675) */
+
 struct tcpcb {
 	struct	tcpiphdr *seg_next;	/* sequencing queue */
 	struct	tcpiphdr *seg_prev;
@@ -82,6 +90,11 @@ struct tcpcb {
 #define	TF_RCVD_SCALE	0x0040		/* other side has requested scaling */
 #define	TF_REQ_TSTMP	0x0080		/* have/will request timestamps */
 #define	TF_RCVD_TSTMP	0x0100		/* a timestamp was received in the SYN */
+#define	TF_REQ_SACK	0x0200		/* will offer SACK-permitted (RFC 2018) */
+#define	TF_SACK_PERMIT	0x0400		/* SACK negotiated -- both SYNs carried it */
+#define	TF_SACK_RECOVER	0x0800		/* in RFC 6675 SACK-based loss recovery */
+#define	TF_SACK_RESCUE	0x1000		/* rule (3) rescue retransmit sent this episode */
+#define	TF_DSACK	0x2000		/* a D-SACK block (RFC 2883) is pending to emit */
 	struct	tcpiphdr *t_template;	/* skeletal packet for transmit */
 	struct	inpcb *t_inpcb;		/* back pointer to internet pcb */
 /*
@@ -147,6 +160,42 @@ struct tcpcb {
 	u_long	ts_recent;		/* timestamp echo data */
 	u_long	ts_recent_age;		/* when ts_recent was last updated */
 	tcp_seq	last_ack_sent;		/* for RFC 1323 PAWS ts_recent update */
+/*
+ * RFC 2018 SACK receiver scoreboard: the out-of-order data blocks we currently
+ * hold above rcv_nxt, kept most-recent-first (RFC 2018 sec.4) and reported in the
+ * SACK option of our ACKs. Maintained by tcp_sack_addblock()/tcp_sack_purge()
+ * (net/tcp_sack.c) alongside the reassembly queue. Zero until data is queued
+ * out of order; tcp_newtcpcb() bzero's the whole tcpcb so SACK is off by default.
+ */
+	int	rcv_numsacks;		/* number of valid entries in sackblks[] */
+	struct	sackblk sackblks[TCP_MAX_SACK];
+	struct	sackblk rcv_dsackblk;	/* RFC 2883 D-SACK: range of a just-received
+					 * duplicate segment, emitted as the first SACK
+					 * block on the next ACK when TF_DSACK is set */
+/*
+ * RFC 6675 SACK SENDER scoreboard: the ranges of our own sent-but-unacked data
+ * [snd_una, snd_max) that the peer has reported SACKed, kept SORTED ascending and
+ * merged (snd_sackblks[0..snd_numsackblks-1]). The un-SACKed gaps between them are
+ * the holes we retransmit. snd_recover is the recovery point (snd_max captured when
+ * SACK recovery began; recovery ends when snd_una reaches it); snd_highrxt is
+ * RFC 6675 HighRxt, the highest sequence we have retransmitted this recovery, so
+ * NextSeg() does not resend a hole it already covered. Maintained by
+ * tcp_sack_update() (net/tcp_sack.c). Zero/empty until a SACK arrives; bzero'd in
+ * tcp_newtcpcb, so it is dormant on a non-SACK connection.
+ */
+	int	snd_numsackblks;	/* number of valid entries in snd_sackblks[] */
+	struct	sackblk snd_sackblks[TCP_MAX_SACK_SND];
+	tcp_seq	snd_recover;		/* SACK/NewReno recovery point (snd_max at entry) */
+	tcp_seq	snd_highrxt;		/* RFC 6675 HighRxt: highest seq retransmitted */
+/*
+ * RFC 6937 Proportional Rate Reduction bookkeeping, valid only while
+ * TF_SACK_RECOVER is set (reset at each recovery entry). prr_delivered/prr_out
+ * are octets delivered/sent since entry; prr_recoverfs is the flight size
+ * (snd_max - snd_una) captured at entry, the reduction's proportional base.
+ */
+	u_long	prr_delivered;		/* octets newly delivered this recovery */
+	u_long	prr_out;		/* octets sent this recovery */
+	u_long	prr_recoverfs;		/* RecoverFS: flight size at recovery entry */
 };
 
 #define	intotcpcb(ip)	((struct tcpcb *)(ip)->inp_ppcb)
@@ -252,9 +301,19 @@ struct	tcpstat {
 #ifdef KERNEL
 extern struct	inpcb tcb;		/* head of queue of active tcpcb's */
 extern struct	tcpstat tcpstat;	/* tcp statistics */
+extern int	tcprexmtthresh;		/* dup-ack / RFC 6675 DupThresh (== 3) */
 
 void	tcp_isn_init(void);		/* seed the per-boot ISN secret (net/tcp_isn.c) */
 tcp_seq	tcp_new_isn(struct tcpcb *tp);	/* RFC 6528 randomised initial send seq # */
+void	tcp_sack_addblock(struct tcpcb *tp, tcp_seq start, tcp_seq end); /* RFC 2018 (net/tcp_sack.c) */
+void	tcp_sack_purge(struct tcpcb *tp);	/* drop SACK blocks the cumulative ack covered */
+void	tcp_sack_update(struct tcpcb *tp, struct sackblk *sack, int nsack); /* RFC 6675 sender scoreboard */
+int	tcp_sack_islost(struct tcpcb *tp, tcp_seq seq);		/* RFC 6675 IsLost() */
+u_long	tcp_sack_pipe(struct tcpcb *tp);			/* RFC 6675 SetPipe() */
+u_long	tcp_sack_snd_bytes_above(struct tcpcb *tp, tcp_seq floor); /* PRR: SACKed octets >= floor */
+void	tcp_sack_prr_ack(struct tcpcb *tp, long acked, u_long prev_sacked); /* RFC 6937 PRR per-ack */
+int	tcp_sack_nextseg(struct tcpcb *tp, tcp_seq *startp, tcp_seq *endp, int *rxmit); /* RFC 6675 NextSeg() */
+int	tcp_sack_rescue(struct tcpcb *tp, tcp_seq *startp, tcp_seq *endp);	/* RFC 6675 NextSeg() rule (3) */
 #endif
 
 #endif /* !TCP_VAR_H */

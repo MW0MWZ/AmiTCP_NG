@@ -216,8 +216,9 @@ static void show_interfaces(void)
 /* -- verbose per-interface detail (INTERFACE <name>) ------------------------- */
 static int show_interface_info(const char *name)
 {
-  struct ng_sin sin, mask; LONG mtu = 0, hwt = 0, state = 0, unit = 0; ULONG rx = 0, tx = 0;
-  struct TagItem tg[12]; char ip[24], hb[24]; char *dev = 0;   /* IFQ_DeviceName -> STRPTR */
+  struct ng_sin sin, mask; LONG mtu = 0, hwt = 0, state = 0, unit = 0, mss = 0;
+  ULONG rx = 0, tx = 0, ierr = 0, idrop = 0, inobuf = 0, oqdrop = 0, oerr = 0, onobuf = 0;
+  struct TagItem tg[20]; char ip[24], hb[24]; char *dev = 0;   /* IFQ_DeviceName -> STRPTR */
   sin.sin_addr = 0; mask.sin_addr = 0;
   tg[0].ti_Tag = IFQ_DeviceName_;     tg[0].ti_Data = (ULONG)&dev;
   tg[1].ti_Tag = IFQ_DeviceUnit_;     tg[1].ti_Data = (ULONG)&unit;
@@ -228,7 +229,14 @@ static int show_interface_info(const char *name)
   tg[6].ti_Tag = IFQ_Address;         tg[6].ti_Data = (ULONG)&sin;
   tg[7].ti_Tag = IFQ_NetMask_;        tg[7].ti_Data = (ULONG)&mask;
   tg[8].ti_Tag = IFQ_State;           tg[8].ti_Data = (ULONG)&state;
-  tg[9].ti_Tag = TAG_END;             tg[9].ti_Data = 0;
+  tg[9].ti_Tag = NGIFQ_TcpMss;        tg[9].ti_Data = (ULONG)&mss;
+  tg[10].ti_Tag = IFQ_BadData;        tg[10].ti_Data = (ULONG)&ierr;
+  tg[11].ti_Tag = IFQ_InputDrops;     tg[11].ti_Data = (ULONG)&idrop;
+  tg[12].ti_Tag = NGIFQ_InNoBuf;      tg[12].ti_Data = (ULONG)&inobuf;
+  tg[13].ti_Tag = IFQ_OutputDrops;    tg[13].ti_Data = (ULONG)&oqdrop;
+  tg[14].ti_Tag = NGIFQ_OutErrors;    tg[14].ti_Data = (ULONG)&oerr;
+  tg[15].ti_Tag = NGIFQ_OutNoBuf;     tg[15].ti_Data = (ULONG)&onobuf;
+  tg[16].ti_Tag = TAG_END;            tg[16].ti_Data = 0;
   if (ng_queryif((void *)name, tg) != 0) return 0;
 
   Printf((STRPTR)"Interface \"%s\"\n", (LONG)name);
@@ -236,11 +244,20 @@ static int show_interface_info(const char *name)
   Printf((STRPTR)"Device unit number           = %ld\n", unit);
   Printf((STRPTR)"Hardware type                = %s\n", (LONG)hw_name(hwt, hb));
   Printf((STRPTR)"Maximum transmission unit    = %ld Bytes\n", mtu);
+  /* MSS as the STACK computes it for this interface (override-aware, via the
+   * NGIFQ_TcpMss query) -- never recomputed here, so an override shows correctly. */
+  Printf((STRPTR)"TCP MSS                      = %ld Bytes\n", mss);
   if (sin.sin_addr)  { fmt_ip(sin.sin_addr, ip);  Printf((STRPTR)"Address                      = %s\n", (LONG)ip); }
   else                                             Printf((STRPTR)"Address                      = (Not configured)\n");
   if (mask.sin_addr) { fmt_ip(mask.sin_addr, ip); Printf((STRPTR)"Network mask                 = %s\n", (LONG)ip); }
   Printf((STRPTR)"Packets received             = %ld\n", (LONG)rx);
   Printf((STRPTR)"Packets sent                 = %ld\n", (LONG)tx);
+  Printf((STRPTR)"Input errors (media)         = %ld\n", (LONG)ierr);
+  Printf((STRPTR)"Input drops (queue full)     = %ld\n", (LONG)idrop);
+  Printf((STRPTR)"Input drops (no mbuf)        = %ld\n", (LONG)inobuf);
+  Printf((STRPTR)"Output errors (media)        = %ld\n", (LONG)oerr);
+  Printf((STRPTR)"Output drops (queue full)    = %ld\n", (LONG)oqdrop);
+  Printf((STRPTR)"Output drops (no mbuf)       = %ld\n", (LONG)onobuf);
   Printf((STRPTR)"Link status                  = %s\n", (LONG)((state == NG_SM_Up) ? "Up" : "Down"));
   return 1;
 }
