@@ -149,40 +149,112 @@ extern void ng_low_stack_check(void);
 #define NG_STACK_CHECK() ((void)0)
 #endif
 
+/*
+ * PORT (AmiTCP_NG): give a task sharing this base its own scratch context
+ * before it can touch any. Only costs anything on a shared base -- the flag
+ * test short-circuits for everyone else. Done HERE, at vector entry, because
+ * this is at spl0 with no Forbid() held so allocating is safe; deeper in the
+ * socket layer it would not be. A failure leaves the task on the opener's
+ * context, which is what it had before contexts existed.
+ */
+#define NG_ENSURE_CTX()							\
+  { extern struct ng_taskctx *ng_ctx_ensure(struct SocketBase *);	\
+    if (libPtr->flags & SBFF_CAN_SHARE) (void)ng_ctx_ensure(libPtr); }
+
+/*
+ * PORT (AmiTCP_NG): SBTC_CAN_SHARE_LIBRARY_BASES (tag 51) relaxes the
+ * same-task rule, matching Roadshow, which also refuses non-opener callers
+ * until an application opts in.
+ *
+ * What sharing does NOT buy, and cannot without giving every task its own copy
+ * of the per-opener state (at which point it is just reopening the library,
+ * which Roadshow's own autodoc recommends):
+ *   - signals (SIGIO, SIGURG, address-change, CTRL-C) still go to the OPENER,
+ *     exactly as Roadshow documents;
+ *   - errno and h_errno are shared. errnoPtr/hErrnoPtr are one pointer each for
+ *     the whole base -- and they point at the base's own defErrno/defHErrno
+ *     unless the program repoints them -- so two tasks failing concurrently
+ *     overwrite each other's. There is nowhere to put a per-task errno without
+ *     breaking SBTC_ERRNOPTR's whole-base contract, so Roadshow has this too;
+ *   - syslog settings (mask, facility, tag) are per base, not per task;
+ *   - a descriptor is released the moment close() is called, before the socket
+ *     has finished lingering, so another task may be given that number while
+ *     the old connection is still shutting down. That is what close() means
+ *     everywhere else, but it does mean Dup2Socket() onto a descriptor whose
+ *     socket lingers can find the number taken, and fails with EBADF rather
+ *     than seizing it back;
+ *   - a context is created for a sharing task on its first call and is NEVER
+ *     reclaimed, because there is no hook for a task exiting. AmigaOS recycles
+ *     Task structures, so if a sharer exits and its address is later reused for
+ *     another task that also shares this base, that task inherits the dead
+ *     one's scratch -- including its resolver socket. Bounded, but real: a
+ *     long-lived shared base with a churn of short-lived workers is the shape
+ *     to avoid;
+ *   - closing a base that other tasks have shared does not free it. The closer
+ *     cannot tell whether a sharer is still inside the library (or asleep in
+ *     recv() on one of its sockets), and Exec runs Close under Forbid() so it
+ *     cannot wait to find out -- so the base, its sockets and its memory are
+ *     deliberately leaked rather than pulled out from under a live task. See
+ *     UL_Close() in api/amiga_api.c.
+ *
+ * These are the reasons Roadshow's autodoc recommends reopening the library per
+ * user rather than sharing one base; sharing is the escape hatch for an
+ * application that knows the limits, which is exactly how we treat it.
+ *
+ * NB the reject path below must tolerate a NULL libPtr->thisTask. UL_Close()
+ * clears it when it leaks a base that was shared, precisely so a recycled Task
+ * address cannot match the owner test above and be granted owner access -- and
+ * a sharer CAN still arrive here afterwards, if the application turned
+ * SBFF_CAN_SHARE back off before closing. libPtr comes straight from the
+ * vector's own a6, so the delisting that hides the base from every list walk
+ * does not protect this site.
+ */
 #define CHECK_TASK()					\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
-  if (libPtr->thisTask != SysBase->ThisTask) {		\
+  if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\
+      libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\
 	wTask->tc_Node.ln_Name,	libPtr->thisTask,	\
-	libPtr->thisTask->tc_Node.ln_Name);		\
+	libPtr->thisTask					\
+	  ? (STRPTR)libPtr->thisTask->tc_Node.ln_Name	\
+	  : (STRPTR)"<closed>");			\
     return -1;						\
-  }      
+  }							\
+  NG_ENSURE_CTX()
 
 #define CHECK_TASK_NULL()				\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
-  if (libPtr->thisTask != SysBase->ThisTask) {		\
+  if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\
+      libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\
 	wTask->tc_Node.ln_Name,	libPtr->thisTask,	\
-	libPtr->thisTask->tc_Node.ln_Name);		\
+	libPtr->thisTask					\
+	  ? (STRPTR)libPtr->thisTask->tc_Node.ln_Name	\
+	  : (STRPTR)"<closed>");			\
     return NULL;					\
-  }      
+  }							\
+  NG_ENSURE_CTX()
 
 #define CHECK_TASK2() CHECK_TASK_NULL()
 
 #define CHECK_TASK_VOID()				\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
-  if (libPtr->thisTask != SysBase->ThisTask) {		\
+  if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\
+      libPtr->thisTask != SysBase->ThisTask) {		\
     struct Task * wTask = SysBase->ThisTask;		\
     log(LOG_CRIT, wrongTaskErrorFmt, wTask,		\
 	wTask->tc_Node.ln_Name,	libPtr->thisTask,	\
-	libPtr->thisTask->tc_Node.ln_Name);		\
+	libPtr->thisTask					\
+	  ? (STRPTR)libPtr->thisTask->tc_Node.ln_Name	\
+	  : (STRPTR)"<closed>");			\
     return;						\
-  }      
+  }							\
+  NG_ENSURE_CTX()
 
 /*
  * PORT (AmiTCP_NG) fix: wrapped in do { } while (0). This macro expands to
@@ -194,10 +266,59 @@ extern void ng_low_stack_check(void);
  * other ~25 are standalone statements, unaffected.) The do/while makes it a single
  * statement, correct in every context.
  */
+/*
+ * PORT (AmiTCP_NG): API failure tracing, for compatibility debugging.
+ *
+ * Every vector that returns an error logs its own name and that errno. That is
+ * how you find out WHICH call a closed-source client is unhappy with instead of
+ * guessing from the outside -- it is what identified Amiga Explorer's
+ * setsockopt(SO_EVENTMASK). __FUNCTION__ gives the vector name for free, so this
+ * covers every vector that returns through here rather than a hand-picked few.
+ *
+ * COMPILED INTO EVERY BUILD, with no flag to switch it off. It used to be gated
+ * on NG_APITRACE and that was wrong twice over: it costs 2,184 bytes and no
+ * measurable speed (this is an error return, not the data path, and a disabled
+ * log() stops at two compares without evaluating its arguments), and a
+ * diagnostic whose whole job is to explain a machine you cannot reach must not
+ * require you to build that machine a private binary. It once shipped switched
+ * off in a pre-release advertised as ready for exactly that job.
+ *
+ * Logged at LOG_DEBUG, so LOGGING=ON plus LOGLEVEL=7 in AmiTCP.config is all it
+ * takes, on any build.
+ *
+ * It logs from inside API_STD_RETURN, which every vector reaches after
+ * releasing the syscall semaphore.
+ *
+ * CORRECTION (2026-08-07): an earlier version of this comment said the
+ * placement mattered because "log() can block waiting for a free log message".
+ * It does not. GetLogMsg() (kern/amiga_log.c) uses GetMsg(), which never waits:
+ * an empty pool simply increments GetLogMsgFail and the message is dropped. So
+ * there is no blocking hazard here, and none in calling log() from a vector
+ * that still holds the semaphore. The claim mattered enough to correct rather
+ * than leave: it now guards every build rather than an opt-in one, and a
+ * hazard nobody can find is a hazard people design around for no reason.
+ *
+ * What IS still true is that the tracer costs a formatted message on an error
+ * return, so it is gated by LOGLEVEL (LOG_DEBUG) and skipped at the call site
+ * when the level excludes it -- two compares, arguments never evaluated.
+ *
+ * And the placement after the release is still the right one, for a different
+ * reason than the old comment gave: syscall_semaphore is ONE semaphore shared by
+ * every base and every socket, and ObtainSyscallSemaphore() boosts the caller to
+ * the net task's priority while it is held. Formatting a log message before
+ * releasing it would lengthen a machine-wide, priority-boosted critical section
+ * that every other task's library calls are queued behind. Not a deadlock -- a
+ * cost. Do not move the trace earlier on the grounds that it is "safe".
+ */
+#define NG_TRACE_FAIL(error)						\
+  log(LOG_DEBUG, "APITRACE %s failed, errno %ld",			\
+      (STRPTR)__FUNCTION__, (LONG)(error))
+
 #define API_STD_RETURN(error, ret)	\
   do {					\
     if (error == 0)			\
       return ret;			\
+    NG_TRACE_FAIL(error);		\
     writeErrnoValue(libPtr, error);	\
     return -1;				\
   } while (0)

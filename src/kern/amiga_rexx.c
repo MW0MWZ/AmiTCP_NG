@@ -253,7 +253,26 @@ BOOL rexx_poll(void)
 {
   struct RexxMsg *rmsg;
 	  
-  if ((rmsg = (struct RexxMsg *)GetMsg(ARexxPort))
+  rmsg = (struct RexxMsg *)GetMsg(ARexxPort);
+
+  /*
+   * PORT (AmiTCP_NG) fix: a message we have already taken off the port MUST be
+   * replied, even if we cannot interpret it.
+   *
+   * This used to be a single condition -- GetMsg && != REXX_RETURN_ERROR &&
+   * IsRexxMsg -- so anything that failed IsRexxMsg() was removed from the port
+   * by GetMsg() and then simply dropped on the floor: never replied, never
+   * freed. The sender is left waiting on its reply port FOREVER (found exactly
+   * that way: a test client blocked in WaitPort() until the machine was reset),
+   * and its message is leaked. A caller does not have to be malicious to hit
+   * this -- anything the library does not recognise as a Rexx message qualifies.
+   */
+  if (rmsg != NULL && rmsg != REXX_RETURN_ERROR && !IsRexxMsg(rmsg)) {
+    ReplyMsg((struct Message *)rmsg);
+    return TRUE;			/* we did consume a message */
+  }
+
+  if (rmsg
       && rmsg != REXX_RETURN_ERROR 
       && IsRexxMsg(rmsg)) {
     UBYTE rbuf[REPLYBUFLEN];

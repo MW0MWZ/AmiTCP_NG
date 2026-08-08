@@ -175,84 +175,125 @@ sleep_init(void)
   return TRUE;
 }
 
+/*
+ * PORT (AmiTCP_NG): build a per-call sleep context on the caller's stack.
+ *
+ * Everything here is done IN THE CALLING TASK, which is the whole point: the
+ * signal bit and the port's mp_SigTask must belong to the task that is going to
+ * Wait(), or it can never be woken. The timer request borrows the device and
+ * unit the base already opened, so there is no OpenDevice() -- see the note in
+ * sys/synch.h about Forbid().
+ *
+ * Returns 0, or ENOMEM if the task has no free signal bit left.
+ */
+int
+ng_sleepctx_init(struct ng_sleepctx *sc, struct SocketBase *p)
+{
+  sc->sc_task	   = SysBase->ThisTask;
+  sc->sc_wchan	   = (caddr_t)0;
+  sc->sc_wmesg	   = NULL;
+  sc->sc_timerbusy = FALSE;
+
+  sc->sc_sigbit = AllocSignal(-1L);
+  if (sc->sc_sigbit == -1)
+    return (ENOMEM);
+
+  /* A message port built by hand. CreateMsgPort() would allocate the bit in
+   * this task too, but it must then be freed with DeleteMsgPort() by this same
+   * task -- doing it ourselves keeps the whole thing on the stack. */
+  sc->sc_port.mp_Node.ln_Succ = NULL;	/* never AddPort()ed, but do not leave */
+  sc->sc_port.mp_Node.ln_Pred = NULL;	/* stack garbage in list linkage       */
+  sc->sc_port.mp_Node.ln_Type = NT_MSGPORT;
+  sc->sc_port.mp_Node.ln_Pri  = 0;
+  sc->sc_port.mp_Node.ln_Name = NULL;
+  sc->sc_port.mp_Flags	      = PA_IGNORE;   /* enabled only around a timeout */
+  sc->sc_port.mp_SigBit	      = sc->sc_sigbit;
+  sc->sc_port.mp_SigTask      = sc->sc_task;
+  NewList(&sc->sc_port.mp_MsgList);
+
+  /* Clone the opened timer. io_Device/io_Unit are what OpenDevice() filled in
+   * on the base's request; every other field we set ourselves. */
+  aligned_bzero((caddr_t)&sc->sc_timer, sizeof(sc->sc_timer));
+  sc->sc_timer.tr_node.io_Message.mn_Node.ln_Type = NT_UNKNOWN;
+  sc->sc_timer.tr_node.io_Message.mn_ReplyPort	  = &sc->sc_port;
+  sc->sc_timer.tr_node.io_Message.mn_Length	  = sizeof(sc->sc_timer);
+  sc->sc_timer.tr_node.io_Device = p->tsleep_timer->tr_node.io_Device;
+  sc->sc_timer.tr_node.io_Unit	 = p->tsleep_timer->tr_node.io_Unit;
+  sc->sc_timer.tr_node.io_Command = TR_ADDREQUEST;
+
+  return (0);
+}
+
+/*
+ * Tear the context down before its stack frame dies.
+ *
+ * Reclaiming the timer request is not optional: a request still queued at
+ * timer.device would be written back into a stack frame that no longer exists,
+ * corrupting whatever now occupies it -- there is no MMU to catch that.
+ */
 void
-tsleep_send_timeout(struct SocketBase *p,
+ng_sleepctx_done(struct ng_sleepctx *sc)
+{
+  if (sc->sc_timerbusy) {
+    /* Re-arm signalling: AbortIO()+WaitIO() below wait for the reply to come
+     * back to this port, and under PA_IGNORE the reply raises no signal, so
+     * WaitIO() would never return. */
+    sc->sc_port.mp_Flags = PA_SIGNAL;
+    if (sc->sc_timer.tr_node.io_Message.mn_Node.ln_Type != NT_REPLYMSG)
+      AbortIO((struct IORequest *)&sc->sc_timer);
+    WaitIO((struct IORequest *)&sc->sc_timer);
+    sc->sc_timerbusy = FALSE;
+  }
+  if (sc->sc_sigbit != -1) {
+    /* Safe: this runs in sc_task, the task that allocated the bit. */
+    FreeSignal((LONG)sc->sc_sigbit);
+    sc->sc_sigbit = -1;
+  }
+}
+
+void
+tsleep_send_timeout(struct ng_sleepctx *sc,
 		    const struct timeval *time_out)
 {
 
   /*
-   * Make sure that the timer message is back from the timer device
-   */
-  if (p->tsleep_timer->tr_node.io_Message.mn_Node.ln_Type != NT_UNKNOWN) {
-    /*
-     * PORT (AmiTCP_NG) fix: the previous sleep may have ended via
-     * tsleep_abort_timeout(), which sets this port to PA_IGNORE so a late timer
-     * reply cannot spuriously wake us. But AbortIO()+WaitIO() just below wait for
-     * the aborted request to return TO this port -- and under PA_IGNORE the reply
-     * generates no signal, so WaitIO()'s internal Wait() never returns: the socket
-     * task hangs forever. Re-arm the port to PA_SIGNAL before we wait on it. (The
-     * send branch's later PA_SIGNAL assignment still covers the no-pending-timer
-     * case, so this is additive, not a move.)
-     */
-    p->timerPort->mp_Flags = PA_SIGNAL;
-    /*
-     * abort previous timeout if it has not been completed yet
-     */
-    if (p->tsleep_timer->tr_node.io_Message.mn_Node.ln_Type != NT_REPLYMSG) {
-      AbortIO((struct IORequest *)(p->tsleep_timer));
-    }
-    /*
-     * Remove timerequest from reply port.
-     */
-    WaitIO((struct IORequest *)p->tsleep_timer);
-    /*
-     * Set the node type to NT_UNKNOWN to mark that it is referenced only by
-     * the p->tsleep_timer.
-     */
-    p->tsleep_timer->tr_node.io_Message.mn_Node.ln_Type = NT_UNKNOWN;
-#if 0
-    /*
-     * Make sure the signal gets cleared.
-     *
-     * if this is not done, the tsleep_main will do one unnecessary round
-     * IF the signal was set. IS THIS WORTH OF IT?
-     */
-    SetSignal(0, 1 << p->timerPort->mp_SigBit);
-#endif
-  }
-  /*
-   * send timeout request if necessary
+   * The request is fresh -- it was built by ng_sleepctx_init() a moment ago on
+   * this very stack frame -- so there is no leftover from a previous sleep to
+   * reap. That whole dance (and the PA_IGNORE/WaitIO deadlock it had to work
+   * around) belonged to a request that was reused for the life of the library
+   * base; per-call state makes it unnecessary.
    */
   if (time_out) {
-    /*
-     * set the timeout
-     */
-    p->tsleep_timer->tr_time = *time_out;
-    /*
-     * Enable signalling again
-     */
-    p->timerPort->mp_Flags = PA_SIGNAL;
-    /*
-     * send the request to the timer device
-     */
-    BeginIO((struct IORequest *)(p->tsleep_timer));  
+    sc->sc_timer.tr_time = *time_out;
+    sc->sc_port.mp_Flags = PA_SIGNAL;
+    sc->sc_timerbusy	 = TRUE;
+    BeginIO((struct IORequest *)&sc->sc_timer);
   }
 }
 
 void
-tsleep_abort_timeout(struct SocketBase *p,
+tsleep_abort_timeout(struct ng_sleepctx *sc,
 		     const struct timeval *time_out)
 {
   if (time_out) {
     /*
-     * do not signal us any more
+     * Stop the port signalling, so a timer reply that lands between here and
+     * the reap cannot raise a signal nobody is waiting on.
+     *
+     * Vestigial, strictly: every caller follows this with ng_sleepctx_done(),
+     * which re-arms PA_SIGNAL anyway because it has to wait for the aborted
+     * request to come back. It mattered when the request lived for the whole
+     * life of the base and a late reply could wake the NEXT sleep; a per-call
+     * request has no next sleep to disturb. Kept because it costs a store and
+     * keeps the abort/reap pair symmetrical, not because anything depends on
+     * it.
      */
-    p->timerPort->mp_Flags = PA_IGNORE;
+    sc->sc_port.mp_Flags = PA_IGNORE;
   }
 }
 
 void
-tsleep_enter(struct SocketBase *p,
+tsleep_enter(struct ng_sleepctx *sc,
 	     caddr_t chan,		/* 'channel' to wait on */
 	     const char *wmesg)		/* reason to sleep */
 {
@@ -270,21 +311,21 @@ tsleep_enter(struct SocketBase *p,
 #endif
   
   /*
-   * The sleep_semaphore protects the sleep queues and
-   * p_ fields in SocketBases.
+   * The sleep_semaphore protects the sleep queues and the sc_ fields of the
+   * contexts linked into them.
    *
-   * When the process is in a sleep queue its p_wchan field is nonzero.
+   * While a context is in a sleep queue its sc_wchan field is nonzero.
    */
   ObtainSemaphore(&sleep_semaphore);
-  p->p_wchan = chan;
-  p->p_wmesg = wmesg;
+  sc->sc_wchan = chan;
+  sc->sc_wmesg = wmesg;
   q = &sleep_queue[SLEEP_HASH(chan)];
-  queue_enter(q, p, struct SocketBase *, p_sleep_link);
+  queue_enter(q, sc, struct ng_sleepctx *, sc_link);
   ReleaseSemaphore(&sleep_semaphore);
 }
 
 int
-tsleep_main(struct SocketBase *p, ULONG wakemask)
+tsleep_main(struct ng_sleepctx *sc, struct SocketBase *p, ULONG wakemask)
 {
   ULONG sigmask, bmask, timermask;
   struct timerequest *timerReply;
@@ -294,11 +335,30 @@ tsleep_main(struct SocketBase *p, ULONG wakemask)
   /* 
    * Set the signal mask for the wait
    */
-  timermask = 1 << p->timerPort->mp_SigBit;
+  timermask = 1 << sc->sc_port.mp_SigBit;
   sigmask = timermask | p->sigIntrMask | wakemask;
 
   for (;;) {
-    /* 
+    /*
+     * PORT (AmiTCP_NG) lost-wakeup fix: check for an already-delivered wakeup
+     * BEFORE sleeping. A wakeup that fired during tsleep()'s
+     * tsleep_send_timeout() (after tsleep_enter() registered us) has cleared
+     * sc_wchan, but its Signal may have been swallowed by that WaitIO() (shared
+     * timerPort bit) -- so Wait()ing here could block forever. Catch it up front.
+     * On the first pass no signals have been consumed by this loop, so returning
+     * without restoring bmask is correct.
+     *
+     * Trade-off: if an interrupt signal (sigIntrMask) is ALSO already pending in
+     * this same race, this early return reports the wakeup (0) ahead of the
+     * interrupt, unlike the in-loop path below which gives EINTR priority. That
+     * interrupt is NOT lost -- AmigaOS signals are level-triggered/sticky and we
+     * never Wait() here, so the bit stays set and is caught on the task's next
+     * blocking call; detection is merely deferred by one syscall. Accepted.
+     */
+    if (sc->sc_wchan == 0)
+      return (0);
+
+    /*
      * wait for timeout, wakeup or interrupt
      */
     bmask = Wait(sigmask);
@@ -325,7 +385,7 @@ tsleep_main(struct SocketBase *p, ULONG wakemask)
      * If p->p_chan is zero then the wakener has removed us from
      * the sleep queue.
      */
-    if (p->p_wchan == 0) {
+    if (sc->sc_wchan == 0) {
       /*
        * Set back the signals which interrupted us so that user program can
        * detect them
@@ -341,8 +401,8 @@ tsleep_main(struct SocketBase *p, ULONG wakemask)
      * check if we got the timer reply signal and message
      */
     if (bmask & timermask &&
-	(timerReply = (struct timerequest *)GetMsg(p->timerPort)) && 
-	timerReply == p->tsleep_timer) { /* sanity check */
+	(timerReply = (struct timerequest *)GetMsg(&sc->sc_port)) &&
+	timerReply == &sc->sc_timer) { /* sanity check */
       /*
        * timeout expired.
        *
@@ -350,6 +410,7 @@ tsleep_main(struct SocketBase *p, ULONG wakemask)
        * the p->tsleep_timer.
        */
       timerReply->tr_node.io_Message.mn_Node.ln_Type = NT_UNKNOWN;
+      sc->sc_timerbusy = FALSE;	/* it came back; nothing left to reap */
 
       result = EWOULDBLOCK;
       break;
@@ -375,10 +436,10 @@ tsleep_main(struct SocketBase *p, ULONG wakemask)
    * If p_chan is nonzero then we still are on the sleep queue and
    * need to be removed from there.
    */
-  if (p->p_wchan != 0) {
-    q = &sleep_queue[SLEEP_HASH(p->p_wchan)];
-    p->p_wchan = (char *)0;
-    queue_remove(q, p, struct SocketBase *, p_sleep_link);
+  if (sc->sc_wchan != 0) {
+    q = &sleep_queue[SLEEP_HASH(sc->sc_wchan)];
+    sc->sc_wchan = (char *)0;
+    queue_remove(q, sc, struct ng_sleepctx *, sc_link);
   }
   ReleaseSemaphore(&sleep_semaphore);
 
@@ -402,6 +463,18 @@ tsleep(struct SocketBase *p,  /* Library base through which this call came */
 {
   int result;
   spl_t old_spl;
+  /*
+   * PORT (AmiTCP_NG): the priority-boost bookkeeping (callerTask, myPri,
+   * libCallPri) lives on the SocketBase, which was safe only while one task
+   * could ever be inside a given base. Releasing syscall_semaphore below lets
+   * a SHARER task enter the same base and overwrite all three; if we then
+   * restored from the struct after waking we would hand OUR original priority
+   * to THAT task -- leaving us permanently boosted and calling SetTaskPri() on
+   * a task pointer that may since have exited. Snapshot into locals instead.
+   */
+  struct Task *boostTask;
+  BYTE boostPri, boostCallPri;
+  struct ng_sleepctx sc;	/* this call's sleep state, on our own stack */
 
 #if DIAGNOSTIC
   extern struct Task *AmiTCP_Task;
@@ -425,9 +498,36 @@ tsleep(struct SocketBase *p,  /* Library base through which this call came */
   }
 #endif
     
-  tsleep_send_timeout(p, time_out);
-  
-  tsleep_enter(p, chan, wmesg);
+  /*
+   * PORT (AmiTCP_NG): build this call's sleep context on our own stack.
+   *
+   * Any task may block here now, including one that merely shares the base:
+   * the reply port, its signal bit and the sleep-queue node all belong to
+   * whoever is running, so wakeup() can reach them and two tasks cannot
+   * collide on one slot. See sys/synch.h for why this cannot instead be
+   * per-task state owned by the base.
+   */
+  if (ng_sleepctx_init(&sc, p) != 0) {
+    log(LOG_WARNING, "tsleep: task %s has no free signal bit to block on",
+	SysBase->ThisTask->tc_Node.ln_Name ?
+	  (STRPTR)SysBase->ThisTask->tc_Node.ln_Name : (STRPTR)"?");
+    return (ENOMEM);
+  }
+
+  /*
+   * PORT (AmiTCP_NG) lost-wakeup fix: register on the sleep queue BEFORE reaping
+   * any stale timer. tsleep_send_timeout() can block in WaitIO() (AbortIO+WaitIO
+   * of a leftover timer request from a prior sleep that ended non-timeout), and
+   * the net task can wakeup() us at any moment WITHOUT holding syscall_semaphore.
+   * If we were not yet on the sleep queue during that WaitIO(), a wakeup would be
+   * LOST -- wakeup() would find no registered sleeper -- and recv() would hang
+   * with data already buffered. Registering first means the wakeup finds us and
+   * clears sc_wchan; the top-of-loop check in tsleep_main() then observes it
+   * even if the wakeup's Signal was consumed (it shares the port's bit).
+   */
+  tsleep_enter(&sc, chan, wmesg);
+
+  tsleep_send_timeout(&sc, time_out);
 
   /*
    * release spl-level while in sleep.
@@ -436,21 +536,46 @@ tsleep(struct SocketBase *p,  /* Library base through which this call came */
    */
 
   old_spl = spl0();
+  /*
+   * Give the priority boost back before we sleep: we are about to stop running,
+   * so holding the net task's priority buys nothing, and the struct fields that
+   * record it must be free for whoever runs next on this base (see the locals'
+   * declaration above).
+   */
+  boostTask     = p->callerTask;
+  boostPri      = p->myPri;
+  boostCallPri  = p->libCallPri;
+  if (boostTask != NULL)
+    SetTaskPri(boostTask, boostPri);
   ReleaseSemaphore(&syscall_semaphore);	                     /* XXX */
 
-  result = tsleep_main(p, 0);
+  result = tsleep_main(&sc, p, 0);
 
   /*
    * return old spl-level
    */
   ObtainSemaphore(&syscall_semaphore);	                     /* XXX */
+  /*
+   * Re-establish the boost from our OWN snapshot, and re-stamp the base so the
+   * eventual ReleaseSyscallSemaphore() restores this task and not a sharer that
+   * ran while we slept. Safe to write here: holding syscall_semaphore again
+   * means no other task is inside the library.
+   */
+  if (boostTask != NULL) {
+    p->callerTask = boostTask;
+    p->libCallPri = boostCallPri;
+    p->myPri      = SetTaskPri(boostTask, boostCallPri);
+  }
   splx(old_spl);
 
   /*
    * abort the timeout request if necessary
    */
-  if (result != EWOULDBLOCK) 
-    tsleep_abort_timeout(p, time_out);
+  if (result != EWOULDBLOCK)
+    tsleep_abort_timeout(&sc, time_out);
+
+  /* Reclaim the timer and the signal bit BEFORE this frame goes away. */
+  ng_sleepctx_done(&sc);
 
   return (result);
 }
@@ -459,7 +584,7 @@ void
 wakeup(caddr_t chan)
 {
   register queue_t q;
-  struct SocketBase *p, *next;
+  struct ng_sleepctx *sc, *next;
   
 #if DIAGNOSTIC
   if (chan == 0) {
@@ -471,24 +596,27 @@ wakeup(caddr_t chan)
   ObtainSemaphore(&sleep_semaphore);
   q = &sleep_queue[SLEEP_HASH(chan)];
   
-  p = (struct SocketBase *)queue_first(q);
-  while (!queue_end(q, (queue_entry_t)p)) {
-    next = (struct SocketBase *)queue_next(&p->p_sleep_link);
-    if (p->p_wchan == chan) {
+  sc = (struct ng_sleepctx *)queue_first(q);
+  while (!queue_end(q, (queue_entry_t)sc)) {
+    next = (struct ng_sleepctx *)queue_next(&sc->sc_link);
+    if (sc->sc_wchan == chan) {
       /*
        * mark sleeper as woken up
        */
-      p->p_wchan = NULL;
+      sc->sc_wchan = NULL;
       /*
        * remove sleeper from the sleep queue
        */
-      queue_remove(q, p, struct SocketBase *, p_sleep_link);
+      queue_remove(q, sc, struct ng_sleepctx *, sc_link);
       /*
        * signal process to take attention
        */
-      Signal(p->thisTask, 1 << p->timerPort->mp_SigBit);
+      /* Each sleeper owns its port and its signal bit, so this reaches the
+       * task that is actually blocked -- not the base's opener. That is what
+       * lets a task sharing the base block at all. */
+      Signal(sc->sc_task, 1 << sc->sc_port.mp_SigBit);
     }
-    p = next;
+    sc = next;
   }
   ReleaseSemaphore(&sleep_semaphore);
 }

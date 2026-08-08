@@ -265,9 +265,22 @@ NewList(register struct List *list)
 }
 
 /*
- * undef math log, because it conflicts with log() used for logging.
+ * PORT (AmiTCP_NG): this used to be an unconditional `#undef log`, to undo a
+ * SAS/C-era <math.h> that defined log() as a macro. Nothing in this tree includes
+ * <math.h>, and the bebbo/GCC build has no such macro -- so all it did was strip
+ * OUR log() macro (sys/systm.h), which tests the log level at the call site.
+ *
+ * That was silent and total: this header is pulled in (often transitively, via
+ * sys/malloc.h) AFTER sys/systm.h in most translation units, so ~90% of the
+ * codebase quietly fell back to calling the real function unconditionally --
+ * evaluating every argument for messages that were about to be discarded. It
+ * still compiled and still logged correctly, which is why nothing caught it.
+ *
+ * Kept only for SAS/C, where the original conflict was real.
  */
+#if __SASC
 #undef log
+#endif
 
 #endif /* !AMIGA_INCLUDES_H */
 

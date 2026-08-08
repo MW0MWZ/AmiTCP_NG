@@ -28,10 +28,27 @@ static inline void setup_accesscontroltable(struct NetDataBase * ndb)
 {
   *((ULONG *)&ndb->ndb_AccessTable[ndb->ndb_AccessCount]) = 0; /*mark default*/
 
-  ndb->ndb_AccessTable =
-    bsd_realloc(ndb->ndb_AccessTable,
-		ndb->ndb_AccessCount * sizeof (struct AccessItem) +
-		sizeof (ULONG), M_NETDB, M_WAITOK);
+  /*
+   * PORT (AmiTCP_NG): do NOT overwrite the live pointer with the return value
+   * unconditionally. bsd_realloc() leaves the OLD block intact and returns NULL
+   * when it cannot allocate (kern/kern_malloc.c), so assigning the NULL both
+   * leaked that block and left controlaccess() walking through a NULL table.
+   * Keeping the old, larger block on failure is harmless -- it is merely bigger
+   * than needed -- so ndb_AccessMax stays as it was in that case.
+   */
+  {
+    struct AccessItem *shrunk =
+      bsd_realloc(ndb->ndb_AccessTable,
+		  ndb->ndb_AccessCount * sizeof (struct AccessItem) +
+		  sizeof (ULONG), M_NETDB, M_WAITOK);
+
+    if (shrunk != NULL) {
+      ndb->ndb_AccessTable = shrunk;
+      /* The table is now an EXACT fit: no spare capacity at all. This is what
+       * made the old constant bound in addaccessent() wrong -- see there. */
+      ndb->ndb_AccessMax = ndb->ndb_AccessCount;
+    }
+  }
 
 #if 0
   {

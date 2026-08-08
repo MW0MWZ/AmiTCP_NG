@@ -185,7 +185,13 @@ m_xhalf(m, k, err)
 		return EXTRACT_SHORT(cp);
 	}
 	m0 = m->m_next;
-	if (m0 == 0)
+	/* PORT (AmiTCP_NG) fix: also require the next mbuf to actually hold the
+	 * second byte. m_xword() above checks its own continuation the same way
+	 * (MLEN(m0) + len - k < 4); this one only checked for a NULL link, so a
+	 * zero-length mbuf mid-chain -- a legal BSD state -- yielded a byte of
+	 * stale data from inside that mbuf, letting a filter's accept/reject
+	 * decision depend on memory that was never part of the packet. */
+	if (m0 == 0 || MLEN(m0) < 1)
 		goto bad;
 	*err = 0;
 	return (cp[0] << 8) | mtod(m0, u_char *)[0];

@@ -83,6 +83,38 @@ own MAC. This is the standard DHCP-bootstrap reception case — some servers
 address being offered, which is not yet ours. The rule is tightly scoped (receiving
 interface only, unicast UDP only) and inert once the interface has an address.
 
+## Tracked gaps that are not vectors
+
+Things that are genuinely missing but have no LVO to stub and nothing to probe, so
+they do not belong in the lists above. Recorded here so they are not mistaken for
+deferrals that a capability flag would report.
+
+### IP multicast — not implemented
+
+There is no `IP_ADD_MEMBERSHIP`/`IP_DROP_MEMBERSHIP` socket option, no `igmp.c`, no
+`in_multi`/`ip_moptions`, no `S2_ADDMULTICASTADDRESS` call to the driver, and no
+multicast delivery branch in `ip_input`. The single `IN_MULTICAST` test in
+`in_pcb.c` is a `SO_REUSEPORT` bind-time special case, not delivery.
+
+Transmit happens to work by accident — a multicast destination is just an address
+the routing code will send somewhere — but **receive is entirely unbuilt**. Anything
+needing group membership (mDNS/Bonjour service discovery being the obvious one) will
+not work, and will fail by hearing nothing rather than by returning an error.
+
+### Later SANA-II buffer management, including DMA
+
+The stack advertises the two mandatory copy callbacks plus the R4 32-bit-aligned
+variants, and counts which a driver chooses (`rxprofile` reports it). It does *not*
+implement the DMA hooks, which would let a driver transfer straight into an mbuf
+cluster instead of calling us per frame. Measured reason: no driver we can test uses
+even the R4 variants — `a2065` and `wifipi` both report zero — and R4/R5 are
+proposals rather than a ratified standard. See `docs/ARCHITECTURE.md` §8 for the two
+hazards (cache coherency without an MMU; the Zorro II 16MB DMA limit) that would
+have to be solved if a driver ever does.
+
+`S2_PacketFilter`, which would let a driver discard frames before it calls us at
+all, is unimplemented for the same reason and is the cheapest thing to try next.
+
 ## DHCP config ownership (route / DNS)
 
 After a successful lease the DHCP client applies the whole configuration itself —

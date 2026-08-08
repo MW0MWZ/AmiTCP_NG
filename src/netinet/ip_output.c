@@ -163,36 +163,78 @@ ip_broadcast_flood(m, flags, hlen)
 	int flags, hlen;
 {
 	register struct ip *ip = mtod(m, struct ip *);
-	register struct in_ifaddr *ia, *primary = (struct in_ifaddr *)0;
+	register struct in_ifaddr *ia, *src_ia = (struct in_ifaddr *)0;
+	struct ifnet *directed = (struct ifnet *)0;
+	struct rtentry *rt;
 	struct sockaddr_in bdst;
+	u_short pktlen = (u_short)ip->ip_len;	/* host order, for the MTU test */
 	int error = 0, nsent = 0;
+	spl_t s;
 
 	if ((flags & IP_ALLOWBROADCAST) == 0) {
 		m_freem(m);
 		return (EACCES);
 	}
-	/* Source + primary egress: first UP broadcast-capable interface (skip lo0). */
-	for (ia = in_ifaddr; ia; ia = ia->ia_next)
-		if ((ia->ia_ifp->if_flags & IFF_BROADCAST) &&
-		    (ia->ia_ifp->if_flags & IFF_UP)) {
-			primary = ia;
-			break;
+	/*
+	 * Hold splnet across the whole in_ifaddr walk + sends: the list is mutated
+	 * unlocked-elsewhere (SIOCDIFADDR / interface removal), and this is
+	 * Forbid()-equivalent so no other task can free an ia under us. Every
+	 * if_output() here is non-blocking (sana_output queues async; looutput
+	 * enqueues), so nothing yields while it is held.
+	 */
+	s = splnet();
+
+	/*
+	 * Directed egress: if a specific /32 host route to 255.255.255.255 exists
+	 * (the DHCP client installs one so its DISCOVER leaves a chosen interface),
+	 * honour it -- send out ONLY that interface, and use THAT interface's own
+	 * address as source, which may legitimately be 0.0.0.0 for an unnumbered
+	 * DHCP interface (RFC 2131). Without this, a DISCOVER for an unnumbered
+	 * interface borrowed another interface's real IP as its source and was
+	 * flooded out every segment. rtalloc1() longest-prefix-matches, and the
+	 * default route (0.0.0.0/0) is not RTF_HOST, so this selects only a genuine
+	 * host route to the limited broadcast.
+	 */
+	{
+		struct sockaddr_in ldst;
+		aligned_bzero_const((caddr_t)&ldst, sizeof ldst);
+		ldst.sin_family = AF_INET;
+		ldst.sin_len = sizeof ldst;
+		ldst.sin_addr.s_addr = INADDR_BROADCAST;
+		if ((rt = rtalloc1((struct sockaddr *)&ldst, 0)) != NULL) {
+			if ((rt->rt_flags & RTF_HOST) && rt->rt_ifp &&
+			    (rt->rt_ifp->if_flags & (IFF_UP|IFF_BROADCAST)) ==
+			      (IFF_UP|IFF_BROADCAST))
+				directed = rt->rt_ifp;
+			rtfree(rt);
 		}
-	if (primary == (struct in_ifaddr *)0) {
+	}
+
+	/* Source interface: the directed one, else the first UP broadcast iface. */
+	for (ia = in_ifaddr; ia; ia = ia->ia_next) {
+		if ((ia->ia_ifp->if_flags & (IFF_UP|IFF_BROADCAST)) !=
+		      (IFF_UP|IFF_BROADCAST))
+			continue;
+		if (directed) {
+			if (ia->ia_ifp == directed) { src_ia = ia; break; }
+			continue;
+		}
+		src_ia = ia;
+		break;
+	}
+	if (src_ia == (struct in_ifaddr *)0) {
+		splx(s);
 		m_freem(m);
 		return (ENETUNREACH);
 	}
+
 	/*
-	 * A broadcast is never fragmented; if it will not fit the egress MTU,
-	 * fail synchronously (EMSGSIZE) as the routed path did, rather than
-	 * silently dropping it at the driver. ip_len is still host order here.
+	 * Source: use the egress interface's own address only if the caller left it
+	 * unspecified. For an unnumbered directed interface this leaves ip_src at
+	 * 0.0.0.0, which is correct; never borrow an unrelated interface's address.
 	 */
-	if ((u_short)ip->ip_len > (u_short)primary->ia_ifp->if_mtu) {
-		m_freem(m);
-		return (EMSGSIZE);
-	}
 	if (ip->ip_src.s_addr == INADDR_ANY)
-		ip->ip_src = IA_SIN(primary)->sin_addr;
+		ip->ip_src = IA_SIN(src_ia)->sin_addr;
 	m->m_flags |= M_BCAST;
 	/* Finalise the header once; every interface copy is identical. */
 	ip->ip_len = htons((u_short)ip->ip_len);
@@ -210,9 +252,20 @@ ip_broadcast_flood(m, flags, hlen)
 		struct mbuf *mc;
 		int e;
 
-		if ((ifp->if_flags & IFF_BROADCAST) == 0 ||
-		    (ifp->if_flags & IFF_UP) == 0)
+		if ((ifp->if_flags & (IFF_UP|IFF_BROADCAST)) != (IFF_UP|IFF_BROADCAST))
 			continue;
+		if (directed && ifp != directed)
+			continue;		/* directed: this interface only */
+		/*
+		 * A broadcast is never fragmented; check each interface's own MTU
+		 * (they may differ) and skip -- rather than silently drop at the
+		 * driver -- an interface it won't fit, reporting EMSGSIZE.
+		 */
+		if (pktlen > (u_short)ifp->if_mtu) {
+			if (error == 0)
+				error = EMSGSIZE;
+			continue;
+		}
 		if ((mc = m_copy(m, 0, (int)M_COPYALL)) == (struct mbuf *)0) {
 			error = ENOBUFS;
 			continue;
@@ -222,7 +275,10 @@ ip_broadcast_flood(m, flags, hlen)
 		if (e)
 			error = e;
 		nsent++;
+		if (directed)			/* exactly one interface */
+			break;
 	}
+	splx(s);
 	m_freem(m);			/* free the finalised template */
 	if (nsent == 0 && error == 0)
 		error = ENETUNREACH;
@@ -258,6 +314,17 @@ ip_output(m0, opt, ro, flags)
 	if (opt) {
 		m = ip_insertoptions(m, opt, &len);
 		hlen = len;
+		/*
+		 * PORT (AmiTCP_NG) fix: track the new chain head. When the
+		 * original mbuf has no room for the options ip_insertoptions()
+		 * MGETHDRs a fresh header mbuf and prepends it, returning that as
+		 * the head -- but only the local `m` was updated, while every
+		 * `goto bad` path frees the *parameter* m0. The prepended mbuf was
+		 * reachable from nothing else, so each failing send (a caller
+		 * using IP_OPTIONS to an unroutable destination is enough) leaked
+		 * one mbuf from the fixed pool with no way to reclaim it.
+		 */
+		m0 = m;
 	}
 	ip = mtod(m, struct ip *);
 	/*

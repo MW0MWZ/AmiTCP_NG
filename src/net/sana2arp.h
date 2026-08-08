@@ -1,3 +1,10 @@
+/*
+ * AmiTCP_NG -- a modernised, open fork of AmiTCP/IP 3.0b2.
+ * Modifications for AmiTCP_NG Copyright (C) 2026 Andy Taylor (MW0MWZ).
+ * Licensed under the GNU General Public License, version 2 (see COPYING).
+ * The original AmiTCP/IP and BSD copyright notices are retained below.
+ */
+
 /* $Id: sana2arp.h,v 1.8 1993/06/04 11:16:15 jraja Exp $
  * 
  * Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>,
@@ -90,6 +97,12 @@ void arpinput(struct sana_softc *ssc, struct mbuf *m, caddr_t srcaddr);
 int arpioctl(int cmd, caddr_t data);
 /* RFC 3927 IPv4 link-local: raw ARP probe (sender 0.0.0.0) and announcement
  * (sender == target == addr). See ng_arp_probe/ng_arp_announce in sana2arp.c. */
+/* Upper-layer reachability confirmation: called from the SANA receive path
+ * for each inbound IP packet, with the frame's SENDER hardware address (the
+ * next hop). Refreshes -- never creates or redirects -- every complete entry
+ * whose cached hardware address matches. */
+void ng_arp_confirm_inbound(struct sana_softc *ssc, const u_char *srchw);
+
 void ng_arp_probe(struct sana_softc *ssc, struct in_addr target);
 void ng_arp_announce(struct sana_softc *ssc, struct in_addr addr);
 #endif

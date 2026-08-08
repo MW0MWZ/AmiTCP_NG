@@ -224,6 +224,18 @@ getvalue(struct CSource *args, UBYTE **errstrp, struct CSource *res)
   WORD var, index;
   LONG vlen = 0;
   UBYTE *value = NULL;
+  /*
+   * PORT (AmiTCP_NG) fix: the buffer this CSource arrived with. CS_Alloc()
+   * grows the reply buffer by allocating a new one and overwriting
+   * res->CS_Buffer WITHOUT freeing the old -- its comment says "old buffer
+   * will be freed by caller", but the only caller that frees anything
+   * (rexx_poll) sees just the FINAL pointer. A single ARexx line naming two
+   * data-heavy VAR_FUNC keywords ("CONNECTIONS ROUTES") therefore grew the
+   * buffer twice and orphaned the first allocation permanently. Remember the
+   * entry buffer so we can free any intermediate one ourselves, while still
+   * leaving the last for rexx_poll's existing `!= rbuf` check.
+   */
+  UBYTE *orig_buf = res->CS_Buffer;
 
   Buffer[0] = '\0';
 
@@ -251,7 +263,17 @@ getvalue(struct CSource *args, UBYTE **errstrp, struct CSource *res)
       switch (variables[var].type) {
       case VAR_FUNC:
 	if (variables[var].value) {
-	  if ((vlen = (*(var_f)(variables[var].value))(args, errstrp, res)))
+	  UBYTE *prevbuf = res->CS_Buffer;
+
+	  vlen = (*(var_f)(variables[var].value))(args, errstrp, res);
+	  /*
+	   * If the handler grew the reply buffer, release whatever it
+	   * replaced -- but never the buffer the caller handed us, which
+	   * the caller still owns (it is typically stack storage).
+	   */
+	  if (res->CS_Buffer != prevbuf && prevbuf != orig_buf)
+	    bsd_free(prevbuf, M_TEMP);
+	  if (vlen)
 	    return vlen;
 	} else {
 	  *errstrp = ERR_ILLEGAL_VAR;
@@ -309,12 +331,19 @@ getvalue(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 	break;
       }
       /* prepend by space? */
-      if (res->CS_CurChr) 
+      if (res->CS_CurChr)
 	res->CS_Buffer[res->CS_CurChr++] = ' ';
-      if (vlen + res->CS_CurChr > res->CS_Length) {
+      /* >= not >: a value that exactly fills the buffer would leave CS_CurChr ==
+       * CS_Length, so the terminator write at CS_Buffer[CS_CurChr] below (and a
+       * following item's space-prepend) would land one byte past the buffer.
+       * Reserve the final byte for the NUL unconditionally. (Masked for a plain
+       * QUERY by the caller's 1-byte slack, but a real heap overflow via the
+       * exactly-sized CS_Alloc buffer of getroutes()/getsockets() chained with a
+       * following variable.) */
+      if (vlen + res->CS_CurChr >= res->CS_Length) {
 	*errstrp = ERR_TOO_LONG;
 	return RETURN_ERROR;
-      } 
+      }
       bcopy(value, res->CS_Buffer + res->CS_CurChr, (WORD)vlen);
       res->CS_CurChr += vlen;
     }

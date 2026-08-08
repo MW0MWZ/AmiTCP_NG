@@ -104,12 +104,26 @@ LONG SAVEDS RAF4(_socket,
    * socket() is no longer special-cased; any first API call brings the stack up. */
   CHECK_TASK();
 
-  if ((error = sdFind(libPtr, &fd)))
-      goto Return;
-  
+  /*
+   * PORT (AmiTCP_NG): hold the semaphore across FINDING the descriptor and
+   * PUBLISHING it, the way _accept() already does.
+   *
+   * sdFind() only reports a free slot -- it does not claim it; the bit is set
+   * by the FD_SET below. With the descriptor table shared between tasks (see
+   * SBTC_CAN_SHARE_LIBRARY_BASES), two of them could pass through that gap and
+   * be handed the SAME fd: both create a socket, the second overwrites
+   * dTable[fd], and the first one's socket is left referenced by nothing --
+   * unreachable, unclosable, and holding its mbufs forever. Serialising the
+   * whole find-create-publish sequence closes it.
+   */
   ObtainSyscallSemaphore(libPtr);
+
+  if ((error = sdFind(libPtr, &fd))) {
+    ReleaseSyscallSemaphore(libPtr);
+    goto Return;
+  }
+
   error = socreate(domain, &so, type, protocol);
-  ReleaseSyscallSemaphore(libPtr);
 
   if (! error) {
     /*
@@ -119,11 +133,47 @@ LONG SAVEDS RAF4(_socket,
       error = libPtr->fdCallback(fd, FDCB_ALLOC);
     if (! error) {
       so->so_refcnt = 1;		/* reference count is pure AmiTCP addition */
+      /*
+       * PORT (AmiTCP_NG) compatibility fix: give the socket an owner up front.
+       *
+       * so_pgid is who sowakeup() signals for asynchronous socket events, and
+       * until now the ONLY thing that ever set it was the FIOSETOWN ioctl. A
+       * program that enabled FIOASYNC without first calling FIOSETOWN therefore
+       * got SS_ASYNC set, every flag correct, and no notification EVER -- the
+       * guard `if (so->so_pgid)` in sowakeup() silently skipped the Signal. Not
+       * an error return; a permanent wait for an event that could not arrive.
+       *
+       * Strict BSD does require an explicit F_SETOWN, so the old behaviour was
+       * defensible in isolation. But this library exists to be a drop-in for
+       * Roadshow, and software written against Roadshow/Miami/AmiTCP 4.x works
+       * there and hangs here -- Cloanto document "asynchronous socket events"
+       * as exactly the feature whose absence breaks Amiga Explorer. Where
+       * strictness and compatibility conflict for a drop-in, compatibility wins.
+       *
+       * Three readers see the difference, and only two of them are gated:
+       *   - sowakeup()'s SIGIO delivery -- gated by SS_ASYNC, so it still takes a
+       *     deliberate FIOASYNC. This is the case the fix is for.
+       *   - FIOGETOWN/SIOCGPGRP -- now answers with the creating task instead of
+       *     NULL. Strictly more useful, and what a caller would expect.
+       *   - sohasoutofband()'s SIGURG (kern/uipc_socket.c) -- NOT gated by
+       *     SS_ASYNC or by anything else. It fires whenever a peer sends urgent
+       *     data, so a program that never asked for either ioctl can now receive
+       *     a SIGURG it would previously have ignored. That matches BSD, where
+       *     SIGURG likewise goes to whoever owns the socket and does not require
+       *     async mode -- the old silence was a consequence of having no owner at
+       *     all, not a deliberate policy. Recorded here rather than papered over:
+       *     it is a real behaviour change for a program that opted into nothing.
+       * An explicit FIOSETOWN still overrides the default, so anything that
+       * already set an owner is entirely unaffected.
+       */
+      so->so_pgid = libPtr;
       libPtr->dTable[fd] = so;
       FD_SET(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
     }
   }
-  
+
+  ReleaseSyscallSemaphore(libPtr);
+
  Return: API_STD_RETURN(error, fd);
 }
 
@@ -197,6 +247,18 @@ LONG SAVEDS RAF4(_accept,
   CHECK_TASK();
   ObtainSyscallSemaphore(libPtr);
 
+  /*
+   * PORT (AmiTCP_NG) security fix: `name` was checked but `anamelen` was not,
+   * and it is dereferenced on both the normal path and the mbuf-exhaustion
+   * path below. A caller passing a real buffer with a NULL length pointer
+   * would write address 0 -- the CPU exception vectors, no MMU. A NULL
+   * `name` remains valid (accept() with no peer address wanted).
+   */
+  if (name != NULL && anamelen == NULL) {
+    error = EFAULT;
+    goto Return;
+  }
+
   if ((error = getSock(libPtr, s, &so)))
     goto Return;
 
@@ -239,12 +301,37 @@ LONG SAVEDS RAF4(_accept,
     struct socket *aso = so->so_q;
     if (soqremque(aso, 1) == 0)
       panic("accept");
+    /*
+     * PORT (AmiTCP_NG): re-arm FD_ACCEPT while connections remain queued.
+     * The API says the stack "keeps track of each pending connection" and
+     * generates a new FD_ACCEPT until all are accounted for; a bitmask cannot
+     * hold two, so the count is honoured here instead -- one re-arm per
+     * accept() that leaves the queue non-empty. Doing it HERE rather than in
+     * GetSocketEvents() is what makes it safe: re-arming at collection time
+     * while so_qlen stayed non-zero would mean an application draining "until
+     * -1" before accepting never sees -1. This way a client that accepts once
+     * per signal still learns there is more, and a client that drains in a
+     * loop is unaffected. `so` is still the LISTENING socket at this point.
+     */
+    if (so->so_qlen != 0)
+      soraise_event(so, FD_ACCEPT);
     so = aso;
-  }	
+  }
 
   libPtr->dTable[fd] = so;
   FD_SET(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
   so->so_refcnt = 1;  /* pure AmiTCP addition */
+  /*
+   * PORT (AmiTCP_NG) compatibility fix: same rule as _socket() -- whichever
+   * SocketBase takes delivery of the descriptor owns the socket for
+   * asynchronous-event purposes. An accepted connection is the case that
+   * matters most for a server: it is the socket the program will actually put
+   * into FIOASYNC mode, and without an owner sowakeup() would never signal it.
+   * Note the owner is the ACCEPTING base, not the listener's -- the listener may
+   * belong to a different task, and the task that now holds the fd is the one
+   * that needs the notification. An explicit FIOSETOWN still overrides this.
+   */
+  so->so_pgid = libPtr;
 
   /*
    * PORT (AmiTCP_NG): m_get() can return NULL here (fixed mbuf pool exhausted;
@@ -416,6 +503,17 @@ LONG SAVEDS RAF6(_getsockopt,
   if ((error = getSock(libPtr, s, &so)))
     goto Return;
   
+  /*
+   * PORT (AmiTCP_NG) security fix: `val` was checked but `avalsize` was not,
+   * yet it is read here and written back below. A caller passing a real
+   * buffer with a NULL length pointer would read and then write address 0 --
+   * the CPU exception vectors, with no MMU to catch it.
+   */
+  if (val != NULL && avalsize == NULL) {
+    error = EFAULT;
+    goto Return;
+  }
+
   if (val)
     valsize = *avalsize;
   else
@@ -453,10 +551,22 @@ LONG SAVEDS RAF4(_getsockname,
   CHECK_TASK();
   ObtainSyscallSemaphore(libPtr);
 
+  /*
+   * PORT (AmiTCP_NG) security fix: both out-parameters are dereferenced
+   * below with no check. Stock BSD relied on copyin/copyout faulting on a
+   * bad caller pointer; with no MMU and no user/kernel boundary a NULL here
+   * writes over the CPU exception vectors at address 0. recvit() in
+   * amiga_sendrecv.c already guards its length pointer this way.
+   */
+  if (asa == NULL || alen == NULL) {
+    error = EFAULT;
+    goto Return;
+  }
+
   if ((error = getSock(libPtr, fdes, &so)))
     goto Return;
 
-  m = m_getclr(M_WAIT, MT_SONAME);    
+  m = m_getclr(M_WAIT, MT_SONAME);
   if (m == NULL) {
     error = ENOBUFS;
     goto Return;
@@ -491,6 +601,13 @@ LONG SAVEDS RAF4(_getpeername,
 
   CHECK_TASK();
   ObtainSyscallSemaphore(libPtr);
+
+  /* PORT (AmiTCP_NG) security fix: see _getsockname above -- both
+   * out-parameters are dereferenced below and neither was checked. */
+  if (asa == NULL || alen == NULL) {
+    error = EFAULT;
+    goto Return;
+  }
 
   if ((error = getSock(libPtr, fdes, &so)))
     goto Return;

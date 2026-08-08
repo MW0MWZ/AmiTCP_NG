@@ -253,10 +253,27 @@ soisconnected(so)
 	so->so_state |= SS_ISCONNECTED;
 	if (head && soqremque(so, 0)) {
 		soqinsque(head, so, 1);
-		sorwakeup(head);
+		sorwakeup(head);	/* raises FD_ACCEPT on the listening socket */
 		wakeup((caddr_t)&head->so_timeo);
 	} else {
 		wakeup((caddr_t)&so->so_timeo);
+#ifdef AMITCP
+		/* PORT (AmiTCP_NG): a non-blocking connect() has completed. Raised
+		 * before the buffer wakeups so that an application collecting once
+		 * sees FD_CONNECT together with the FD_WRITE that follows it, rather
+		 * than being told the socket is writable before it is told why.
+		 *
+		 * Gated on so_head, NOT on reaching this branch. A protocol that puts
+		 * a child straight on the complete queue (sonewconn() with a non-zero
+		 * connstatus) and then calls soisconnected() also lands here, because
+		 * soqremque(so, 0) fails for a socket that was never on queue 0 --
+		 * and that child is an ACCEPT, not a connect. It is unobservable
+		 * today only because such a child was just zeroed and so has no event
+		 * mask yet; relying on that would break the moment the queueing
+		 * changes. so_head == NULL is the actual question being asked. */
+		if (so->so_head == NULL)
+			soraise_event(so, FD_CONNECT);
+#endif
 		sorwakeup(so);
 		sowwakeup(so);
 	}
@@ -282,6 +299,12 @@ soisdisconnected(so)
 	so->so_state &= ~(SS_ISCONNECTING|SS_ISCONNECTED|SS_ISDISCONNECTING);
 	so->so_state |= (SS_CANTRCVMORE|SS_CANTSENDMORE);
 	wakeup((caddr_t)&so->so_timeo);
+#ifdef AMITCP
+	/* PORT (AmiTCP_NG): the connection is gone -- "closed (graceful or not)".
+	 * soraise_event() adds FD_ERROR itself if so_error is set, which is how a
+	 * reset is distinguished from an orderly close. */
+	soraise_event(so, FD_CLOSE);
+#endif
 	sowwakeup(so);
 	sorwakeup(so);
 }
@@ -407,6 +430,12 @@ socantrcvmore(so)
 {
 
 	so->so_state |= SS_CANTRCVMORE;
+#ifdef AMITCP
+	/* PORT (AmiTCP_NG): the peer will send no more (a received FIN). That is
+	 * the graceful half of FD_CLOSE; the socket may still be writable and any
+	 * data already queued is still readable. */
+	soraise_event(so, FD_CLOSE);
+#endif
 	sorwakeup(so);
 }
 
@@ -462,6 +491,35 @@ sb_lock(sb, cp)
 }
 
 /*
+ * PORT (AmiTCP_NG): is the per-segment wakeup actually costing anything?
+ *
+ * The TCP data fast path calls sorwakeup() for EVERY in-sequence segment, which
+ * at bench rates is several hundred calls a second. But this function is only
+ * expensive when somebody is genuinely waiting: with all three flags clear it is
+ * three tests and a return, while SB_WAIT means a real wakeup() -- ObtainSemaphore,
+ * a hash-bucket walk, Signal, ReleaseSemaphore -- and that is what would be worth
+ * coalescing.
+ *
+ * Which of those it is depends entirely on whether the reader keeps up, and that
+ * is not something to guess at: the DMA work in this same revision was closed by
+ * measuring instead of assuming, after the assumption had already been used to
+ * justify a plan. So count both, and let real hardware say whether there is
+ * anything here at all.
+ *
+ * ng_sowk_calls  every call, receive side and send side alike
+ * ng_sowk_rcv    of those, calls on a RECEIVE buffer (the fast path's ones)
+ * ng_sowk_wait   calls that found a blocked reader/writer and did a real wakeup()
+ * ng_sowk_sel    calls that had to service a select()
+ * ng_sowk_async  calls that delivered an asynchronous signal
+ *
+ * If ng_sowk_wait stays near zero during a bulk transfer, the reader never
+ * actually blocks, the call is already almost free, and coalescing it would buy
+ * nothing -- close this and move on.
+ */
+unsigned long ng_sowk_calls = 0, ng_sowk_rcv = 0;
+unsigned long ng_sowk_wait  = 0, ng_sowk_sel = 0, ng_sowk_async = 0;
+
+/*
  * Wakeup processes waiting on a socket buffer.
  * Do asynchronous notification via SIGIO
  * if the socket has the SS_ASYNC flag set.
@@ -474,6 +532,21 @@ sowakeup(so, sb)
 #ifndef AMITCP
         struct proc *p;
 #endif
+	/* Read each word ONCE and test the copy, both here and below. Nothing
+	 * between the two can change them, but re-reading would leave the cost of
+	 * the accounting depending on whether the compiler commons the loads --
+	 * and this sits on the per-packet path. */
+	{
+		short sbf = sb->sb_flags;
+		short sst = so->so_state;
+
+		ng_sowk_calls++;
+		if (sb == &so->so_rcv) ng_sowk_rcv++;
+		if (sbf & SB_SEL)      ng_sowk_sel++;
+		if (sbf & SB_WAIT)     ng_sowk_wait++;
+		if (sst & SS_ASYNC)    ng_sowk_async++;
+	}
+
 	if (sb->sb_flags & SB_SEL) {
 		sb->sb_flags &= ~SB_SEL; /* do not notify us any more */
 		selwakeup(&sb->sb_sel);
@@ -484,7 +557,15 @@ sowakeup(so, sb)
 	}
 	if (so->so_state & SS_ASYNC) {
 #ifdef AMITCP
-		if (so->so_pgid)
+		/*
+		 * PORT (AmiTCP_NG): thisTask may be NULL. A base closed while
+		 * it was being shared is deliberately left allocated (see
+		 * UL_Close in api/amiga_api.c), so so_pgid stays valid -- but
+		 * its opener has exited and Exec has recycled that Task
+		 * structure. Signal() on it would relink garbage through the
+		 * scheduler's own queues; there is no MMU to stop it.
+		 */
+		if (so->so_pgid && so->so_pgid->thisTask)
 			Signal(so->so_pgid->thisTask, so->so_pgid->sigIOMask);
 #else
 		if (so->so_pgid < 0)
@@ -493,7 +574,110 @@ sowakeup(so, sb)
 			psignal(p, SIGIO);
 #endif
 	}
+#ifdef AMITCP
+	/*
+	 * PORT (AmiTCP_NG): asynchronous socket events. This is the natural place
+	 * for FD_READ/FD_WRITE -- every path that makes a socket readable or
+	 * writable already lands here, which is exactly the guarantee select()
+	 * relies on, so events cannot drift out of step with WaitSelect().
+	 *
+	 * A listening socket is woken through its RECEIVE buffer when a connection
+	 * completes (soisconnected() calls sorwakeup(head)); for that socket the
+	 * documented event is FD_ACCEPT, not FD_READ.
+	 *
+	 * The test is SO_ACCEPTCONN, NOT so_qlimit. solisten() clamps a negative
+	 * backlog to 0 and accepts it, so listen(s, 0) leaves so_qlimit == 0 on a
+	 * socket that is genuinely listening -- and _listen() does not reject it.
+	 * Using so_qlimit there would report FD_READ for a completed connection and
+	 * an event-driven application would never call accept(): the connection
+	 * would simply sit in the queue. SO_ACCEPTCONN is set unconditionally by
+	 * solisten() and is zero on every other socket, both being bzero'd at birth.
+	 *
+	 * DEVIATION, deliberate: FD_WRITE is raised whenever send-buffer space frees
+	 * up, not only after a send() has actually returned EWOULDBLOCK. The autodoc
+	 * describes it as "able to accept data for writing again (only for
+	 * non-blocking sockets)", which reads as edge-triggered. Level-triggering it
+	 * is safe -- the bit coalesces until collected, so the signal rate is bounded
+	 * by how often the application calls GetSocketEvents() -- and it cannot lose
+	 * a writability transition, which the edge-triggered reading can if the
+	 * application never hits EWOULDBLOCK. The cost is that FD_WRITE tends to
+	 * read as permanently set during a bulk send.
+	 */
+	if (so->so_eventmask) {
+		if (sb == &so->so_rcv)
+			soraise_event(so,
+			    (so->so_options & SO_ACCEPTCONN) ? FD_ACCEPT : FD_READ);
+		else
+			soraise_event(so, FD_WRITE);
+	}
+#endif /* AMITCP */
 }
+
+#ifdef AMITCP
+/*
+ * PORT (AmiTCP_NG): record an asynchronous socket event and tell the owner.
+ *
+ * Part of the AmiTCP V4 / Roadshow API this fork was missing entirely: the
+ * application selects events per socket with setsockopt(SO_EVENTMASK), names a
+ * signal with SocketBaseTags(SBTC_SIGEVENTMASK), and collects them with
+ * GetSocketEvents(). AmiTCP 3.0b2 had none of it, so a Roadshow-model client
+ * (Amiga Explorer, for one) failed at its first setsockopt and gave up.
+ *
+ * Cheap by design: a socket that never asked for events (so_eventmask == 0 --
+ * every socket, until something opts in) costs one test on the wakeup path.
+ */
+void
+soraise_event(so, ev)
+	register struct socket *so;
+	register u_long ev;
+{
+	register struct SocketBase *base;
+	register u_long fresh;
+
+	if (so->so_eventmask == 0)
+		return;
+
+	/*
+	 * "If it was closed due to an error then the FD_ERROR event is set as
+	 * well" -- so an asynchronous error rides along with whatever event
+	 * exposed it. so_error is deliberately NOT cleared here: the documented
+	 * way to read and clear it is getsockopt(SO_ERROR).
+	 *
+	 * Reported ONCE per distinct error, though. so_error outlives the report,
+	 * and udp_notify() sets it on a socket that carries on working, so an
+	 * unlatched test would staple FD_ERROR to every later FD_READ on that
+	 * socket forever -- an application would read one stale ICMP notification
+	 * as an endless stream of new errors. Latching on the value rather than a
+	 * flag still reports a genuinely different error that arrives later.
+	 */
+	if (so->so_error != 0 && (so->so_eventmask & FD_ERROR) != 0 &&
+	    so->so_error != so->so_error_reported) {
+		ev |= FD_ERROR;
+		so->so_error_reported = so->so_error;
+	}
+
+	/*
+	 * Only bits the application asked for are ever recorded, so the collector
+	 * never has to mask again. Signal only for bits that were not ALREADY
+	 * pending: until the application collects, one signal is as informative as
+	 * ten, and a busy socket would otherwise signal per packet.
+	 */
+	fresh = ev & so->so_eventmask & ~so->so_events;
+	if (fresh == 0)
+		return;
+	so->so_events |= fresh;
+
+	base = so->so_pgid;
+	/*
+	 * Same hazard as the SIGIO path above: a base that was shared and then
+	 * closed is deliberately left allocated, but its opener has exited and
+	 * Exec may have recycled that Task. thisTask is cleared on close -- test
+	 * it, or Signal() relinks garbage through the scheduler's own queues.
+	 */
+	if (base != NULL && base->thisTask != NULL && base->sigEventMask != 0)
+		Signal(base->thisTask, base->sigEventMask);
+}
+#endif /* AMITCP */
 
 /*
  * Socket buffer (struct sockbuf) utility routines.

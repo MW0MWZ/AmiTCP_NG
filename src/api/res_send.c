@@ -76,9 +76,10 @@ static char sccsid[] = "@(#)res_send.c	6.27 (Berkeley) 2/24/91";
 
 /*
  * res_sock is the PER-TASK resolver socket: resolv.h maps `res_sock` to
- * libPtr->res_socket (a SocketBase field, initialised to -1 per task in
- * amiga_api.c), so concurrent resolves in different tasks each use their own
- * socket -- there is no shared socket to race. (A dead `#ifndef AMITCP` file-
+ * NG_CTX(libPtr)->res_socket, a field of the calling task's scratch context
+ * (api/amiga_api.h), initialised to -1 when the base is opened. Each task
+ * resolving concurrently uses its own socket -- there is no shared socket to
+ * race. (A dead `#ifndef AMITCP` file-
  * static used to sit here; it never compiled in this AMITCP build but made the
  * socket look shared, so it was removed.)
  */
@@ -110,11 +111,17 @@ res_send(struct SocketBase *	libPtr,
 	char *cp;
 	fd_set dsmask;
 	struct timeval timeout;
+	long waitleft = 0;	/* seconds left for the current server; see
+				 * the "goto wait" hardening note below */
+	long wtotal = 0;	/* that server's whole budget, in seconds */
+	int wrejects = 0;	/* rejected packets left before we give up */
+	struct timeval wstart;	/* when the wait on this server began */
 	int nsi;			/* index of the nameserver being queried */
 	struct sockaddr_in host;
 	HEADER *hp = (HEADER *) buf;
 	HEADER *anhp = (HEADER *) answer;
 	u_char terrno = ETIMEDOUT;
+#define MAXREJECTS 32	/* rejected packets tolerated per server, backstopping the clock */
 #define JUNK_SIZE 128	/* read-and-discard drain chunk; small to keep the caller-stack frame down */
 	char junk[JUNK_SIZE]; /* buffer for trash data */
 
@@ -375,9 +382,65 @@ res_send(struct SocketBase *	libPtr,
 			if (timeout.tv_sec <= 0)
 				timeout.tv_sec = 1;
 			timeout.tv_usec = 0;
+			/*
+			 * PORT (AmiTCP_NG) security fix: remember how much of
+			 * this server's budget is left. Every `goto wait` below
+			 * (an answer from an unexpected source, or one carrying
+			 * a stale query id) used to re-enter WaitSelect with
+			 * this same, untouched timeout -- and WaitSelect does
+			 * not write back the remaining time -- so each rejected
+			 * packet re-armed a FULL-length wait. Anyone able to
+			 * send UDP to our ephemeral port with the nameserver's
+			 * address and port 53 could hold res_send() here
+			 * forever, hanging every gethostbyname() on the machine.
+			 * Note this needs no query-id guessing: a WRONG id is
+			 * precisely what triggers the retry.
+			 *
+			 * The budget is charged by ELAPSED TIME, not simply
+			 * spent on the first wait: a stale reply from an
+			 * earlier retry of this same query is routine DNS and
+			 * needs no attacker, so a rejected packet must not
+			 * cost us a healthy server whose real answer may be
+			 * microseconds away. A rejects counter backstops the
+			 * clock, keeping the loop bounded even if the system
+			 * time is stepped underneath us (sntp does exactly
+			 * that, and on a battery-less Amiga the step can be
+			 * years).
+			 */
+			wtotal = timeout.tv_sec;
+			wrejects = MAXREJECTS;
+			get_time(&wstart);
 wait:
 			FD_ZERO(&dsmask);
 			FD_SET(res_sock, &dsmask);
+			/*
+			 * Charge each wait against the remaining budget, and
+			 * give up on this server once it is spent (the outer
+			 * retry loop then moves on) instead of waiting anew.
+			 */
+			{
+				struct timeval wnow;
+				long elapsed;
+
+				get_time(&wnow);
+				elapsed = (long)wnow.tv_sec - (long)wstart.tv_sec;
+				if (elapsed < 0)
+					/* Clock stepped backwards: charge the
+					 * whole budget rather than handing out
+					 * a fresh one, which would reinstate
+					 * the very hang described above. */
+					elapsed = wtotal;
+				waitleft = wtotal - elapsed;
+			}
+			if (waitleft <= 0 || wrejects <= 0) {
+				/* Budget spent on rejected packets: treat it
+				 * exactly as the n == 0 timeout below does, so
+				 * the retry loop advances to the next server. */
+				gotsomewhere = 1;
+				continue;
+			}
+			timeout.tv_sec = waitleft;
+			timeout.tv_usec = 0;
 			n = WaitSelect(libPtr, res_sock+1, &dsmask, NULL,
 				NULL, &timeout, NULL);
 			if (n < 0) {
@@ -432,6 +495,7 @@ wait:
 #ifdef RES_DEBUG
 					printf("answer from unexpected source, ignored\n");
 #endif /* RES_DEBUG */
+					wrejects--;
 					goto wait;
 				}
 			}
@@ -444,6 +508,7 @@ wait:
 					printf("old answer:\n");
 					__p_query(answer);
 #endif /* RES_DEBUG */
+				wrejects--;
 				goto wait;
 			}
 			if (!(_res.options & RES_IGNTC) && anhp->tc) {

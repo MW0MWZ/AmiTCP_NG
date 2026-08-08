@@ -110,6 +110,7 @@ RCS_ID_C="$Id: radix.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 #include <net/radix.h>
 #include <sys/malloc.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>
 #define	M_DONTWAIT M_NOWAIT
 #endif
 #include <net/radix_protos.h>
@@ -543,7 +544,7 @@ struct radix_node *head;
 on2:
 	MKGet(m);
 	if (m == 0) {
-		printf("Mask for route not entered\n");
+		log(LOG_ERR, "rn_addmask: mask for route not entered\n");
 		return (tt);
 	}
 	Bzero(m, sizeof *m);
@@ -582,7 +583,7 @@ rn_delete(v, netmask, head)
 	if (tt->rn_mask == 0 || (saved_m = m = tt->rn_mklist) == 0)
 		goto on1;
 	if (m->rm_mask != tt->rn_mask) {
-		printf("rn_delete: inconsistent annotation\n");
+		log(LOG_ERR, "rn_delete: inconsistent annotation\n");
 		goto on1;
 	}
 	if (--m->rm_refs >= 0)
@@ -602,7 +603,7 @@ rn_delete(v, netmask, head)
 			break;
 		}
 	if (m == 0)
-		printf("rn_delete: couldn't find our annotation\n");
+		log(LOG_ERR, "rn_delete: couldn't find our annotation\n");
 on1:
 	/*
 	 * Eliminate us from tree
@@ -631,7 +632,7 @@ on1:
 			for (p = saved_tt; p && p->rn_dupedkey != tt;)
 				p = p->rn_dupedkey;
 			if (p) p->rn_dupedkey = tt->rn_dupedkey;
-			else printf("rn_delete: couldn't find us\n");
+			else log(LOG_ERR, "rn_delete: couldn't find us\n");
 		}
 		goto out;
 	}
@@ -654,7 +655,7 @@ on1:
 					x->rn_mklist = 0;
 					MKFree(m);
 				} else 
-					printf("%s %lx at %lx\n",
+					log(LOG_ERR, "%s %lx at %lx\n",
 					       "rn_delete: Orphaned Mask", 
 					       (u_long)m, (u_long)x);
 				m = mm;

@@ -59,10 +59,23 @@ extern struct Library *SocketBase;
 #define IFQ_BadData		(IFQ_BASE + 10)	/* input errors (if_ierrors)          */
 #define IFQ_OutputDrops		(IFQ_BASE + 35)	/* output-queue-full drops (if_snd.ifq_drops) */
 #define IFQ_InputDrops		(IFQ_BASE + 36)	/* input-queue-full drops (if_iqdrops)*/
+/* Byte counters. NOTE THE BUFFER CONTRACT: these take a pointer to a 64-bit
+ * SBQUAD_T -- {ULONG high; ULONG low;}, high word FIRST -- not a plain ULONG.
+ * Passing a 32-bit target leaves the low word as caller-stack garbage, which is
+ * exactly how ShowNetStatus once printed impossible byte figures. */
+#define IFQ_GetBytesIn		(IFQ_BASE + 28)
+#define IFQ_GetBytesOut		(IFQ_BASE + 29)
+/* SANA-II buffer-management copy-callback counts -> struct SANA2CopyStats. A driver
+ * that does not use the byte-copy hooks reports 0; that is the driver's choice. */
+#define IFQ_GetSANA2CopyStats	(IFQ_BASE + 31)
 /* AmiTCP_NG-private (match amiga_roadshow_compat.c): split the TX failure modes. */
 #define NGIFQ_OutErrors		(NG_TU + 0x004E4731)	/* if_oerrors: media/device TX errors  */
 #define NGIFQ_OutNoBuf		(NG_TU + 0x004E4732)	/* TX drops: send-tag mbuf alloc failed */
 #define NGIFQ_InNoBuf		(NG_TU + 0x004E4733)	/* RX drops: read re-post mbuf alloc fail */
+/* SANA-II R4 32-bit-aligned copy-callback counts (0 on a driver that only knows
+ * the original two functions -- which is the measurement). */
+#define NGIFQ_Copy32In		(NG_TU + 0x004E4734)
+#define NGIFQ_Copy32Out		(NG_TU + 0x004E4735)
 /* AmiTCP_NG-private: the stack-computed effective TCP MSS for the interface
  * (override-aware). MUST match NGIFQ_TcpMss in src/api/amiga_roadshow_compat.c. */
 #define NGIFQ_TcpMss		(NG_TU + 0x004E4730)
@@ -99,6 +112,24 @@ static __attribute__((unused)) struct List *ng_obtainiflist(void) {				/* Obtain
 static void __attribute__((unused)) ng_releaseiflist(struct List *l) {				/* ReleaseInterfaceList -456 */
   register struct List *_a0 __asm("a0")=l; register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-456)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
+}
+/* ---- statistics + routing-table enumeration (netstat) ---------------------- */
+/* GetNetworkStatistics type codes. Only these four are served; the rest
+ * (igmp/mbuf/multicast-routing/route/socket lists) return EINVAL today. */
+#define NG_NS_ICMP	0
+#define NG_NS_IP	2
+#define NG_NS_TCP	6
+#define NG_NS_UDP	7
+
+/* GetNetworkStatistics (-510). destination NULL asks for the required size.
+ * NOTE the buffer must be at least that size: the library bcopies into it. */
+static long __attribute__((unused)) ng_netstats(long type, long ver, void *dst, long size) {
+  register long _d0 __asm("d0")=type; register long _d1 __asm("d1")=ver;
+  register void *_a0 __asm("a0")=dst; register long _d2 __asm("d2")=size;
+  register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-510)":"+r"(_d0),"+r"(_d1),"+r"(_a0),"+r"(_d2)
+                       :"r"(_a6):"a1","memory");
+  return _d0;
 }
 static long __attribute__((unused)) ng_queryif(void *name, void *tags) {			/* QueryInterfaceTagList -468 (a0,a1) */
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=name;
@@ -142,6 +173,7 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
 /* ---- SocketBaseTagList + SBTC_SYSTEM_STATUS (GetNetStatus) ------------------ */
 #define NG_SBTB_CODE		1
 #define NG_SBTC_SYSTEM_STATUS	56
+#define NG_SBTC_HERRNO		7	/* SBTC_HERRNO: the resolver's h_errno */
 #define NG_SBTM_GETVAL(code)	(NG_TU | (((code) & 0x3FFF) << NG_SBTB_CODE))
 
 /* AmiTCP_NG-private GET-only diagnostic codes (mirror of SBTC_NG_* in the library's
@@ -152,6 +184,34 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
 #define NG_SBTC_TCP_RECVSPACE	0x2002	/* effective global tcp_recvspace   */
 #define NG_SBTC_SB_MAX		0x2003	/* effective global sb_max          */
 #define NG_SBTC_LINK_SPEED	0x2004	/* last interface's if_baudrate (bps) */
+#define NG_SBTC_TCP_PREDACK	0x2005	/* TCP fast-path hits, pure ACKs      */
+#define NG_SBTC_TCP_PREDDAT	0x2006	/* TCP fast-path hits, in-seq data    */
+#define NG_SBTC_TCP_RCVTOTAL	0x2007	/* all TCP segments received          */
+#define NG_SBTC_TCP_PCBMISS	0x2008	/* one-entry PCB cache misses         */
+#define NG_SBTC_TCP_PREDWIN	0x2009	/* fast-path hits, window updates     */
+#define NG_SBTC_SOWK_CALLS	0x2020
+#define NG_SBTC_SOWK_RCV	0x2021
+#define NG_SBTC_SOWK_WAIT	0x2022
+#define NG_SBTC_SOWK_SEL	0x2023
+#define NG_SBTC_SOWK_ASYNC	0x2024
+/* Header-prediction miss attribution -- one bucket per segment, but they do NOT
+ * sum to the slow path (segments dropped before prediction are never attributed). */
+#define NG_SBTC_TPM_STATE	0x2010
+#define NG_SBTC_TPM_FLAGS	0x2011
+#define NG_SBTC_TPM_TSTAMP	0x2012
+#define NG_SBTC_TPM_SEQ		0x2013
+#define NG_SBTC_TPM_WIN		0x2014
+#define NG_SBTC_TPM_REXMIT	0x2015
+#define NG_SBTC_TPM_DUPACK	0x2016
+#define NG_SBTC_TPM_SACK	0x2017
+#define NG_SBTC_TPM_ACK		0x2018
+#define NG_SBTC_TPM_CWND	0x2019
+#define NG_SBTC_TPM_ACKDATA	0x201A
+#define NG_SBTC_TPM_REASS	0x201B
+#define NG_SBTC_TPM_SPACE	0x201C
+#define NG_SBTC_TPM_ZEROWIN	0x201D
+#define NG_SBTC_TPM_ACKDUP	0x201E
+#define NG_SBTC_TPM_WINONLY	0x201F
 #define SBSYSSTAT_Interfaces		(1L<<0)
 #define SBSYSSTAT_PTP_Interfaces	(1L<<1)
 #define SBSYSSTAT_BCast_Interfaces	(1L<<2)

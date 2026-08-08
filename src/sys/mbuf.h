@@ -483,6 +483,7 @@ struct mbuf * m_gethdr(int canwait, int type);
 struct mbuf * m_getclr(int canwait, int type);
 struct mbuf * m_free(struct mbuf * m);
 void m_freem(struct mbuf * m);
+int m_valid(struct mbuf * m);	/* API-boundary sanity check -- see uipc_mbuf.c */
 struct mbuf * m_prepend(struct mbuf * m, int len, int canwait);
 struct mbuf * m_copym(struct mbuf * m, int off0, int len, int wait);
 void m_copydata(struct mbuf * m, int off, int len, caddr_t cp);

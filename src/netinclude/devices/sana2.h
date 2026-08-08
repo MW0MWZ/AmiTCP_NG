@@ -87,6 +87,27 @@ struct IOSana2Req
 
 #define S2_CopyToBuff   (S2_Dummy + 1)
 #define S2_CopyFromBuff (S2_Dummy + 2)
+/*
+ * PORT (AmiTCP_NG): later SANA-II buffer-management methods. The DMA variants are
+ * attributed to R3 in ref/roadshow-sdk/doc/sana2r4.html; R4 consolidated the set
+ * and added the 16-bit variants, PacketFilter and Log. AmiTCP 3.0b2 (1994)
+ * predates these entirely -- which is the whole reason this stack never offered a
+ * driver anything but the mandatory two above. Values are taken from the NDK 3.2
+ * header (ref/NDK3.2/SANA+RoadshowTCP-IP/include/devices/sana2.h), not invented.
+ * NOTE these come from a PROPOSAL (R4, and R5's hook redesign on top of it), not a
+ * ratified standard everyone implements -- driver uptake is exactly what we are
+ * trying to measure. The DMA variants return a buffer ADDRESS instead of copying.
+ */
+#define S2_PacketFilter      (S2_Dummy +  3)
+#define S2_CopyToBuff16      (S2_Dummy +  4)
+#define S2_CopyFromBuff16    (S2_Dummy +  5)
+#define S2_CopyToBuff32      (S2_Dummy +  6)
+#define S2_CopyFromBuff32    (S2_Dummy +  7)
+#define S2_DMACopyToBuff32   (S2_Dummy +  8)
+#define S2_DMACopyFromBuff32 (S2_Dummy +  9)
+#define S2_DMACopyToBuff64   (S2_Dummy + 10)
+#define S2_DMACopyFromBuff64 (S2_Dummy + 11)
+#define S2_Log               (S2_Dummy + 12)
 
 
 struct Sana2DeviceQuery

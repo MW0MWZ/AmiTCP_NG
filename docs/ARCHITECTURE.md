@@ -263,6 +263,24 @@ IORequests:
   stack to move payload between its buffers and our mbuf chains. This is the crux of
   the mbuf-pool requirement above.
 
+  Those two are *mandatory* and are all AmiTCP 3.0b2 ever offered — it predates the
+  later SANA-II revisions. We now also advertise the R4 32-bit-aligned variants
+  (`S2_CopyToBuff32`/`S2_CopyFromBuff32`) and count which a driver actually calls,
+  because that question gates something bigger: the R3/R4 **DMA** hooks
+  (`S2_DMACopyToBuff32` and friends) don't copy at all — they return a buffer
+  *address* for the driver to DMA into, which would remove the per-frame copy
+  entirely. On PiStorm that is worth more than it sounds, since the Pi currently has
+  to call back into 68k code for every single frame.
+
+  The measured answer so far is that no driver we can reach uses them: `a2065` and
+  `wifipi` both report zero R4 calls. That is consistent with the spec history —
+  R4 and R5 are *proposals* (see `ref/roadshow-sdk/doc/sana2r5.html`), not a
+  ratified standard drivers were obliged to follow. If your driver reports non-zero,
+  say so; it changes the calculus. Two hazards would need solving first: with no MMU,
+  DMA into RAM on 68040/060 copyback caches needs `CachePreDMA`/`CachePostDMA` or we
+  read stale data, and a Zorro II bus master can only reach the low 16MB while our
+  mbuf pool is plain `MEMF_PUBLIC`.
+
 `if_sana.c` is where a BSD `ifnet` is wired onto a SANA-II device — the single most
 Amiga-specific file in the stack and the best thing to study if you want to learn
 "how do you attach a Unix stack to a foreign driver model".

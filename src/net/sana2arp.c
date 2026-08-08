@@ -95,7 +95,84 @@ struct	arptab {
   u_char         at_timer;	/* minutes since last reference */
   u_char         at_flags;	/* flags */
   struct mbuf   *at_hold;	/* last packet until resolved/timeout */
+/*
+ * PORT (AmiTCP_NG): retry pacing and reachability, modelled on what modern
+ * stacks do. 4.3BSD -- which this descends from -- broadcast an ARP request for
+ * EVERY packet sent to an unresolved address, with no rate limit, no cap, and no
+ * way for the caller to learn the destination was unreachable. Under load that
+ * is a broadcast storm: one request per retransmit, per connection, driven by
+ * the network task. FreeBSD sends a bounded burst then holds down and returns
+ * EHOSTDOWN; Linux probes a few times then fails the neighbour. These fields are
+ * what that costs us.
+ */
+  ULONG          at_lastreq;	/* clock secs of the last request we sent    */
+  ULONG          at_confirmed;	/* clock secs we last had PROOF it is live   */
+  ULONG          at_holdstart;	/* clock secs the hold-down BEGAN (0 = none) */
+  u_char         at_asked;	/* requests sent since the last confirmation */
+  u_char         at_pad;	/* keep the struct longword aligned          */
 };
+
+/*
+ * PORT (AmiTCP_NG): ARP pacing constants. Chosen to match the behaviour of
+ * current BSD/Linux rather than invented:
+ *   one request per second while unresolved (never one per packet)
+ *   a bounded burst, then a hold-down during which sends fail fast
+ *   a complete entry is re-checked rather than trusted for its full lifetime
+ */
+#define NG_ARP_MAXTRIES		5	/* requests per burst (FreeBSD: 5)     */
+#define NG_ARP_HOLDDOWN		20	/* seconds of EHOSTDOWN (FreeBSD: 20)  */
+#define NG_ARP_REVALIDATE	60	/* re-probe a complete entry after 60s */
+#define NG_ARP_UCAST_PROBES	3	/* unicast first (Linux ucast_solicit) */
+#define NG_ARP_BCAST_PROBES	5	/* then broadcast (Linux mcast_solicit) */
+#define NG_ARP_PROBE_LIMIT	(NG_ARP_UCAST_PROBES + NG_ARP_BCAST_PROBES)
+					/* unanswered probes -> demote          */
+#define NG_ARP_SLOWPROBE	5	/* seconds between probes once the      \
+					 * fast burst is spent -- slow, but      \
+					 * NEVER zero: see arpresolve()          */
+
+/*
+ * PORT (AmiTCP_NG): when a complete entry may be demoted -- and when it may NOT.
+ *
+ * An earlier revision cleared ATF_COM once an entry had gone unconfirmed for
+ * ~70 s, forcing a resolve from scratch. That was wrong on a lossy link, and
+ * actively harmful on WiFi:
+ *
+ *   at_confirmed was stamped ONLY by an ARP arriving from the peer. A peer we
+ *   are exchanging TCP with at full rate need not send us an ARP for minutes,
+ *   so the freshness clock ran down during PERFECTLY HEALTHY traffic, and the
+ *   only thing that reset it was a successful BROADCAST ARP exchange -- exactly
+ *   the traffic class an access point is most likely to delay or drop. Losing a
+ *   few probes therefore tore down a cache entry that unicast traffic was using
+ *   without trouble, and the stack then refused to send at all (EHOSTDOWN).
+ *   That converted a transient stall into a permanent outage, and could
+ *   manufacture an outage with no underlying fault at all.
+ *
+ * Two things changed so that bounding a dead entry is now safe:
+ *
+ *  1. ng_arp_confirm_inbound() stamps at_confirmed from ordinary inbound IP
+ *     traffic, matched on the frame's SENDER HARDWARE ADDRESS -- the next hop.
+ *     An entry with traffic flowing BACK through it is therefore confirmed
+ *     continuously and does not reach the probe escalation below at all. That
+ *     covers any two-way flow, including everything routed via a gateway.
+ *
+ *     It is NOT an absolute guarantee, and must not be read as one: a peer we
+ *     only ever TRANSMIT to (one-way UDP telemetry, a strictly asymmetric path)
+ *     gives us no inbound frame to match, so its entry is still protected only
+ *     by the ARP exchange itself. For that case the guarantee is weaker but
+ *     bounded: NG_ARP_PROBE_LIMIT consecutive losses, unicast first, rather
+ *     than the single missed check the old code demoted on.
+ *  2. Probing escalates unicast -> broadcast. Demotion is gated on the
+ *     BROADCAST phase having gone unanswered, which is far stronger evidence
+ *     than "a timer expired": the whole segment was asked, repeatedly.
+ *
+ * NOTE what does NOT bound this: arptimer()'s ARPT_KILLC (20 min). at_timer is
+ * "minutes since last REFERENCE" and arpresolve() resets it to 0 on every send
+ * to the entry, so under active traffic that reaper never fires. An earlier
+ * draft of this comment claimed ARPT_KILLC was the backstop; it is not, and
+ * relying on it would let a genuinely dead peer black-hole traffic for as long
+ * as the application kept retrying -- with no error surfaced, which is the very
+ * failure this whole change exists to end. Hence NG_ARP_PROBE_LIMIT.
+ */
 
 /*
  * Global constant for ARP entry allocation
@@ -108,6 +185,11 @@ unsigned long arpentries = ARPENTRIES;
 struct arptable {
   struct SignalSemaphore atb_lock;
   struct arptab         *atb_free;
+  /* Cost gate for ng_arp_confirm_inbound(): the clock second in which this
+   * interface last did a confirmation lookup. Read unlocked -- an aligned
+   * 32-bit load is instruction-atomic on 68k, and a missed/duplicated
+   * confirmation costs at most one extra hash walk. */
+  ULONG                  atb_lastconfirm;
   struct MinList         atb_entries[ARPTAB_HSIZE];
 };
 
@@ -123,6 +205,8 @@ extern struct ifnet loif;
 int	useloopback = 1;
 
 static void arpwhohas(register struct sana_softc *ssc, struct in_addr * addr);
+static void arpwhohas_to(register struct sana_softc *ssc, struct in_addr * addr,
+			 const u_char *target_hw);
 static void in_arpinput(register struct sana_softc *ssc, struct mbuf *m);
 static char *sana_sprintf(register u_char *ap, int len);
 
@@ -150,6 +234,9 @@ alloc_arptable(struct sana_softc* ssc, int to_allocate)
 
   if (atab && at) {
     InitSemaphore(&atab->atb_lock);
+    /* bsd_malloc does not zero, and only the ENTRY array is bzero'd below --
+     * this field lives in the table header, so initialise it explicitly. */
+    atab->atb_lastconfirm = 0;
     for (i = 0; i < ARPTAB_HSIZE; i++)
       NewList((struct List *)(atab->atb_entries + i));
 
@@ -250,6 +337,22 @@ arptnew(u_long addr, struct arptable *atb, int permanent)
   if (at) {
     at->at_iaddr.s_addr = addr;
     at->at_flags = ATF_INUSE;
+    /*
+     * PORT (AmiTCP_NG): clear the pacing state for the NEW occupant.
+     *
+     * This slot may be recycled -- either from the free list, or taken from the
+     * LRU victim above when the table is full. Neither arptfree() nor the
+     * eviction path touches these fields, so without this the new address
+     * inherits the previous one's. The damaging case is at_holdstart: a slot
+     * evicted while its old occupant was in hold-down would make the FIRST send
+     * to a brand-new, never-ARPed destination fail with EHOSTDOWN. Table
+     * pressure from many destinations is exactly what forces eviction, which is
+     * exactly the workload this pacing exists to survive.
+     */
+    at->at_lastreq   = 0;
+    at->at_confirmed = 0;
+    at->at_holdstart = 0;
+    at->at_asked     = 0;
     AddHead((struct List *)(&atb->atb_entries[ARPTAB_HASH(addr)]), 
 	    (struct Node *)at);
   }
@@ -316,11 +419,19 @@ arptimer()
  */
 static void
 arp_request_out(register struct sana_softc *ssc,
-		struct in_addr sender, struct in_addr target)
+		struct in_addr sender, struct in_addr target,
+		const u_char *target_hw)
 {
   register struct mbuf *m;
   register struct s2_arppkt *s2a;
   struct sockaddr_sana2 ss2;
+
+  /* For a BROADCAST request ss2_host is unused (sana_start() issues
+   * S2_BROADCAST off M_BCAST), but sana_output()'s AF_UNSPEC case copies it
+   * into the transmit request whenever ss2_type is non-zero -- so clear it
+   * rather than hand the driver stack garbage. For a UNICAST probe it IS the
+   * destination, filled in below. */
+  aligned_bzero_const((caddr_t)&ss2, sizeof (ss2));
 
   if ((m = m_gethdr(M_DONTWAIT, MT_DATA)) == NULL)
     return;
@@ -329,7 +440,21 @@ arp_request_out(register struct sana_softc *ssc,
   MH_ALIGN(m, sizeof(*s2a));
   s2a = mtod(m, struct s2_arppkt *);
   aligned_bzero_const((caddr_t)s2a, sizeof (*s2a));
-  m->m_flags |= M_BCAST;
+
+  /*
+   * PORT (AmiTCP_NG): unicast when we already know the hardware address.
+   *
+   * Re-checking a peer we believe we know does not need the whole segment to
+   * hear it, and on WiFi a broadcast is the frame most likely to be delayed or
+   * dropped -- which is precisely when revalidation matters. Linux does the
+   * same (ucast_solicit before mcast_solicit). The ARP payload's target-hw
+   * field stays zero either way, as the protocol requires for a REQUEST; only
+   * the link-layer destination differs.
+   */
+  if (target_hw != NULL)
+    bcopy((caddr_t)target_hw, ss2.ss2_host, ssc->ss_if.if_addrlen);
+  else
+    m->m_flags |= M_BCAST;
 
   /* fill in header depending of the interface */
   s2a->arp_hrd = ssc->ss_arp.hrd;
@@ -368,7 +493,18 @@ arp_request_out(register struct sana_softc *ssc,
 static void
 arpwhohas(register struct sana_softc *ssc, struct in_addr *addr)
 {
-  arp_request_out(ssc, ssc->ss_ipaddr, *addr);
+  arp_request_out(ssc, ssc->ss_ipaddr, *addr, NULL);
+}
+
+/*
+ * As arpwhohas(), but sent DIRECTLY to a hardware address we already hold,
+ * rather than to the whole segment. Used to revalidate a complete entry.
+ */
+static void
+arpwhohas_to(register struct sana_softc *ssc, struct in_addr *addr,
+	     const u_char *target_hw)
+{
+  arp_request_out(ssc, ssc->ss_ipaddr, *addr, target_hw);
 }
 
 /*
@@ -385,13 +521,13 @@ ng_arp_probe(struct sana_softc *ssc, struct in_addr target)
 {
   struct in_addr any;
   any.s_addr = 0;			/* the probe's 0.0.0.0 sender */
-  arp_request_out(ssc, any, target);
+  arp_request_out(ssc, any, target, NULL);
 }
 
 void
 ng_arp_announce(struct sana_softc *ssc, struct in_addr addr)
 {
-  arp_request_out(ssc, addr, addr);
+  arp_request_out(ssc, addr, addr, NULL);
 }
 
 /*
@@ -595,8 +731,10 @@ arpresolve(register struct sana_softc *ssc,
     alloc_arptable(ssc, 0);
     if (!(atb = ssc->ss_arp.table)) {
       log(LOG_ERR, "arpresolve: memory exhausted");
-      *error = ENOBUFS; 
-      m_free(m); 
+      *error = ENOBUFS;
+      m_freem(m);		/* the whole chain: m_free() would drop only the
+				 * head and leak every cluster behind it -- and
+				 * this path fires precisely when memory is tight */
       return 0;
     }
   }
@@ -606,38 +744,295 @@ arpresolve(register struct sana_softc *ssc,
   if (at == 0) {		/* not found */
     at = arptnew(destip->s_addr, atb, FALSE);
     if (at) {
+      extern unsigned long ng_now_secs;
+
       at->at_hold = m;
+      /* PORT (AmiTCP_NG): the first request counts towards the burst, and
+       * stamps the rate limit -- otherwise a fresh entry would emit one
+       * request per packet until the first second elapsed. */
+      at->at_lastreq = ng_now_secs;
+      at->at_asked   = 1;
       arpwhohas(ssc, destip);
     } else {
       log(LOG_ERR, "arpresolve: no free entry");
       *error = ENETUNREACH;
-      m_free(m); 
-    } 
+      m_freem(m);		/* free the whole chain, not just the head */
+    }
     ARPTAB_UNLOCK(atb);
     return 0;
   }
 
   at->at_timer = 0;		/* restart the timer */
-  if (at->at_flags & ATF_COM) {	/* entry IS complete */
-    bcopy((caddr_t)at->at_hwaddr, (caddr_t)desten, ssc->ss_if.if_addrlen);
+
+  {
+    /*
+     * PORT (AmiTCP_NG): the CACHED clock (net/if.c, refreshed once per
+     * if_slowtimo tick), not get_time(). This runs on the send path of every
+     * packet; a timer.device library-vector call per packet would add real cost
+     * on a 68000 to a path that already takes a semaphore -- and would do so
+     * hardest under the high-rate multi-connection load this pacing exists to
+     * survive. One-second granularity is finer than anything below needs.
+     */
+    extern unsigned long ng_now_secs;
+    ULONG now = ng_now_secs;
+
+    if (at->at_flags & ATF_COM) {	/* entry IS complete */
+      /*
+       * PORT (AmiTCP_NG): REVALIDATE rather than trust it for its full 20
+       * minutes. If the peer's hardware address changes -- a WiFi roam, an AP
+       * restart, a replaced router -- a stock 4.3BSD entry keeps pointing at a
+       * MAC that no longer answers until it ages out, and every packet vanishes
+       * with no error and nothing logged. Linux re-probes a neighbour about 30s
+       * after it was last confirmed; this is the same idea.
+       *
+       * The cached address is ALWAYS used while probing, and the entry is never
+       * demoted here -- see the long note on the constants above for why that
+       * matters on a lossy link. A probe that is merely late, or lost, must
+       * never black-hole traffic that is working.
+       *
+       * Probe escalation follows Linux: the first NG_ARP_UCAST_PROBES go
+       * DIRECTLY to the address we hold (cheap, no broadcast, and it is the
+       * peer itself that must answer); only if those go unanswered do we fall
+       * back to broadcast, which is what would discover a changed hardware
+       * address. The burst runs at 1/s, then drops to one every
+       * NG_ARP_SLOWPROBE seconds indefinitely -- it never stops entirely, so a
+       * peer that comes back is picked up without waiting for ARPT_KILLC.
+       */
+      if ((at->at_flags & ATF_PERM) == 0 &&
+	  now - at->at_confirmed >= NG_ARP_REVALIDATE) {
+	/*
+	 * `probes` holds ONE value for the whole decision. at_asked was
+	 * previously read both before and after its own increment (once for
+	 * the cadence, once for the unicast/broadcast choice) -- correct, but
+	 * a trap for anyone who later moves the increment. Bounded by
+	 * NG_ARP_PROBE_LIMIT below, so the u_char cannot wrap.
+	 */
+	u_char probes = at->at_asked;
+	ULONG  gap    = (probes < NG_ARP_MAXTRIES) ? 1 : NG_ARP_SLOWPROBE;
+
+	if (now - at->at_lastreq >= gap) {
+	  at->at_lastreq = now;
+	  probes         = (u_char)(probes + 1);
+	  at->at_asked   = probes;
+	  if (probes <= NG_ARP_UCAST_PROBES)
+	    arpwhohas_to(ssc, destip, at->at_hwaddr);	/* unicast */
+	  else
+	    arpwhohas(ssc, destip);			/* broadcast fallback */
+	}
+
+	if (probes >= NG_ARP_PROBE_LIMIT) {
+	  /*
+	   * Unicast AND broadcast have now gone unanswered, with no inbound
+	   * traffic from this peer for the whole window. Treat the mapping as
+	   * dead: demote and fall through to the unresolved path, which
+	   * re-resolves and -- if that also fails -- reports EHOSTDOWN to the
+	   * application instead of framing packets with an address nothing
+	   * answers to.
+	   */
+	  at->at_flags    &= ~ATF_COM;
+	  at->at_asked     = 0;
+	  at->at_holdstart = 0;
+	  /*
+	   * Keep at_lastreq at `now`, do NOT zero it. We have just sent the
+	   * final probe of the burst this very call; zeroing would make the
+	   * unresolved path's "now != at_lastreq" rate limit pass immediately
+	   * and emit a SECOND broadcast for the same address in the same tick.
+	   * Harmless on the wire, but it would break the one-request-per-second
+	   * invariant the rest of this function is careful to hold.
+	   */
+	  at->at_lastreq   = now;
+	  log(LOG_NOTICE,
+	      "arp: %ld.%ld.%ld.%ld stopped answering after %ld probes, "
+	      "re-resolving\n",
+	      (ntohl(destip->s_addr) >> 24) & 0xff,
+	      (ntohl(destip->s_addr) >> 16) & 0xff,
+	      (ntohl(destip->s_addr) >>  8) & 0xff,
+	       ntohl(destip->s_addr)        & 0xff,
+	      (long)NG_ARP_PROBE_LIMIT);
+	  goto unresolved;
+	}
+      }
+      bcopy((caddr_t)at->at_hwaddr, (caddr_t)desten, ssc->ss_if.if_addrlen);
+      ARPTAB_UNLOCK(atb);
+      return 1;
+    }
+
+  unresolved:
+
+    /*
+     * There is an arptab entry, but no address response yet.
+     *
+     * PORT (AmiTCP_NG): this used to broadcast a request for EVERY packet, for
+     * as long as the caller kept trying, and never told the caller anything.
+     * Now: at most one request a second, at most NG_ARP_MAXTRIES of them, then
+     * a hold-down during which sends fail immediately with EHOSTDOWN so the
+     * application finds out instead of transmitting into silence.
+     */
+    /*
+     * Hold-down, expressed as "how long since it started", NOT as an absolute
+     * deadline. Every other check here is elapsed-since, which fails SAFE if the
+     * clock moves: unsigned subtraction wraps to a huge number and the condition
+     * simply expires early. A `now < deadline` test is the one shape that fails
+     * the other way -- sntp correcting the clock BACKWARDS would extend the
+     * hold-down by the size of the jump, wedging the destination in EHOSTDOWN
+     * for as long as the correction was large.
+     */
+    if (at->at_holdstart != 0 && now - at->at_holdstart < NG_ARP_HOLDDOWN) {
+      /*
+       * PORT (AmiTCP_NG): fail the send fast, but KEEP PROBING SLOWLY.
+       *
+       * An earlier revision sent nothing at all for the whole hold-down. That
+       * is worse than it looks here, because the ARP transmit path is also the
+       * stack's only way to notice a stalled SANA interface: arpwhohas() ->
+       * sana_output() -> sana_start(), and sana_start() is what signals the
+       * network task when the write-request pool is empty with work pending.
+       * Going silent therefore removed the one thing that could restart a
+       * wedged interface, turning "recovers by itself" into "stays dead".
+       *
+       * One probe every NG_ARP_SLOWPROBE seconds is far below the storm this
+       * pacing exists to prevent (the original code sent one per PACKET), and
+       * it means recovery no longer depends on the application retrying.
+       */
+      if (now - at->at_lastreq >= NG_ARP_SLOWPROBE) {
+	at->at_lastreq = now;
+	arpwhohas(ssc, destip);		/* broadcast: we have no address to aim at */
+      }
+      m_freem(m);			/* the whole chain */
+      *error = EHOSTDOWN;
+      ARPTAB_UNLOCK(atb);
+      return 0;
+    }
+
+    if (at->at_holdstart != 0 && now - at->at_holdstart >= NG_ARP_HOLDDOWN) {
+      at->at_holdstart = 0;		/* hold-down expired: start a new burst */
+      at->at_asked = 0;
+    }
+
+    /* Replace the held mbuf with this latest one. */
+    if (at->at_hold)
+      m_freem(at->at_hold);
+    at->at_hold = m;
+
+    if (at->at_asked >= NG_ARP_MAXTRIES) {
+      /* Burst exhausted with no reply: stop asking for a while, and say so. */
+      at->at_holdstart = now;
+      at->at_asked = 0;
+      log(LOG_NOTICE,
+	  "arp: no response from %ld.%ld.%ld.%ld after %ld tries, "
+	  "holding down %ld s\n",
+	  (ntohl(destip->s_addr) >> 24) & 0xff,
+	  (ntohl(destip->s_addr) >> 16) & 0xff,
+	  (ntohl(destip->s_addr) >>  8) & 0xff,
+	   ntohl(destip->s_addr)        & 0xff,
+	  (long)NG_ARP_MAXTRIES, (long)NG_ARP_HOLDDOWN);
+    } else if (now != at->at_lastreq) {	/* rate limit: one per second */
+      at->at_lastreq = now;
+      at->at_asked++;
+      arpwhohas(ssc, destip);
+    }
+    /*
+     * Held for a pending reply, not an error: say so explicitly rather
+     * than leaving *error as the caller found it. sana_output() does
+     * zero its local first, but now that it PROPAGATES our *error
+     * instead of discarding it, a future second caller that forgot to
+     * would ship a garbage errno to an application. Cheap to close.
+     */
+    *error = 0;
     ARPTAB_UNLOCK(atb);
-    return 1;
+    return 0;
   }
-  /*
-   * There is an arptab entry, but no address response yet.  
-   * Replace the held mbuf with this latest one.
-   */
-  if (at->at_hold)
-    m_freem(at->at_hold);
-  at->at_hold = m;
-  arpwhohas(ssc, destip);	/* ask again */
+}
+
+/*
+ * ng_arp_confirm_inbound(): upper-layer reachability confirmation.
+ *
+ * PORT (AmiTCP_NG). Modern stacks do not re-ARP a peer that is demonstrably
+ * talking to them: Linux lets the transport confirm a neighbour (an arriving
+ * ACK proves reachability), so an active flow never emits a solicitation at
+ * all. Without that, at_confirmed can only be refreshed by an ARP from the
+ * peer -- so a peer we are exchanging data with at full rate still "goes
+ * stale" on a timer and gets probed, and on a link where those probes are
+ * unreliable the entry then looked dead while it was plainly working.
+ *
+ * Called from sana_ip_read() for every received IP packet, with the sender's
+ * hardware address as it arrived on the wire.
+ *
+ * MATCHED ON THE HARDWARE ADDRESS, NOT THE IP SOURCE. This is the whole point,
+ * and an earlier draft got it wrong by looking the entry up by ip_src:
+ *
+ *   ARP entries map a NEXT HOP, but a packet's IP source is its ORIGIN. On any
+ *   routed host they are almost never the same address. Download a file through
+ *   your default gateway and every inbound packet is sourced from the remote
+ *   server -- the gateway's own IP appears as a source on essentially nothing.
+ *   An ip_src lookup therefore could not confirm the gateway's entry no matter
+ *   how much traffic flowed through it, leaving the single most important entry
+ *   on the host exactly as exposed as before.
+ *
+ *   The frame's SENDER HARDWARE ADDRESS is the next hop, by definition -- it is
+ *   the station that actually put the frame on the wire. Matching on it
+ *   confirms the gateway while its traffic flows, and still confirms a direct
+ *   same-subnet peer (whose frames carry its own address). Every entry sharing
+ *   that address is confirmed, so a router proxy-ARPing for several IPs is
+ *   handled too.
+ *
+ * Two further properties:
+ *
+ *  - COST. This is the receive hot path on a 68000, so per-packet work must be
+ *    near zero. atb_lastconfirm limits this to ONE table walk per clock second
+ *    per interface. Worst case is ARPENTRIES (165) entries, each a pointer
+ *    chase and a flag test, with a bcmp of up to MAXADDRSANA (16) bytes for
+ *    those that are complete -- order 2-3 thousand byte-compares, ONCE a
+ *    second, against a 60 s revalidation timer that needs no finer resolution.
+ *    Negligible beside the copy and checksum done for every single packet.
+ *
+ *  - SAFETY. Only a COMPLETE, non-permanent entry whose cached address already
+ *    equals the frame's sender is touched, and only its freshness fields are
+ *    written. This can REFRESH a mapping already learned through ARP; it can
+ *    never create one, redirect one, or alter a hardware address. The most an
+ *    on-segment attacker gains by forging a sender address is keeping an entry
+ *    they could already ARP-spoof outright from expiring.
+ */
+void
+ng_arp_confirm_inbound(struct sana_softc *ssc, const u_char *srchw)
+{
+  struct arptable *atb;
+  register struct arptab *at;
+  extern unsigned long ng_now_secs;
+  ULONG now = ng_now_secs;
+  size_t len = ssc->ss_if.if_addrlen;
+  int i;
+
+  if (!(atb = ssc->ss_arp.table))
+    return;
+
+  /* Cost gate -- see above. Unlocked 32-bit read: instruction-atomic on 68k,
+   * and both outcomes of a race are harmless (a duplicated walk, or one
+   * confirmation deferred by a second). */
+  if (atb->atb_lastconfirm == now)
+    return;
+
+  ARPTAB_LOCK(atb);
+  atb->atb_lastconfirm = now;
+  for (i = 0; i < ARPTAB_HSIZE; i++) {
+    for (at = (struct arptab *)atb->atb_entries[i].mlh_Head;
+	 at->at_succ;
+	 at = at->at_succ) {
+      if ((at->at_flags & ATF_COM) &&
+	  (at->at_flags & ATF_PERM) == 0 &&
+	  bcmp((caddr_t)at->at_hwaddr, (caddr_t)srchw, len) == 0) {
+	at->at_confirmed = now;
+	at->at_asked     = 0;	/* clear any probe burst in progress */
+	at->at_lastreq   = 0;
+	at->at_holdstart = 0;
+      }
+    }
+  }
   ARPTAB_UNLOCK(atb);
-  return 0;
 }
 
 /*
  * Called from the sana poll routine
- * when ARP type packet is received.  
+ * when ARP type packet is received.
  * Common length and type checks are done here,
  * then the protocol-specific routine is called.
  * In addition, a sanity check is performed on the sender
@@ -839,6 +1234,17 @@ in_arpinput(register struct sana_softc *ssc,
 
     if (at) {
       bcopy(sha, (caddr_t)at->at_hwaddr, len);
+      /*
+       * PORT (AmiTCP_NG): this is the only place we get PROOF the peer is
+       * reachable, so it is where reachability is stamped and the retry pacing
+       * is cleared. Any ARP from that host counts -- a reply to us, or a
+       * request of its own -- which is what lets a stalled entry recover as
+       * soon as the peer speaks, rather than waiting out a timer.
+       */
+      { extern unsigned long ng_now_secs; at->at_confirmed = ng_now_secs; }
+      at->at_asked     = 0;
+      at->at_lastreq   = 0;
+      at->at_holdstart = 0;
       at->at_flags |= ATF_COM;
       if (at->at_hold) {
 	sin.sin_family = AF_INET;
@@ -851,8 +1257,14 @@ in_arpinput(register struct sana_softc *ssc,
     if (at == 0 && itaddr.s_addr == myaddr.s_addr) {
       /* ensure we have a table entry */
       if ((at = arptnew(isaddr.s_addr, atb, FALSE))) {
+	extern unsigned long ng_now_secs;
+
 	bcopy(sha, (caddr_t)at->at_hwaddr, len);
 	at->at_flags |= ATF_COM;
+	/* PORT (AmiTCP_NG): stamp reachability here too. Every path that sets
+	 * ATF_COM must, or the entry reads as infinitely stale (at_confirmed
+	 * starts at 0) and gets demoted on its first use. */
+	at->at_confirmed = ng_now_secs;
       }
     }
     ARPTAB_UNLOCK(atb);
@@ -982,6 +1394,14 @@ arpioctl(cmd, data)
     at->at_flags = ATF_COM | ATF_INUSE | 
       (ar->arp_flags & (ATF_PERM|ATF_PUBL));
     at->at_timer = 0;
+    /* PORT (AmiTCP_NG): an operator-supplied entry counts as confirmed NOW.
+     * Without this it would carry at_confirmed == 0, read as infinitely stale,
+     * and be demoted and re-resolved the first time it was used -- which would
+     * quietly defeat the point of setting a static ARP entry at all. */
+    { extern unsigned long ng_now_secs; at->at_confirmed = ng_now_secs; }
+    at->at_asked = 0;
+    at->at_lastreq = 0;
+    at->at_holdstart = 0;
     break;
 
   case SIOCDARP:		/* delete entry */

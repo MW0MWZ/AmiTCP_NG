@@ -160,6 +160,52 @@ void cs_putchar(unsigned char, struct CSource *);
 void panic(const char *, ...);
 void log(unsigned long, const char *, ...);
 unsigned long vlog(unsigned long, const char *, va_list);
+
+/*
+ * PORT (AmiTCP_NG): logging controls, and the call-site fast path.
+ *
+ * log_enabled is the master switch and log_level the highest (least important)
+ * syslog priority that gets recorded. They are independent on purpose: switching
+ * logging off and back on must not lose the verbosity you chose, and "off" must
+ * not be expressible as a priority number that already means something else.
+ * LOGGING= and LOGLEVEL= in AmiTCP.config set them, and both are visible over
+ * ARexx. Defined in kern/amiga_log.c.
+ *
+ * The macro is what makes it cheap to leave logging calls in the source. vlog()
+ * filters too -- it has to, since it is also reachable through printf() -- but by
+ * then the caller has already evaluated every argument and made the call. Several
+ * log sites pass ntohl(), pointer arithmetic or inet_ntoa() results, and on a
+ * 7MHz 68000 that is real work done purely to be thrown away. Testing here means
+ * a switched-off log() costs one load, one compare and a not-taken branch, and
+ * its arguments are never touched.
+ *
+ * 7 rather than LOG_PRIMASK on purpose: this header is included in translation
+ * units that do not pull in <sys/syslog.h>, and the syslog priority encoding has
+ * been three bits since 4.2BSD.
+ *
+ * The parentheses around (log) in the expansion suppress the macro, so this
+ * calls the real function. kern/subr_prf.c defines it the same way.
+ *
+ * TWO CONSTRAINTS ON CALLERS, both of which every current call site satisfies:
+ *   - `level` is evaluated TWICE, so it must have no side effects. Pass a LOG_*
+ *     constant (or a side-effect-free expression, as accesscontrol.c does).
+ *   - The expansion is a statement, not an expression. `log(...)` cannot be used
+ *     for its value -- it has none -- and needs its trailing semicolon as usual.
+ *
+ * If a translation unit ever appears to ignore the level, check for a `#undef
+ * log` reaching it after this header: kern/amiga_includes.h carried an
+ * unconditional one for years (a SAS/C <math.h> workaround), which silently
+ * disabled this fast path in most of the tree while still compiling and logging
+ * correctly.
+ */
+extern long log_level;
+extern long log_enabled;
+
+#define log(level, ...)							\
+  do {									\
+    if (log_enabled && (long)((level) & 7) <= log_level)		\
+      (log)((level), __VA_ARGS__);					\
+  } while (0)
 unsigned long printf(const char *, ...);
 unsigned long sprintf(char * buf, const char * fmt, ...);
 unsigned long csprintf(struct CSource* buf, const char * fmt, ...);

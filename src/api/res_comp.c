@@ -180,6 +180,16 @@ dn_expand(const u_char *msg, const u_char *eomorig, const u_char *comp_dn,
 			return (-1);			/* flag error */
 		}
 	}
+	/*
+	 * PORT (AmiTCP_NG) security fix: bound the final NUL terminator like every
+	 * other write above. The empty/root-name early-exit (first label byte 0x00)
+	 * breaks here with dn == exp_dn, so if the caller passed length <= 0 (a
+	 * fully-consumed output buffer -- reachable when getanswer()'s hostbuf fills
+	 * exactly) this write would land at or past exp_dn + length, one byte past
+	 * the caller's buffer (a heap overflow driven by a crafted DNS reply).
+	 */
+	if (dn >= eom)
+		return (-1);
 	*dn = '\0';
 	if (len < 0)
 		len = cp - comp_dn;

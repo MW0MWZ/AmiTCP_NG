@@ -116,6 +116,12 @@ struct sana_softc {
   VOID           *ss_bufmgnt;	      /* magic cookie for buffer management */
   ULONG           ss_copyin;	      /* SANA2 byte CopyToBuff (RX) call count   */
   ULONG           ss_copyout;	      /* SANA2 byte CopyFromBuff (TX) call count  */
+  /* Of the above, how many came through the SANA-II R4 32-bit-aligned variants.
+   * Zero on every driver that only knows the original two functions -- which is
+   * the number we are actually after: it says whether offering a driver more
+   * than AmiTCP 3.0b2 did achieves anything on real hardware. */
+  ULONG           ss_copyin32;
+  ULONG           ss_copyout32;
   ULONG           ss_txnobuf;	      /* TX packets dropped: send-tag mbuf alloc failed */
   ULONG           ss_rxnobuf;	      /* RX packets dropped: read re-post mbuf alloc failed */
   UWORD		  ss_reqno;	      /* # of requests to allocate */

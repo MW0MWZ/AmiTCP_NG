@@ -246,6 +246,9 @@ struct tcpcb {
  * Many of these should be kept per connection,
  * but that's inconvenient at the moment.
  */
+/* PORT (AmiTCP_NG): NG_STAT_TCP_OUR in api/amiga_roadshow_compat.c hardcodes this
+ * struct's size, because that file sees only an incomplete type. Keep them in step
+ * -- a mismatch silently truncates the tail of the statistics. */
 struct	tcpstat {
 	u_long	tcps_connattempt;	/* connections initiated */
 	u_long	tcps_accepts;		/* connections accepted */

@@ -35,6 +35,11 @@ int sb_lock(struct sockbuf * sb,
 void sowakeup(register struct socket * so,
              register struct sockbuf * sb);
 
+/* PORT (AmiTCP_NG): record an asynchronous socket event (FD_*) and signal the
+ * owner if it asked to be told. See kern/uipc_socket2.c. */
+void soraise_event(register struct socket * so,
+                   register u_long ev);
+
 int soreserve(register struct socket * so,
               u_long sndcc,
               u_long rcvcc);

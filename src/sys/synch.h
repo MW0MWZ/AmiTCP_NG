@@ -81,15 +81,64 @@
 #include <sys/time.h>
 #endif
 
+/* queue_chain_t (the sleep-queue linkage embedded in struct ng_sleepctx) and
+ * struct MsgPort/timerequest, which that struct holds by value. */
+#include <sys/queue.h>
+#include <exec/ports.h>
+#include <devices/timer.h>
+
 #if !defined(AMIGA_INCLUDES_H) && !defined(DEBUG)
 #include <kern/amiga_includes.h> /* for the inline spl_n() */
 #endif
 
+/*
+ * PORT (AmiTCP_NG): the sleep context is PER CALL, and lives on the stack of
+ * the task that blocks.
+ *
+ * It used to be one set of fields on the SocketBase, created when the library
+ * was opened. That bound blocking to the opening task three ways over: the
+ * reply port's signal bit is an AllocSignal() of whoever created the port, so
+ * only that task could be woken; the timer device signals mp_SigTask, which is
+ * likewise fixed at creation; and one queue node per base cannot be linked into
+ * the global sleep queue twice. So no other task sharing the base could ever
+ * block, and a second sleeper would have corrupted a list every socket walks.
+ *
+ * Putting it on the caller's stack fixes all three at once, and sidesteps the
+ * lifetime problem that sank the alternative: a per-task context would have to
+ * be torn down eventually, and DeleteMsgPort() calls FreeSignal(), which always
+ * acts on SysBase->ThisTask -- so NO task can ever free another task's port.
+ * A blocking call, by definition, is a live stack frame in the blocking task,
+ * which is exactly the lifetime this state wants. Nothing to reclaim, nothing
+ * to leak, no dead-task hazard.
+ *
+ * The port is built by hand rather than with CreateMsgPort(), and the timer
+ * request borrows io_Device/io_Unit from the one the base opened -- so there is
+ * no OpenDevice() here. That matters: tsleep() runs with splnet() (i.e.
+ * Forbid()) held by its caller, and OpenDevice() under Forbid() can hang the
+ * machine.
+ *
+ * ng_sleepctx_done() MUST reclaim the timer request before the frame dies; a
+ * request still outstanding at timer.device would later be written back into
+ * a dead stack.
+ */
+struct ng_sleepctx {
+  struct Task *		sc_task;	/* the task blocking in this frame  */
+  struct MsgPort	sc_port;	/* reply port, owned by sc_task     */
+  struct timerequest	sc_timer;	/* io_Device/io_Unit cloned         */
+  queue_chain_t		sc_link;	/* link in the global sleep_queue   */
+  caddr_t		sc_wchan;	/* what we are waiting for, 0 = woken */
+  const char *		sc_wmesg;
+  BYTE			sc_sigbit;	/* AllocSignal() bit, -1 if none    */
+  BOOL			sc_timerbusy;	/* a request is out at the device   */
+};
+
 extern BOOL sleep_init(void);
-extern void tsleep_send_timeout(struct SocketBase *, const struct timeval *);
-extern void tsleep_abort_timeout(struct SocketBase *, const struct timeval *);
-extern void tsleep_enter(struct SocketBase *, caddr_t, const char *);
-extern int  tsleep_main(struct SocketBase *, ULONG blockmask);
+extern int  ng_sleepctx_init(struct ng_sleepctx *, struct SocketBase *);
+extern void ng_sleepctx_done(struct ng_sleepctx *);
+extern void tsleep_send_timeout(struct ng_sleepctx *, const struct timeval *);
+extern void tsleep_abort_timeout(struct ng_sleepctx *, const struct timeval *);
+extern void tsleep_enter(struct ng_sleepctx *, caddr_t, const char *);
+extern int  tsleep_main(struct ng_sleepctx *, struct SocketBase *, ULONG blockmask);
 extern int  tsleep(struct SocketBase *, caddr_t, const char *,const struct timeval *);
 extern void wakeup(caddr_t);
 

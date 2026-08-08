@@ -97,6 +97,7 @@ RCS_ID_C="$Id: in.c,v 1.11 1993/06/04 11:16:15 jraja Exp $";
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>
 #include <sys/ioctl.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
@@ -111,6 +112,13 @@ RCS_ID_C="$Id: in.c,v 1.11 1993/06/04 11:16:15 jraja Exp $";
 #include <netinet/in_var.h>
 
 #include <netinet/in_protos.h>
+
+/*
+ * PORT (AmiTCP_NG): SBTC_SIG_ADDRESS_CHANGE_MASK broadcast, defined in
+ * api/amiga_api.c. Declared here rather than pulling in api/amiga_api.h, which
+ * would drag the whole SocketBase definition into the IP layer for one call.
+ */
+extern void ng_signal_address_change(void);
 
 #if INET
 /*
@@ -356,9 +364,29 @@ in_control(so, cmd, data, ifp)
 		if (ifp == 0)
 			panic("in_control");
 		if (ia == (struct in_ifaddr *)0) {
+		    /*
+		     * PORT (AmiTCP_NG): hold splnet() across the whole
+		     * create-and-link sequence, mirroring the SIOCDIFADDR fix
+		     * below. The node is spliced onto in_ifaddr and
+		     * ifp->if_addrlist BEFORE ia_ifp is filled in at the end of
+		     * this block, and both lists are walked unlocked by the net
+		     * task -- ip_output's broadcast flood and in_broadcast(),
+		     * which runs on EVERY ip_output() to classify the
+		     * destination, both dereference ia->ia_ifp->if_flags with no
+		     * NULL check. The caller holds syscall_semaphore, but that is
+		     * a plain mutex and does not stop Exec preempting this task
+		     * (ObtainSyscallSemaphore raises us to the net task's
+		     * priority, not above it), so without this a packet sent
+		     * while another interface is being configured could walk onto
+		     * a half-built node and dereference a NULL ia_ifp.
+		     */
+		    spl_t s = splnet();
+
 			m = m_getclr(M_WAIT, MT_IFADDR);
-			if (m == (struct mbuf *)NULL)
+			if (m == (struct mbuf *)NULL) {
+				splx(s);
 				return (ENOBUFS);
+			}
 			if ((ia = in_ifaddr)) {
 				for ( ; ia->ia_next; ia = ia->ia_next)
 					;
@@ -385,6 +413,7 @@ in_control(so, cmd, data, ifp)
 			ia->ia_ifp = ifp;
 			if (ifp != &loif)
 				in_interfaces++;
+			splx(s);
 		}
 		break;
 
@@ -457,8 +486,22 @@ in_control(so, cmd, data, ifp)
 		    (struct sockaddr_in *) &ifr->ifr_addr, 1));
 
 	case SIOCSIFNETMASK:
+		/*
+		 * PORT (AmiTCP_NG): rekey the connected route, don't just poke the
+		 * mask field. ia_ifa.ifa_netmask points AT ia_sockmask, so changing
+		 * it in place would silently change the delete key a later
+		 * in_ifscrub() computes -- the radix node (inserted under the OLD
+		 * mask) would never be found/removed, orphaning it RTF_UP with
+		 * rt_ifa dangling once the address is scrubbed (a teardown UAF).
+		 * Scrub under the old mask first, apply the new one, then re-init to
+		 * add the connected route under the new mask (in_ifinit() no-ops for
+		 * an unnumbered 0.0.0.0 interface).
+		 */
+		in_ifscrub(ifp, ia);
 		i = ifra->ifra_addr.sin_addr.s_addr;
 		ia->ia_subnetmask = ntohl(ia->ia_sockmask.sin_addr.s_addr = i);
+		if (ia->ia_addr.sin_family == AF_INET)
+			return (in_ifinit(ifp, ia, &ia->ia_addr, 0));
 		break;
 
 	case SIOCAIFADDR:
@@ -495,6 +538,17 @@ in_control(so, cmd, data, ifp)
 		return (error);
 
 	case SIOCDIFADDR:
+	    {
+		/*
+		 * PORT (AmiTCP_NG): hold splnet() across the whole unlink+free. The
+		 * in_ifaddr / if_addrlist lists are walked unlocked by the net task
+		 * (ip_output's broadcast flood, in_iaonnetof, ifa_ifwithdstaddr,
+		 * in_primary_ifaddr, ...); without excluding those here, a walker
+		 * could dereference this ia after m_free() frees it -- a cross-task
+		 * use-after-free. splnet() is a Forbid()-equivalent here, so it stops
+		 * the net task mid-walk. (in_ifscrub -> rtinit nests its own splnet.)
+		 */
+		spl_t s = splnet();
 		in_ifscrub(ifp, ia);
 		if ((ifa = ifp->if_addrlist) == (struct ifaddr *)ia)
 			ifp->if_addrlist = ifa->ifa_next;
@@ -505,7 +559,7 @@ in_control(so, cmd, data, ifp)
 			if (ifa->ifa_next)
 				ifa->ifa_next = ((struct ifaddr *)ia)->ifa_next;
 			else
-				printf("Couldn't unlink inifaddr from ifp\n");
+				log(LOG_ERR, "in_ifscrub: couldn't unlink inifaddr from ifp\n");
 		}
 		oia = ia;
 		if (oia == (ia = in_ifaddr))
@@ -516,9 +570,17 @@ in_control(so, cmd, data, ifp)
 			if (ia->ia_next)
 				ia->ia_next = oia->ia_next;
 			else
-				printf("Didn't unlink inifadr from list\n");
+				log(LOG_ERR, "in_ifscrub: didn't unlink inifaddr from list\n");
 		}
 		(void) m_free(dtom(oia));
+		splx(s);
+		/* PORT (AmiTCP_NG): SBTC_SIG_ADDRESS_CHANGE_MASK -- an address was
+		 * removed. Raised AFTER splx() and after the address is off both
+		 * lists, so a woken application that immediately enumerates
+		 * interfaces sees the finished state rather than a half-unlinked
+		 * one, and so the signal is not sent with the net task excluded. */
+		ng_signal_address_change();
+	    }
 		break;
 
 	default:
@@ -640,6 +702,17 @@ in_ifinit(ifp, ia, sin, scrub)
 	}
 	if ((error = rtinit(&(ia->ia_ifa), (int)RTM_ADD, flags)) == 0)
 		ia->ia_flags |= IFA_ROUTE;
+	/*
+	 * PORT (AmiTCP_NG): SBTC_SIG_ADDRESS_CHANGE_MASK. Signalled from here
+	 * because in_ifinit() is the single point every address assignment passes
+	 * through -- SIOCSIFADDR, SIOCAIFADDR and SIOCSIFNETMASK all end in it --
+	 * so one call covers them without chasing each ioctl's return path.
+	 * Announced even when the route add failed: the ADDRESS did change, which
+	 * is what the application asked to be told about, and a watcher that only
+	 * heard about fully successful changes would miss exactly the cases worth
+	 * reacting to. Removal is signalled separately, from SIOCDIFADDR.
+	 */
+	ng_signal_address_change();
 	return (error);
 }
 

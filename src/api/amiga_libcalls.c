@@ -114,9 +114,27 @@ RCS_ID_C="$Id: amiga_libcalls.c,v 1.19 1993/06/11 19:01:41 too Exp $";
  * The vectors that do NOT need the socket layer -- pure utility functions the
  * library exports: inet_addr()/inet_aton() (dotted-decimal string -> 32-bit
  * address), inet_ntoa()/Inet_NtoA() (the reverse), Inet_LnaOf/Inet_NetOf, and
- * similar. inet_aton's isdigit()/isspace() use is the reason this file pulls in
- * <ctype.h> -- see the -noixemul/libnix ctype note in PORTING.md.
+ * similar.
+ *
+ * PORT (AmiTCP_NG): these parsers used <ctype.h>'s isdigit()/isspace()/etc.
+ * They must not. libnix implements those against a table reached through the
+ * undefined symbol __ctype_, which a normal program's crt0 sets up -- and the
+ * self-starting LIBS:bsdsocket.library has no crt0 at all. The very first
+ * client to call inet_aton() before anything else had brought the stack up
+ * therefore went through an uninitialised table pointer and never came back:
+ * the machine simply stopped, with no error and nothing logged. This file was
+ * the ONLY object in the whole library importing __ctype_, so replacing them
+ * with the four local tests below removes that dependency outright. They are
+ * ASCII-only, which is all an IPv4 address or a numeric host part can be.
  */
+
+/* Local, table-free character tests -- see the note above. */
+#define ng_isdigit(c)	((c) >= '0' && (c) <= '9')
+#define ng_islower(c)	((c) >= 'a' && (c) <= 'z')
+#define ng_isxdigit(c)	(ng_isdigit(c) || \
+			 ((c) >= 'a' && (c) <= 'f') || ((c) >= 'A' && (c) <= 'F'))
+#define ng_isspace(c)	((c) == ' '  || (c) == '\t' || (c) == '\n' || \
+			 (c) == '\v' || (c) == '\f' || (c) == '\r')
 
 #include <conf.h>
 
@@ -139,7 +157,6 @@ RCS_ID_C="$Id: amiga_libcalls.c,v 1.19 1993/06/11 19:01:41 too Exp $";
 #include <api/amiga_libcallentry.h>
 #include <api/allocdatabuffer.h>
 
-#include <ctype.h>
 
 /*
  * Functions which are defined in link library in unix systems
@@ -160,13 +177,13 @@ char *SAVEDS RAF2(_Inet_NtoA,
 
   CHECK_TASK2();
 
-  sprintf(libPtr->inet_ntoa,
+  sprintf(NG_CTX(libPtr)->inet_ntoa,
 	  "%ld.%ld.%ld.%ld", 
 	  (s_addr>>24) & 0xff, 
 	  (s_addr>>16) & 0xff, 
 	  (s_addr>>8) & 0xff, 
 	  s_addr & 0xff);
-  return ((char *)libPtr->inet_ntoa);
+  return ((char *)NG_CTX(libPtr)->inet_ntoa);
 }
 
 /* from inet_addr.c */
@@ -199,14 +216,14 @@ inet_aton(register const char *cp, struct in_addr *addr)
 				base = 8;
 		}
 		while ((c = *cp) != '\0') {
-			if (isascii(c) && isdigit(c)) {
+			if (ng_isdigit(c)) {
 				val = (val * base) + (c - '0');
 				cp++;
 				continue;
 			}
-			if (base == 16 && isascii(c) && isxdigit(c)) {
+			if (base == 16 && ng_isxdigit(c)) {
 				val = (val << 4) + 
-					(c + 10 - (islower(c) ? 'a' : 'A'));
+					(c + 10 - (ng_islower(c) ? 'a' : 'A'));
 				cp++;
 				continue;
 			}
@@ -228,7 +245,7 @@ inet_aton(register const char *cp, struct in_addr *addr)
 	/*
 	 * Check for trailing characters.
 	 */
-	if (*cp && (!isascii(*cp) || !isspace(*cp)))
+	if (*cp && !ng_isspace(*cp))
 		return (0);
 	/*
 	 * Concoct the address according to
@@ -274,6 +291,7 @@ ULONG SAVEDS RAF2(_inet_addr,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 	struct in_addr val;
 	(void)libPtr;
 
@@ -294,6 +312,7 @@ ULONG SAVEDS RAF2(_Inet_LnaOf,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 	(void)libPtr;
 	(void)NTOHL(s_addr);
 
@@ -316,6 +335,7 @@ ULONG SAVEDS RAF2(_Inet_NetOf,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 	(void)libPtr;
 	(void)NTOHL(s_addr);
 
@@ -339,6 +359,7 @@ ULONG SAVEDS RAF3(_Inet_MakeAddr,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 	u_long addr;
 	(void)libPtr;
 
@@ -366,6 +387,7 @@ ULONG SAVEDS RAF2(_inet_network,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 	register u_long val, base, n;
 	register char c;
 	u_long parts[4], *pp = parts;
@@ -379,13 +401,13 @@ again:
 	if (*cp == 'x' || *cp == 'X')
 		base = 16, cp++;
 	while ((c = *cp)) {
-		if (isdigit(c)) {
+		if (ng_isdigit(c)) {
 			val = (val * base) + (c - '0');
 			cp++;
 			continue;
 		}
-		if (base == 16 && isxdigit(c)) {
-			val = (val << 4) + (c + 10 - (islower(c) ? 'a' : 'A'));
+		if (base == 16 && ng_isxdigit(c)) {
+			val = (val << 4) + (c + 10 - (ng_islower(c) ? 'a' : 'A'));
 			cp++;
 			continue;
 		}
@@ -397,7 +419,7 @@ again:
 		*pp++ = val, cp++;
 		goto again;
 	}
-	if (*cp && !isspace(*cp))
+	if (*cp && !ng_isspace(*cp))
 		return (INADDR_NONE);
 	*pp++ = val;
 	n = pp - parts;

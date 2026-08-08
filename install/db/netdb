@@ -17,19 +17,58 @@ P tcp  6  TCP
 P udp  17 UDP
 
 # Services (common)
+# ng-services-v2 -- marks which set of service definitions this file carries.
+# The installer adds any it is missing on upgrade and keys off this line, so do
+# not delete it; a real service name is no good as the marker because a user may
+# well have added that same entry by hand (Miami's instructions say to for
+# aexplorer), which would make the installer think the whole set was present.
 S echo    7/udp
 S echo    7/tcp
 S daytime 13/udp
+S ftp-data 20/tcp
 S ftp     21/tcp
 S ssh     22/tcp
 S telnet  23/tcp
 S smtp    25/tcp
+S time    37/udp
+S time    37/tcp
 S domain  53/udp
 S domain  53/tcp
 S bootps  67/udp
 S bootpc  68/udp
+S tftp    69/udp
+S finger  79/tcp
 S http    80/tcp
 S pop3    110/tcp
 S ntp     123/udp
 S imap    143/tcp
 S https   443/tcp
+
+# Windows/SMB file sharing. How an Amiga most often actually moves files today
+# -- smbfs and friends against a PC or NAS. 445 is modern SMB; 137-139 are the
+# older NetBIOS ports still needed by many shares.
+S netbios-ns  137/udp
+S netbios-dgm 138/udp
+S netbios-ssn 139/tcp
+S microsoft-ds 445/tcp
+
+# Mail over TLS. YAM with AmiSSL uses these; the plain-text ports above are
+# increasingly refused by real mail providers.
+S submission 587/tcp
+S smtps    465/tcp
+S imaps    993/tcp
+S pop3s    995/tcp
+
+# Printing and logging.
+S printer 515/tcp
+S syslog  514/udp
+
+# Amiga Explorer (Cloanto). Its Windows side connects to this port on the
+# Amiga; Miami's own instructions have the user add exactly this entry by hand,
+# so ship it rather than making everyone do that. UDP is listed alongside TCP
+# for the same reason Miami's firewall recipe covers both.
+S aexplorer 356/tcp
+S aexplorer 356/udp
+
+# IRC -- AmIRC and friends.
+S irc 6667/tcp

@@ -297,3 +297,15 @@ extern STRPTR consolename ;	 int logname_changed(void *pt, LONG new);
 LOGF=LOGFILENAME ;	1 ;	Filename for the log file.
 extern STRPTR logfilename;
 { VAR_STRP, VF_RW, NULL, &logfilename, logname_changed }
+#
+LOGGING ;	1 ;	Boolean master switch for logging. When off, nothing is recorded at all and log calls are skipped at the call site.
+extern LONG log_enabled;
+{ VAR_ENUM, VF_RW, NULL, &log_enabled, boolean_enum }
+#
+LOGCON=LOGCONSOLE ;	1 ;	Boolean. Also show log messages in a console window. Off by default: the window puts itself in front of whatever you are doing. The log FILE is unaffected.
+extern LONG log_console_enabled;
+{ VAR_ENUM, VF_RW, NULL, &log_console_enabled, boolean_enum }
+#
+LOGL=LOGLEVEL ;	1 ;	Highest syslog priority written to the log: 0=emerg, 3=err, 4=warning, 5=notice, 6=info, 7=debug. Default 5.
+extern LONG log_level ;	 int loglevel_changed(void *pt, LONG new);
+{ VAR_LONG, VF_RW, NULL, &log_level, loglevel_changed }

@@ -152,14 +152,14 @@ static struct hostent * makehostent(struct SocketBase * libPtr,
   long diff;
   short i;
 
-  if ((diff = copyGenent(libPtr, &libPtr->hostents,
+  if ((diff = copyGenent(libPtr, &NG_CTX(libPtr)->hostents,
 			 (struct GenentNode *)ent)) == 0)
     return NULL; /* failed to allocate memory */
 
   /*
    * patch pointers
    */
-#define HOSTENT ((struct hostent *)libPtr->hostents.db_Addr)
+#define HOSTENT ((struct hostent *)NG_CTX(libPtr)->hostents.db_Addr)
   HOSTENT->h_name += diff;
 
   HOSTENT->h_aliases = (char **)((caddr_t)HOSTENT->h_aliases + diff);
@@ -236,14 +236,14 @@ static struct netent * makenetent(struct SocketBase * libPtr,
   long diff;
   short i;
 
-  if ((diff = copyGenent(libPtr, &libPtr->netents,
+  if ((diff = copyGenent(libPtr, &NG_CTX(libPtr)->netents,
 			 (struct GenentNode *)ent)) == 0)
     return NULL;
 
   /*
    * patch pointers
    */
-#define NETENT ((struct netent *)libPtr->netents.db_Addr)
+#define NETENT ((struct netent *)NG_CTX(libPtr)->netents.db_Addr)
   NETENT->n_name += diff;
 
   NETENT->n_aliases = (char **)((caddr_t)NETENT->n_aliases + diff);
@@ -322,14 +322,14 @@ static struct servent * makeservent(struct SocketBase * libPtr,
   long diff;
   short i;
 
-  if ((diff = copyGenent(libPtr, &libPtr->servents,
+  if ((diff = copyGenent(libPtr, &NG_CTX(libPtr)->servents,
 			 (struct GenentNode *)ent)) == 0)
     return NULL;
 
   /*
    * patch pointers
    */
-#define SERVENT ((struct servent *)libPtr->servents.db_Addr)
+#define SERVENT ((struct servent *)NG_CTX(libPtr)->servents.db_Addr)
   SERVENT->s_name += diff;
 
   SERVENT->s_aliases = (char **)((caddr_t)SERVENT->s_aliases + diff);
@@ -430,14 +430,14 @@ static struct protoent * makeprotoent(struct SocketBase * libPtr,
   long diff;
   short i;
 
-  if ((diff = copyGenent(libPtr, &libPtr->protoents,
+  if ((diff = copyGenent(libPtr, &NG_CTX(libPtr)->protoents,
 			 (struct GenentNode *)ent)) == 0)
     return NULL;
 
   /*
    * patch pointers
    */
-#define PROTOENT ((struct protoent *)libPtr->protoents.db_Addr)
+#define PROTOENT ((struct protoent *)NG_CTX(libPtr)->protoents.db_Addr)
   PROTOENT->p_name += diff;
 
   PROTOENT->p_aliases = (char **)((caddr_t)PROTOENT->p_aliases + diff);
@@ -527,8 +527,8 @@ VOID SAVEDS RAF2(_setnetent,
   CHECK_TASK_VOID();
   (void)stay_open;
   LOCK_R_NDB(NDB);
-  libPtr->netentCursor = NDB->ndb_Networks.mlh_Head;
-  libPtr->netentGen = NDB->ndb_Generation;
+  NG_CTX(libPtr)->netentCursor = NDB->ndb_Networks.mlh_Head;
+  NG_CTX(libPtr)->netentGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -539,7 +539,7 @@ VOID SAVEDS RAF1(_endnetent,
 {
 #endif
   CHECK_TASK_VOID();
-  libPtr->netentCursor = NULL;
+  NG_CTX(libPtr)->netentCursor = NULL;
 }
 
 /* getnetent (LVO -552): return the next network entry, or NULL at end. */
@@ -554,18 +554,18 @@ struct netent * SAVEDS RAF1(_getnetent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->netentCursor == NULL ||		/* implicit setnetent(), or */
-      libPtr->netentGen != NDB->ndb_Generation) {	/* stale after reset_netdb() */
-    libPtr->netentCursor = NDB->ndb_Networks.mlh_Head;
-    libPtr->netentGen = NDB->ndb_Generation;
+  if (NG_CTX(libPtr)->netentCursor == NULL ||		/* implicit setnetent(), or */
+      NG_CTX(libPtr)->netentGen != NDB->ndb_Generation) {	/* stale after reset_netdb() */
+    NG_CTX(libPtr)->netentCursor = NDB->ndb_Networks.mlh_Head;
+    NG_CTX(libPtr)->netentGen = NDB->ndb_Generation;
   }
-  node = (struct NetentNode *)libPtr->netentCursor;
+  node = (struct NetentNode *)NG_CTX(libPtr)->netentCursor;
   if (node->nn_Node.mln_Succ == NULL) {		/* tail sentinel -> end */
     UNLOCK_NDB(NDB);
     writeErrnoValue(libPtr, 0);
     return NULL;
   }
-  libPtr->netentCursor = node->nn_Node.mln_Succ;	/* advance */
+  NG_CTX(libPtr)->netentCursor = node->nn_Node.mln_Succ;	/* advance */
   net = makenetent(libPtr, node);
   UNLOCK_NDB(NDB);
   return net;
@@ -581,8 +581,8 @@ VOID SAVEDS RAF2(_setprotoent,
   CHECK_TASK_VOID();
   (void)stay_open;
   LOCK_R_NDB(NDB);
-  libPtr->protoentCursor = NDB->ndb_Protocols.mlh_Head;
-  libPtr->protoentGen = NDB->ndb_Generation;
+  NG_CTX(libPtr)->protoentCursor = NDB->ndb_Protocols.mlh_Head;
+  NG_CTX(libPtr)->protoentGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -593,7 +593,7 @@ VOID SAVEDS RAF1(_endprotoent,
 {
 #endif
   CHECK_TASK_VOID();
-  libPtr->protoentCursor = NULL;
+  NG_CTX(libPtr)->protoentCursor = NULL;
 }
 
 /* getprotoent (LVO -570): return the next protocol entry, or NULL at end. */
@@ -608,18 +608,18 @@ struct protoent * SAVEDS RAF1(_getprotoent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->protoentCursor == NULL ||
-      libPtr->protoentGen != NDB->ndb_Generation) {
-    libPtr->protoentCursor = NDB->ndb_Protocols.mlh_Head;
-    libPtr->protoentGen = NDB->ndb_Generation;
+  if (NG_CTX(libPtr)->protoentCursor == NULL ||
+      NG_CTX(libPtr)->protoentGen != NDB->ndb_Generation) {
+    NG_CTX(libPtr)->protoentCursor = NDB->ndb_Protocols.mlh_Head;
+    NG_CTX(libPtr)->protoentGen = NDB->ndb_Generation;
   }
-  node = (struct ProtoentNode *)libPtr->protoentCursor;
+  node = (struct ProtoentNode *)NG_CTX(libPtr)->protoentCursor;
   if (node->pn_Node.mln_Succ == NULL) {
     UNLOCK_NDB(NDB);
     writeErrnoValue(libPtr, 0);
     return NULL;
   }
-  libPtr->protoentCursor = node->pn_Node.mln_Succ;
+  NG_CTX(libPtr)->protoentCursor = node->pn_Node.mln_Succ;
   proto = makeprotoent(libPtr, node);
   UNLOCK_NDB(NDB);
   return proto;
@@ -635,8 +635,8 @@ VOID SAVEDS RAF2(_setservent,
   CHECK_TASK_VOID();
   (void)stay_open;
   LOCK_R_NDB(NDB);
-  libPtr->serventCursor = NDB->ndb_Services.mlh_Head;
-  libPtr->serventGen = NDB->ndb_Generation;
+  NG_CTX(libPtr)->serventCursor = NDB->ndb_Services.mlh_Head;
+  NG_CTX(libPtr)->serventGen = NDB->ndb_Generation;
   UNLOCK_NDB(NDB);
 }
 
@@ -647,7 +647,7 @@ VOID SAVEDS RAF1(_endservent,
 {
 #endif
   CHECK_TASK_VOID();
-  libPtr->serventCursor = NULL;
+  NG_CTX(libPtr)->serventCursor = NULL;
 }
 
 /* getservent (LVO -588): return the next service entry, or NULL at end. */
@@ -662,18 +662,18 @@ struct servent * SAVEDS RAF1(_getservent,
   CHECK_TASK2();
 
   LOCK_R_NDB(NDB);
-  if (libPtr->serventCursor == NULL ||
-      libPtr->serventGen != NDB->ndb_Generation) {
-    libPtr->serventCursor = NDB->ndb_Services.mlh_Head;
-    libPtr->serventGen = NDB->ndb_Generation;
+  if (NG_CTX(libPtr)->serventCursor == NULL ||
+      NG_CTX(libPtr)->serventGen != NDB->ndb_Generation) {
+    NG_CTX(libPtr)->serventCursor = NDB->ndb_Services.mlh_Head;
+    NG_CTX(libPtr)->serventGen = NDB->ndb_Generation;
   }
-  node = (struct ServentNode *)libPtr->serventCursor;
+  node = (struct ServentNode *)NG_CTX(libPtr)->serventCursor;
   if (node->sn_Node.mln_Succ == NULL) {
     UNLOCK_NDB(NDB);
     writeErrnoValue(libPtr, 0);
     return NULL;
   }
-  libPtr->serventCursor = node->sn_Node.mln_Succ;
+  NG_CTX(libPtr)->serventCursor = node->sn_Node.mln_Succ;
   serv = makeservent(libPtr, node);
   UNLOCK_NDB(NDB);
   return serv;

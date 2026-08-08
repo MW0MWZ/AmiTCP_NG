@@ -155,6 +155,8 @@ struct	ipstat {
 extern struct	ipstat	ipstat;
 extern struct	ipq	ipq;			/* ip reass. queue */
 extern u_short	ip_id;				/* ip packet ctr, for ids */
+/* PORT (AmiTCP_NG): configurable default TTL, SBTC_IP_DEFAULT_TTL. */
+extern int	ip_defttl;
 
 struct	mbuf *ip_srcroute(void);
 #endif

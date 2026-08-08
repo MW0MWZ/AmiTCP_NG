@@ -37,6 +37,14 @@ build_one DeleteNetRoute        src/tools/DeleteNetRoute.c
 build_one GetNetStatus          src/tools/GetNetStatus.c
 build_one ShowNetStatus         src/tools/ShowNetStatus.c
 build_one ping                  src/tools/ping.c
+build_one netstat               src/tools/netstat.c
+build_one tftp                  src/tools/tftp.c
+build_one nslookup              src/tools/nslookup.c
+build_one ftp                   src/tools/ftp.c
+build_one sntp                  src/tools/sntp.c
+
+# Diagnostics. Compiled always; PACKAGED only into -beta releases (build-release.sh).
+build_one rxprofile             src/tools/rxprofile.c
 
 # The docker builds run as root and leave build/ root-owned; hand it back so the host
 # user can stage the release tree.
@@ -44,7 +52,7 @@ build_one ping                  src/tools/ping.c
 
 echo ">>> tools built:"
 for t in Online Offline AddNetInterface ConfigureNetInterface RemoveNetInterface \
-         NetShutdown AddNetRoute DeleteNetRoute GetNetStatus ShowNetStatus ping; do
+         NetShutdown AddNetRoute DeleteNetRoute GetNetStatus ShowNetStatus ping netstat tftp nslookup ftp sntp rxprofile; do
   if [ -f "$ROOT/build/$t" ]; then
     printf '    %-22s %s bytes\n' "$t" "$(wc -c < "$ROOT/build/$t")"
   else

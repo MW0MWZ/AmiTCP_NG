@@ -100,6 +100,7 @@ RCS_ID_C="$Id: if_loop.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/errno.h>
@@ -193,7 +194,7 @@ looutput(ifp, m, dst, rt)
 		break;
 #endif
 	default:
-		printf("lo%ld: can't handle af%ld\n", ifp->if_unit,
+		log(LOG_WARNING, "lo%ld: can't handle af%ld\n", ifp->if_unit,
 			dst->sa_family);
 		m_freem(m);
 		return (EAFNOSUPPORT);

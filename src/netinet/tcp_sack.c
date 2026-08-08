@@ -146,9 +146,15 @@ tcp_sack_snd_trim(tp)
 }
 
 /* Insert [start,end) into the sorted, merged snd_sackblks list, coalescing any
- * blocks it overlaps or touches. Bounded: if the list is full the extra island
- * is dropped (graceful -- worse case we retransmit a range we needn't, never
- * corrupt). Caller guarantees snd_una <= start < end <= snd_max. */
+ * blocks it overlaps or touches. Bounded: if the list is full an island is
+ * dropped rather than overrunning the array -- never corrupt. The array is
+ * sorted ascending and walked low-to-high, so entries are appended lowest
+ * first and the cap can only bite once n has filled: what is lost is whichever
+ * island sorts LAST (the new block, or the tail of the existing ones), i.e. the
+ * tracking furthest from snd_una. Forgetting that far-out data was already
+ * SACKed means we may retransmit a range that in fact arrived -- efficiency
+ * only, and only past TCP_MAX_SACK_SND simultaneous islands.
+ * Caller guarantees snd_una <= start < end <= snd_max. */
 static void
 tcp_sack_snd_insert(tp, start, end)
 	struct tcpcb *tp;
@@ -460,8 +466,19 @@ tcp_sack_prr_ack(tp, acked, prev_sacked)
 		 * The product can exceed 32 bits with RFC 1323 scaled windows, so it
 		 * is formed in 64 bits before the divide brings it back into range.
 		 */
-		sndcnt = (long)(((unsigned long long)tp->prr_delivered *
-		    tp->snd_ssthresh + (fs - 1)) / fs) - (long)tp->prr_out;
+		unsigned long long q = ((unsigned long long)tp->prr_delivered *
+		    tp->snd_ssthresh + (fs - 1)) / fs;
+
+		/*
+		 * Clamp before narrowing: the divide brings the product back into
+		 * range for every window this stack can currently negotiate, but
+		 * converting a quotient above LONG_MAX to a signed long is
+		 * implementation-defined, and sndcnt feeds snd_cwnd. Cheap
+		 * insurance if the window ceiling is ever raised further.
+		 */
+		if (q > 0x7FFFFFFFULL)
+			q = 0x7FFFFFFFULL;
+		sndcnt = (long)q - (long)tp->prr_out;
 	} else {
 		/* SSRB: cap the increase so a burst of ACKs can't overshoot ssthresh. */
 		long lim = (long)tp->prr_delivered - (long)tp->prr_out;

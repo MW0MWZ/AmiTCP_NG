@@ -188,6 +188,19 @@ LONG SAVEDS RAF4(_IoctlSocket,
     error = ENOTTY;
     goto Return;
   }
+  /*
+   * PORT (AmiTCP_NG) security fix: every command with a non-zero parameter
+   * size reads or writes through the caller's `data`. Stock BSD relied on
+   * copyin/copyout to fault safely on a bad pointer; there is no MMU and no
+   * user/kernel boundary here, so a NULL from a careless caller (say
+   * IoctlSocket(fd, FIONREAD, NULL) -- FIONREAD is _IOR, so the bzero below
+   * runs unconditionally) would write over the CPU exception vectors at
+   * address 0. Reject it instead.
+   */
+  if (data == NULL) {
+    error = EFAULT;
+    goto Return;
+  }
   if (!(cmd & IOC_IN) && cmd & IOC_OUT)
     /*
      * Zero the buffer so the user always
@@ -205,7 +218,10 @@ LONG SAVEDS RAF4(_IoctlSocket,
     /*
      * data is a struct Task **, find corresponding SocketBase * and set owner
      */
-    so->so_pgid = FindSocketBase(*(struct Task **)data);
+    /* PORT (AmiTCP_NG): FindCallerBase, not FindSocketBase -- a task sharing a
+     * base is not in socketBaseList, so the opener-only lookup returned NULL
+     * and this silently set NO owner while still reporting success. */
+    so->so_pgid = FindCallerBase(*(struct Task **)data);
     goto Return;
     
   case FIOGETOWN:
@@ -327,7 +343,12 @@ LONG SAVEDS RAF7(_WaitSelect,
   ULONG sigmask = sigmp ? *sigmp : 0;
 
   struct newselbuf * newselbuf;
-  
+  /* PORT (AmiTCP_NG): WaitSelect drives the sleep primitives directly rather
+   * than through tsleep(), so it needs its own per-call context -- same reason:
+   * the port and its signal bit must belong to the task that blocks here. */
+  struct ng_sleepctx sc;
+  int sc_ready = 0;
+
   CHECK_TASK();
 
   if (nfds > libPtr->dTableSize)
@@ -354,11 +375,11 @@ LONG SAVEDS RAF7(_WaitSelect,
    */
 
   obitsize = howmany(nfds, NFDBITS) * sizeof (fd_mask);
-  if (allocDataBuffer(&libPtr->selitems, 3 * obitsize) == FALSE) {
+  if (allocDataBuffer(&NG_CTX(libPtr)->selitems, 3 * obitsize) == FALSE) {
     error = ENOMEM;
     goto Return;
   }
-  obits = (fd_mask *)libPtr->selitems.db_Addr;
+  obits = (fd_mask *)NG_CTX(libPtr)->selitems.db_Addr;
 
   aligned_bzero((caddr_t)obits, 3 * obitsize);
 
@@ -367,7 +388,7 @@ LONG SAVEDS RAF7(_WaitSelect,
    *	which are already true.  Clearing uu_sb
    *	will keep selenter from doing anything.
    */
-  libPtr->p_sb = 0;
+  NG_CTX(libPtr)->p_sb = 0;
   error = selscan(libPtr, readfds, writefds, exeptfds,
 		  obits, nfds, &retval, &selitemcount);
 
@@ -378,15 +399,21 @@ LONG SAVEDS RAF7(_WaitSelect,
     if (timeout == NULL || timeout->tv_secs != 0L || timeout->tv_micro != 0L) {
 	
       /*
-       * Send timeout if there is any.
+       * Build this call's sleep context, then send the timeout if there is one.
        */
+      if (ng_sleepctx_init(&sc, libPtr) != 0) {
+	error = ENOMEM;
+	goto Return;
+      }
+      sc_ready = 1;
+
       if (timeout)
-	tsleep_send_timeout(libPtr, timeout);
+	tsleep_send_timeout(&sc, timeout);
 
       /*
        * Now, make sure there is room for all the selitems...
        */
-      if (allocDataBuffer(&libPtr->selitems,
+      if (allocDataBuffer(&NG_CTX(libPtr)->selitems,
 			  3 * obitsize + sizeof (struct newselbuf) +
 			  selitemcount * sizeof(struct newselitem)) == FALSE) {
 	error = ENOMEM;
@@ -396,8 +423,8 @@ LONG SAVEDS RAF7(_WaitSelect,
        * We need to clear obits again _if_ the memory area for it has 
        * changed.
        */
-      if ((fd_mask *)libPtr->selitems.db_Addr != obits) {
-	obits = (fd_mask *)libPtr->selitems.db_Addr;
+      if ((fd_mask *)NG_CTX(libPtr)->selitems.db_Addr != obits) {
+	obits = (fd_mask *)NG_CTX(libPtr)->selitems.db_Addr;
 	aligned_bzero((caddr_t)obits, 3 * obitsize);
       }
       newselbuf = (struct newselbuf *)((caddr_t)obits + (3 * obitsize));
@@ -413,7 +440,7 @@ LONG SAVEDS RAF7(_WaitSelect,
 	
 	newselbuf->s_state = SB_WILLWAIT;
 	newselbuf->s_count = 0;
-	libPtr->p_sb = newselbuf;
+	NG_CTX(libPtr)->p_sb = newselbuf;
 	
 	error = selscan(libPtr, readfds, writefds, exeptfds,
 			obits, nfds, &retval, &selitemcount);
@@ -436,11 +463,11 @@ LONG SAVEDS RAF7(_WaitSelect,
 	}
 	else {
 	  newselbuf->s_state = SB_WAITING;
-	  tsleep_enter(libPtr, (caddr_t)newselbuf, "select");
+	  tsleep_enter(&sc, (caddr_t)newselbuf, "select");
 	  ReleaseSemaphore(&select_semaphore);
 	  /* ReleaseSemaphore(&syscall_semaphore); don't have this */
 	  
-	  error = tsleep_main(libPtr, sigmask);
+	  error = tsleep_main(&sc, libPtr, sigmask);
 	  
 	  /* ObtainSemaphore(&syscall_semaphore); see above */
 	  ObtainSemaphore(&select_semaphore);
@@ -468,7 +495,7 @@ LONG SAVEDS RAF7(_WaitSelect,
 	 *	Scan for true conditions. Clearing uu_sb
 	 *	will keep selenter from doing anything.
 	 */
-	libPtr->p_sb = 0;
+	NG_CTX(libPtr)->p_sb = 0;
 	error = selscan(libPtr, readfds, writefds, exeptfds,
 			obits, nfds, &retval, &selitemcount);
 	if (error || retval)
@@ -476,12 +503,16 @@ LONG SAVEDS RAF7(_WaitSelect,
       } /* while (TRUE) */	
 
       if (timeout)		/* abort the timeout if any */
-	tsleep_abort_timeout(libPtr, timeout);
+	tsleep_abort_timeout(&sc, timeout);
     }
   }
 
  Return:
-  libPtr->p_sb = 0;
+  /* Reclaim the timer request and the signal bit before this frame dies -- an
+   * outstanding request would be written back into a dead stack. */
+  if (sc_ready)
+    ng_sleepctx_done(&sc);
+  NG_CTX(libPtr)->p_sb = 0;
 
 #define	putbits(name, x) \
   if (name) { \
@@ -524,6 +555,42 @@ selscan(struct SocketBase *p,
 	int n = 0;
 	int error = 0;
 	u_int obitsize = howmany(nfd, NFDBITS); /* in longwords */
+	/*
+	 * PORT (AmiTCP_NG) fix: take ONE consistent snapshot of the descriptor
+	 * table and use only that for the whole scan.
+	 *
+	 * dTable and dTableSize are a pair (the fd_mask bitmap lives inside the
+	 * same allocation, at dTable + dTableSize), and setdtablesize() can replace
+	 * both from another task on a shared base. This function is the ONE reader
+	 * that cannot take the syscall semaphore -- _WaitSelect blocks, and holding
+	 * a single global semaphore across a block would stall the whole stack -- so
+	 * it pairs with the Forbid() around setdtablesize()'s publish instead.
+	 *
+	 * Forbid() covers only the snapshot, not the scan below: the scan calls
+	 * soo_select() per descriptor and must not run with task switching disabled.
+	 * That is why the table setdtablesize() replaces is RETIRED rather than
+	 * freed -- this snapshot may outlive the swap, and a freed pointer here
+	 * would be a use-after-free.
+	 */
+	struct socket **dtab;
+	WORD dtabsize;
+
+	Forbid();
+	dtab     = p->dTable;
+	dtabsize = p->dTableSize;
+	Permit();
+
+	/*
+	 * Re-clamp against the size that belongs to THIS snapshot. _WaitSelect()
+	 * clamped nfd against dTableSize once, unlocked, before calling us; a
+	 * shrink landing between that clamp and the snapshot above would leave nfd
+	 * describing the OLD, larger table while dtab points at the new, smaller
+	 * one -- and the scan below would index past its end. Narrow (a descriptor
+	 * being selected on is normally live, which blocks a shrink below it) but
+	 * free to close.
+	 */
+	if (nfd > (int)dtabsize)
+		nfd = (int)dtabsize;
 
 	for (which = 0; which < 3; which++) {
 		switch (which) {
@@ -546,7 +613,7 @@ selscan(struct SocketBase *p,
 			bits = cbits->fds_bits[i/NFDBITS];
 			while ((j = ffs(bits)) && i + --j < nfd) {
 				bits &= ~(1 << j);
-				so = p->dTable[i + j];
+				so = dtab[i + j];	/* the snapshot, not the live field */
 				if (so == NULL) {
 				  error = EBADF;
 				  break;
@@ -574,7 +641,7 @@ selscan(struct SocketBase *p,
 void selenter(struct SocketBase *	p,
 	      struct newselitem **	hdr)
 {
-	register struct newselbuf *sb = p->p_sb;
+	register struct newselbuf *sb = NG_CTX(p)->p_sb;
 
 	if (sb) {
 	    register struct newselitem **sip = hdr;
@@ -704,6 +771,23 @@ countSockets(struct SocketBase * libPtr, struct socket * so)
   return count;
 }
 
+/*
+ * closeSocketLocked() -- the body of CloseSocket(), for callers that ALREADY
+ * hold the syscall_semaphore.
+ *
+ * PORT (AmiTCP_NG) fix: this exists because syscall_semaphore is a single
+ * GLOBAL SignalSemaphore, and closing a socket can block: soclose() honours
+ * SO_LINGER by calling tsleep(), whose contract is that the caller holds that
+ * semaphore EXACTLY ONCE -- it does one ReleaseSemaphore() before sleeping and
+ * one ObtainSemaphore() after. A caller that obtained it and then called the
+ * public CloseSocket() would nest it (1 -> 2), so tsleep's single release only
+ * drops 2 -> 1: the task keeps ownership for the whole linger wait and every
+ * other task in the system blocks in any socket call until it finishes --
+ * indefinitely, if the peer never completes the close handshake. Sharing this
+ * helper keeps the nest count at exactly one on every path.
+ */
+static int closeSocketLocked(struct SocketBase *libPtr, LONG fd);
+
 LONG SAVEDS RAF2(_CloseSocket,
 		 struct SocketBase *,	libPtr,	a6,
 		 LONG,			fd,	d0)
@@ -712,10 +796,21 @@ LONG SAVEDS RAF2(_CloseSocket,
 #endif
 
   register int error;
-  struct socket *so;
 
   CHECK_TASK();
   ObtainSyscallSemaphore(libPtr);
+
+  error = closeSocketLocked(libPtr, fd);
+
+  ReleaseSyscallSemaphore(libPtr);
+  API_STD_RETURN(error, 0);
+}
+
+static int
+closeSocketLocked(struct SocketBase *libPtr, LONG fd)
+{
+  register int error;
+  struct socket *so;
 
   /*
    * PORT (AmiTCP_NG) security fix: validate fd BEFORE touching the
@@ -745,15 +840,41 @@ LONG SAVEDS RAF2(_CloseSocket,
     if ((error = libPtr->fdCallback(fd, FDCB_FREE)))
       goto Return;
 
-  FD_CLR(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
-
   if ((error = getSock(libPtr, fd, &so))) {
 /*    error = ENOTSOCK; -- well, bit set, but socket == NULL */
     error = 0; /* ignore silently */
+    /* Bit set with no socket behind it: release the descriptor anyway, or it
+     * would stay marked in use with nothing to close and sdFind() would never
+     * offer it again. */
+    FD_CLR(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
     goto Return;
   }
   if (so->so_pgid == libPtr && countSockets(libPtr, so) == 1) 
     so->so_pgid = NULL;		/* not ours any more */
+
+  /*
+   * Release the descriptor -- BOTH the table slot and the usage bitmask --
+   * BEFORE closing, not after.
+   *
+   * PORT (AmiTCP_NG): soclose() can block. A lingering close sleeps in
+   * tsleep(), which releases syscall_semaphore, so with the base shared
+   * another task can be inside this function on the SAME fd while we wait.
+   * Whichever half of the descriptor is left standing across that window is
+   * the one that bites:
+   *   - leave the table slot set and the second closer's getSock() hands it
+   *     the same socket, it decrements the reference count a second time and
+   *     calls soclose() on a socket already being closed -- a double detach
+   *     and a double free.
+   *   - clear the slot only afterwards and, if the fd was meanwhile reissued
+   *     by sdFind() to somebody else's socket(), the assignment wipes THEIR
+   *     entry: a socket referenced by nothing and a descriptor stuck in use.
+   * Releasing both up front avoids each: the fd is free the moment close()
+   * is called, which is what close() is supposed to mean anyway, and the
+   * socket finishes lingering with nothing pointing at it. `so` is already
+   * in hand, so the close below does not need the table.
+   */
+  libPtr->dTable[fd] = NULL;
+  FD_CLR(fd, (fd_set *)(libPtr->dTable + libPtr->dTableSize));
 
   /*
    * Decrease the reference count of a socket (AmiTCP addition) and return if
@@ -762,15 +883,8 @@ LONG SAVEDS RAF2(_CloseSocket,
   if (--so->so_refcnt <= 0)
     error = soclose(so);
 
-  /*
-   * now clear socket from descriptor table. Socket usage bitmask has been
-   * cleared earlier
-   */
-  libPtr->dTable[fd] = NULL;
-
- Return: 
-  ReleaseSyscallSemaphore(libPtr);
-  API_STD_RETURN(error, 0);
+ Return:
+  return error;
 }
 
 
@@ -779,6 +893,70 @@ struct SocketNode {
   LONG			sn_Id;
   struct socket *	sn_Socket;
 };
+
+/*
+ * reapReleasedSockets() -- close and free any socket that was handed off with
+ * ReleaseSocket()/ReleaseCopyOfSocket() but never claimed by a matching
+ * ObtainSocket().
+ *
+ * PORT (AmiTCP_NG) fix: nothing swept releasedSocketList. UL_Close() closes the
+ * sockets still in a departing opener's dTable, but a released socket is by
+ * definition no longer in anyone's dTable -- ownership sits in the list node --
+ * so if the intended recipient never launches, crashes first, or simply never
+ * calls ObtainSocket(), the struct socket, its buffers AND the AllocMem'd
+ * SocketNode stay live with nothing able to reclaim them. The SocketNode in
+ * particular is system memory, not stack-pool memory, so it is lost to the
+ * machine (not merely to us) until a reboot.
+ *
+ * Called from deinit_all() immediately after api_hide(). That placement is
+ * deliberate and load-bearing: deinit_all() runs sana_deinit(), timer_deinit()
+ * and then mbdeinit() -- which FreeMem()s the entire mbuf pool -- BEFORE
+ * api_deinit()/ELL_Expunge() is ever reached. Reaping at expunge time (the
+ * obvious-looking spot) would call soclose() -> sbrelease() -> m_freem() against
+ * an already-freed pool, with the timers gone and logging shut down. Here the
+ * stack is still fully up, so the sockets get a real protocol teardown, while
+ * api_hide() has already stopped any new opener from adding to the list.
+ *
+ * No syscall_semaphore is taken, and none is needed: soclose()'s SO_LINGER
+ * branch bails out via `FindCallerBase(FindTask(NULL)) == NULL -> goto drop`
+ * for any caller that is not an application task, and we always run on
+ * AmiTCP_Task, which is never in socketBaseList. tsleep() -- the reason that
+ * semaphore's nesting discipline exists at all -- is therefore unreachable from
+ * here. The visible consequence is that an unclaimed socket with SO_LINGER set
+ * is closed abruptly at shutdown instead of honouring the linger wait, which is
+ * the only sensible behaviour during teardown anyway.
+ *
+ * Caveat, pre-existing and not introduced here: on the panic() path deinit_all()
+ * runs WITHOUT the graceful-shutdown loop that first drives every other opener's
+ * count down, so an application task could in principle still be adding to the
+ * list as we drain it. The list stays structurally consistent regardless (same
+ * Forbid() discipline every other user of it follows), and that path already
+ * frees the whole mbuf pool out from under any surviving task.
+ */
+void
+reapReleasedSockets(void)
+{
+  struct SocketNode *sn;
+
+  /*
+   * Forbid() only around the list surgery, never across soclose(): that can
+   * linger and sleep, which would break the Forbid() anyway. Unlink one node
+   * at a time and close it outside the critical section.
+   */
+  Forbid();
+  while ((sn = (struct SocketNode *)RemHead((struct List *)&releasedSocketList))
+	 != NULL) {
+    struct socket *so = sn->sn_Socket;
+    Permit();
+
+    FreeMem(sn, sizeof (struct SocketNode));
+    if (so != NULL && --so->so_refcnt <= 0)
+      soclose(so);			/* drops the reference the node held */
+
+    Forbid();
+  }
+  Permit();
+}
 
 /*
  * checkId() checks that there are no released sockets w/ given id.
@@ -862,8 +1040,38 @@ LONG SAVEDS RAF3(_ReleaseSocket,
       goto Return;
     }
   
-  if (so->so_pgid == libPtr && countSockets(libPtr, so) == 1) 
+  if (so->so_pgid == libPtr && countSockets(libPtr, so) == 1) {
     so->so_pgid = NULL;		/* not ours any more */
+    /*
+     * PORT (AmiTCP_NG) security fix: orphan the QUEUED CHILDREN too.
+     *
+     * sonewconn() (kern/uipc_socket2.c) gives every incoming connection its
+     * listener's owner -- `so->so_pgid = head->so_pgid` -- and copies so_state,
+     * SS_ASYNC included. Those children live on so_q0/so_q and are in NO
+     * SocketBase's dTable until accept() dequeues them, so nothing else clears
+     * them. Releasing a listening socket therefore used to hand away the parent
+     * while leaving children pointing at THIS base; if we then exit, UL_Close
+     * frees the SocketBase and sowakeup() would Signal() through it the next
+     * time data lands on a still-queued connection -- a use-after-free with no
+     * MMU to catch it.
+     *
+     * This was harmless while so_pgid was normally NULL. Defaulting the owner in
+     * _socket()/_accept() (for the async-event compatibility fix) armed it for
+     * ordinary server code, so the bookkeeping has to catch up. Note plain close
+     * is NOT affected: soclose() on a SO_ACCEPTCONN socket drains so_q0/so_q via
+     * soabort() before the base goes away, so children never outlive it there.
+     */
+    if (so->so_options & SO_ACCEPTCONN) {
+      struct socket *q;
+
+      for (q = so->so_q0; q != NULL; q = q->so_q0)
+	if (q->so_pgid == libPtr)
+	  q->so_pgid = NULL;
+      for (q = so->so_q; q != NULL; q = q->so_q)
+	if (q->so_pgid == libPtr)
+	  q->so_pgid = NULL;
+    }
+  }
   sn->sn_Id = id;
   sn->sn_Socket = so;
   libPtr->dTable[fd] = NULL;
@@ -1034,8 +1242,58 @@ LONG SAVEDS RAF3(_Dup2Socket,
       error = EBADF;
       goto Return;
     }
-    if (libPtr->dTable[fd2] != NULL)
-      CloseSocket(libPtr, fd2);
+    /*
+     * dup2(fd, fd): fd1 is already validated (getSock above) and dTable[fd2]
+     * already holds `so` with its reference counted, so this is a no-op that
+     * returns fd2. Falling through would CloseSocket(fd2) -- freeing the very
+     * socket we then reinstall as a dangling pointer (use-after-free) -- so
+     * short-circuit here, matching POSIX dup2 semantics.
+     */
+    if (fd1 == fd2)
+      goto Return;			/* error == 0, returns fd2 */
+    /*
+     * closeSocketLocked(), NOT the public CloseSocket(): we already hold the
+     * syscall_semaphore, and nesting it across a close that may linger would
+     * defeat tsleep's single release and stall every task in the system for
+     * the whole linger wait. See the comment on closeSocketLocked().
+     */
+    if (libPtr->dTable[fd2] != NULL) {
+      closeSocketLocked(libPtr, fd2);
+      /*
+       * PORT (AmiTCP_NG): that close may have SLEPT -- a lingering socket
+       * waits in tsleep(), which releases syscall_semaphore -- and it releases
+       * fd2 before closing, so with the base shared another task's socket()
+       * can legitimately have been handed fd2 while we waited. Overwriting it
+       * would discard that task's socket with nothing left referencing it, and
+       * leave it using a descriptor that now points at ours. Refuse instead:
+       * the descriptor we were asked to reuse is no longer ours to reuse.
+       */
+      if (FD_ISSET(fd2, (fd_set *)(libPtr->dTable + libPtr->dTableSize)) ||
+	  libPtr->dTable[fd2] != NULL) {
+	error = EBADF;
+	goto Return;
+      }
+      /*
+       * The same sleep invalidates fd1. `so` was captured by the getSock()
+       * above, BEFORE the close, and holds no reference -- so a task sharing
+       * this base could have closed fd1 while we waited, dropping the last
+       * reference and freeing the socket outright (soclose -> sofree -> FREE).
+       * It could equally have closed it and had the descriptor reissued to a
+       * different socket, which a bare getSock() would not notice. Re-validate
+       * the pointer, not just the descriptor. Failing loudly beats duplicating
+       * whatever fd1 happens to hold now, or taking a reference on freed
+       * memory. Deliberately not done on the fd2 == -1 path above: sdFind()
+       * cannot sleep, so there is no window there.
+       */
+      if (fd1 != -1) {
+	struct socket *so2;
+
+	if (getSock(libPtr, fd1, &so2) != 0 || so2 != so) {
+	  error = EBADF;
+	  goto Return;
+	}
+      }
+    }
     /*
      * Check if the fd is free on the link library
      */

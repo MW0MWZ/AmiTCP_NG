@@ -115,7 +115,13 @@ long count = 0;
 int
 ultoa(unsigned long ul,char *buffer)
 {
-  static char buf[10];
+  /* buf[0] holds the '\0' sentinel; digits are written from buf[1] up. A 32-bit
+   * ULONG has up to 10 decimal digits (ULONG_MAX = 4294967295), so we need 11
+   * bytes: 1 sentinel + 10 digits. The old buf[10] overflowed by one byte on
+   * buf[10] for any value >= 1e9 (a static-BSS corruptor on no-MMU, reachable
+   * via a ShowNetStatus/ARexx query of a byte counter that has crossed 1 GB, or
+   * any negative LONG reinterpreted unsigned). */
+  static char buf[11];
   char *p;
   int len;
 
@@ -368,6 +374,18 @@ getroutes(struct CSource *args, UBYTE **errstrp, struct CSource *res)
   }
 
   DB(log(LOG_DEBUG, "getroutes: found %ld routes", routes));
+
+  /*
+   * PORT (AmiTCP_NG): return early on an empty result, as the sibling
+   * getsockets() already does. Without it, querying a family with no routes
+   * reaches bsd_malloc(0) -- AllocVec(0) -- and a NULL return is reported to
+   * the caller as "Memory exhausted", a misleading error for what is simply an
+   * empty list.
+   */
+  if (routes == 0) {
+    splx(s);
+    return RETURN_OK;
+  }
 
   /* Allocate memory for entries */
   pr = mem = (struct printroute *)

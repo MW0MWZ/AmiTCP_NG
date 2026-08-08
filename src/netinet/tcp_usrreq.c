@@ -219,7 +219,19 @@ tcp_usrreq(so, req, m, nam, control)
 	}
 	if (inp) {
 		tp = intotcpcb(inp);
-		/* WHAT IF TP IS 0? */
+		/*
+		 * tp cannot be 0 here: every inpcb reachable at request time has its
+		 * inp_ppcb set. tcp_attach()'s only failure path (tcp_newtcpcb() ==
+		 * NULL) calls in_pcbdetach() before returning, which frees the inpcb
+		 * and clears so_pcb -- so a failed attach never leaves a live inpcb
+		 * with a null tcpcb; and tcp_close() clears inp_ppcb only immediately
+		 * before in_pcbdetach() with no yield between (single cooperative
+		 * task). (Verified: 4.1.5 review, candidate T-L2.)
+		 */
+#if DIAGNOSTIC
+		if (tp == 0)
+			panic("tcp_usrreq: null tcpcb");
+#endif
 #ifdef KPROF
 		tcp_acounts[tp->t_state][req]++;
 #endif

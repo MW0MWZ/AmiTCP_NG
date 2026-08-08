@@ -12,6 +12,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
       samba samba-common-bin smbclient \
       vsftpd \
+      tftpd-hpa \
       socat \
       build-essential mercurial pkg-config libfuse3-dev ca-certificates \
       procps iproute2 curl \
@@ -42,5 +43,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # SMB (445/139), FTP (21 + passive range), Fitz (17711),
 # raw TCP throughput SOURCE (9000, streams zeros) + SINK (9001, discards)
-EXPOSE 139 445 21 17711 30000-30009 9000 9001
+EXPOSE 139 445 21 69/udp 6969/udp 17711 30000-30009 9000 9001
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

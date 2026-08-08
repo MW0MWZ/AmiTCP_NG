@@ -148,6 +148,16 @@ RCS_ID_C="$Id: subr_prf.c,v 1.33 1994/02/16 06:07:33 jraja Exp $";
 #include <kern/amiga_includes.h>
 #include <api/amiga_api.h>
 #include <api/amiga_libcallentry.h>
+#include <amitcp/socketbasetags.h>	/* PORT (AmiTCP_NG): Log/Error hook messages */
+/* PORT (AmiTCP_NG): DateStamp() for LogHookMessage, CallHookPkt() to invoke the
+ * log hook. Global DOSBase/UtilityBase (kern/amiga_main.c). */
+#if __SASC
+#include <proto/dos.h>
+#include <proto/utility.h>
+#elif __GNUC__
+#include <inline/dos.h>
+#include <inline/utility.h>
+#endif
 #include <kern/amiga_log.h>
 #include <stdarg.h>
 #include <intuition/intuition.h>
@@ -162,6 +172,78 @@ RCS_ID_C="$Id: subr_prf.c,v 1.33 1994/02/16 06:07:33 jraja Exp $";
 #include <dos/rdargs.h>		/* CSource */
 
 extern void exit(int);
+
+/*
+ * PORT (AmiTCP_NG): SBTC_LOG_HOOK (tag 55). Stack-wide, not per-base: there is
+ * one logging subsystem, and the API describes the hook as replacing where log
+ * messages go rather than as a property of one library base. NULL -- the default
+ * -- means messages are recorded and displayed as usual.
+ */
+struct Hook *log_hook = NULL;
+
+/*
+ * Hand one already-formatted, already-queued message to the log hook. Returns
+ * TRUE if the hook took it, so the caller skips the file and console.
+ *
+ * CALLED FROM THE LOG TASK (log_poll(), kern/amiga_log.c), NOT from vlog().
+ * That placement is the whole point and it is a deliberate deviation from the
+ * documented behaviour, which says the hook runs "on the context of the process
+ * which called into vsyslog(), which may be the TCP/IP stack itself".
+ *
+ * It cannot run there safely. log() is called from inside splnet() regions --
+ * sana_poll() on the net task and the SIOCDIFADDR unlink in netinet/in.c are two
+ * of many -- and splnet() on this port is Forbid()-equivalent: task switching is
+ * off. Calling out to application code there means an application that blocks,
+ * waits, or opens a requester stops the scheduler for the entire machine, with
+ * no MMU and no preemption to recover. The API's "process the message as quickly
+ * as possible" warning asks the application to be careful; it does not make it
+ * safe for US to invite arbitrary code into a Forbid().
+ *
+ * Delivering from the log task instead costs the hook nothing it can observe
+ * except the calling context: the same messages arrive, in the same order, with
+ * the same text and priority, and the task is an ordinary process where blocking
+ * is merely slow rather than fatal.
+ *
+ * The hook is invoked through CallHookPkt() so the documented register
+ * convention (hook A0, reserved A2, message A1) is honoured -- calling h_Entry
+ * directly from C would pass the arguments on the stack and enter the
+ * application with garbage in those registers. Without utility.library we cannot
+ * make that call correctly, so the message falls back to the file and console
+ * rather than being dropped or the hook being called wrongly.
+ */
+int
+ng_log_hook_deliver(struct log_msg *msg)
+{
+  extern struct Library *UtilityBase;
+  struct LogHookMessage lhm;
+  ULONG len;
+
+  if (log_hook == NULL || UtilityBase == NULL)
+    return FALSE;
+
+  /*
+   * msg->chars is a count, not a terminator. Terminate inside the buffer for
+   * lhm_Message, which is documented as NUL-terminated. The clamp is written
+   * against the unsigned length so a log_buf_len of 0 cannot produce the
+   * string[-1] write a signed "len - 1" would.
+   */
+  len = (ULONG)msg->chars;
+  if (len >= log_cnf.log_buf_len)
+    len = log_cnf.log_buf_len ? log_cnf.log_buf_len - 1 : 0;
+  msg->string[len] = '\0';
+
+  lhm.lhm_Size     = sizeof lhm;
+  lhm.lhm_Priority = (LONG)LOG_PRI(msg->level);
+  lhm.lhm_Date.ds_Days = lhm.lhm_Date.ds_Minute = lhm.lhm_Date.ds_Tick = 0;
+  if (DOSBase != NULL)
+    DateStamp(&lhm.lhm_Date);
+  lhm.lhm_Tag     = NULL;
+  lhm.lhm_ID      = 0;
+  lhm.lhm_Message = (STRPTR)msg->string;
+
+  (void)CallHookPkt(log_hook, NULL, (APTR)&lhm);
+  return TRUE;
+}
 
 void
 cs_putchar(unsigned char ch, struct CSource * cs)
@@ -235,6 +317,19 @@ panic(const char *fmt,...)
   struct Library *IntuitionBase = NULL; /* local intuitionbase */
   extern struct Task *AmiTCP_Task;
 
+  /*
+   * PORT (AmiTCP_NG) fix: a second caller must NOT fall through to the
+   * requester below. `buffer` is a per-call local that is only filled inside
+   * this block, so a caller that found in_panic already set used to reach
+   * EasyRequestArgs() with uninitialised stack -- and panicES's format is
+   * "panic: %s", so it walked that garbage looking for a NUL. The decrement
+   * was also outside the block, so the second caller cleared the first
+   * caller's flag. This is a genuine two-task race, not just recursion:
+   * panic() is called both from net-task code and from library vectors
+   * running on an application's own task (see amiga_syscalls.c), and nothing
+   * here serialises in_panic. A nested caller now simply blocks and lets the
+   * first panic do the reporting.
+   */
   if (!in_panic){
 				/* If we're called previously.. */
     in_panic++;			/* We're in panic now */
@@ -247,11 +342,12 @@ panic(const char *fmt,...)
     va_start(ap, fmt);
     vcsprintf(&cs, fmt, ap);
     va_end(ap);
-    
+
     log(LOG_EMERG, "panic: %s", buffer); /* Write to log */
-  }
-  in_panic--;
-	
+    in_panic--;
+  } else
+    Wait(0L);			/* another task is already panicking */
+
   /*
    * Inform user (if log system has failed...)
    * by opening a requester to the default public screen.
@@ -328,7 +424,7 @@ panic(const char *fmt,...)
 */
 
 void
-log(unsigned long level, const char *fmt, ...)
+(log)(unsigned long level, const char *fmt, ...)
 {
   va_list ap;
 
@@ -342,14 +438,60 @@ vlog(unsigned long level, const char *fmt, va_list ap)
 {
   struct log_msg *msg;
   struct timeval now;
+
+  /*
+   * PORT (AmiTCP_NG): drop anything less important than the configured level
+   * BEFORE claiming a message buffer.
+   *
+   * The log() macro (sys/systm.h) already filtered anything that came in that
+   * way, and did it without evaluating the caller's arguments. This test is not
+   * redundant: printf() and any direct vlog() caller arrive here having bypassed
+   * the macro entirely, and filtering must not depend on which door was used.
+   *
+   * It also has to happen before GetLogMsg(): there are only log_cnf.log_bufs
+   * (4 by default) message buffers, and letting a burst of debug messages empty
+   * the pool would push out the LOG_ERR that actually mattered.
+   *
+   * LOG_PRI() masks off the facility bits, so a caller passing LOG_KERN|LOG_ERR
+   * is compared on its priority alone. log_enabled is tested separately and
+   * gates everything including LOG_EMERG, so LOGGING=OFF really does mean off.
+   */
+  if (!log_enabled || (LONG)LOG_PRI(level) > log_level)
+    return 0;
+
   if ((msg = (struct log_msg *)GetLogMsg(logReplyPort))) {
+    /*
+     * PORT (AmiTCP_NG): SBTC_LOG_HOOK is delivered by the LOG TASK
+     * (kern/amiga_log.c), not from here. See the note on ng_log_hook_deliver().
+     */
     ULONG ret;
     struct CSource cs;
     cs.CS_Buffer = msg->string;
     cs.CS_Length = log_cnf.log_buf_len;
     cs.CS_CurChr = 0;
 
-    GetSysTime(&now);
+    /*
+     * PORT (AmiTCP_NG) fix: do not timestamp through a timer.device that is not
+     * open yet. GetSysTime() is a jsr through TimerBase, which timer_init()
+     * fills in -- and timer_init() runs AFTER log_init() in both the program and
+     * the self-starting library bring-up (amiga_main.c). So every log() call made
+     * during early init jumped through a NULL base. With no MMU that reads the
+     * CPU exception vectors at address 0 and jumps to whatever is there: the
+     * machine dies silently, mid-boot, with nothing written anywhere.
+     *
+     * Nothing in normal running hits this -- which is why it survived. It fires
+     * exactly when something goes wrong early enough to be worth logging, so the
+     * one message that would have explained a failed bring-up was also the thing
+     * that killed the machine before it could be written.
+     *
+     * An unstamped message is worth far more than a dead Amiga; log_poll()
+     * formats time 0 as 1-Jan-1978, which is an obvious "before the clock
+     * started" marker rather than a plausible wrong date.
+     */
+    if (TimerBase)
+      GetSysTime(&now);
+    else
+      now.tv_secs = now.tv_micro = 0;
 
     vcsprintf(&cs, fmt, ap);
     msg->level = level & (LOG_FACMASK | LOG_PRIMASK);	/* Level of message */
@@ -509,8 +651,20 @@ vcsprintf(struct CSource *cs, const char *fmt, va_list ap)
 	cs_putchar(ch, cs);
       }
       lflag = 0;
-reswitch:	
+reswitch:
       switch (ch = *fmt++) {
+      case '\0':
+	/*
+	 * PORT (AmiTCP_NG) fix: a format string ending in a lone '%'. Without
+	 * this case the NUL fell through `default:` into `case '%'`, and since
+	 * `ch = *fmt++` had already stepped fmt PAST the terminator, the outer
+	 * loop resumed scanning beyond the end of the string -- an unbounded
+	 * read until it chanced on a '%' or NUL in adjacent memory (and any
+	 * stray '%' would then pull further va_args). No current call site can
+	 * trigger it (every format is a literal), but the formatter should not
+	 * depend on that.
+	 */
+	goto end;
       case '-':
 	leftjustify = TRUE;
 	goto reswitch;

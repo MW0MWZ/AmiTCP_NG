@@ -794,6 +794,22 @@ ng_bpf_ioctl(chan, cmd, addr)
 	d = &bpf_chan[chan];
 	if (!d->bd_inuse)
 		return (-EINVAL);
+	/*
+	 * PORT (AmiTCP_NG) security fix: the BIOC* cases that carry a parameter
+	 * read or write through the caller's `addr`, which arrives unchecked
+	 * from the public bpf_ioctl() vector. With no MMU a NULL from a careless
+	 * caller writes over the exception-vector table at address 0.
+	 * ng_bpf_read()/ng_bpf_write() already guard their buffer the same way.
+	 *
+	 * Gate on the command's encoded parameter length rather than rejecting
+	 * NULL outright: BIOCFLUSH and BIOCPROMISC are _IO (void) commands whose
+	 * case bodies never touch addr, and passing NULL for them is the
+	 * documented, exercised calling convention -- the reference
+	 * libpcap-0.8.1 shipped with the Roadshow SDK does exactly
+	 * `ioctl(p->fd, BIOCPROMISC, NULL)`.
+	 */
+	if (addr == NULL && IOCPARM_LEN(cmd) != 0)
+		return (-EFAULT);
 
 	error = 0;
 	switch (cmd) {
@@ -821,6 +837,12 @@ ng_bpf_ioctl(chan, cmd, addr)
 				size = BPF_MINBUFSIZE;
 			*(u_long *)addr = size;
 			s = splimp();
+			/* Wake any reader parked in tsleep() on this channel before
+			 * we free its buffers out from under it, mirroring
+			 * ng_bpf_close(). Not a UAF (the sleeper holds no pointer
+			 * across the sleep and re-reads bd_hbuf on wake), just
+			 * liveness -- otherwise it stays blocked until a timeout. */
+			bpf_wakeup(d);
 			bpf_freebufs(d);	/* resize buffers; keep the filter */
 			d->bd_bufsize = (int)size;
 			error = bpf_allocbufs(d);

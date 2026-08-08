@@ -46,9 +46,20 @@ struct state {
 /*
  * defines to hook variables to the library base.
  */
+/*
+ * h_errno READS the caller's resolver error. Do NOT assign through it: use
+ * set_h_errno() instead.
+ *
+ * PORT (AmiTCP_NG): assignment used to go straight through this macro, so
+ * SBTC_ERROR_HOOK -- whose whole job is to deliver error codes to the right
+ * task when library bases are shared -- could not see a single resolver error.
+ * set_h_errno() routes through writeHErrnoValue(), which offers the hook the
+ * code first and falls back to this same write when no hook is installed.
+ */
 #define h_errno (*libPtr->hErrnoPtr)
-#define _res (libPtr->res_state)
-#define res_sock (libPtr->res_socket)
+#define set_h_errno(v) writeHErrnoValue(libPtr, (v))
+#define _res (NG_CTX(libPtr)->res_state)
+#define res_sock (NG_CTX(libPtr)->res_socket)
 
 /*
  * Resolver options

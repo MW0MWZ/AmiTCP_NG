@@ -229,6 +229,10 @@ alloc_netdb(struct NetDataBase *ndb)
 
   ndb->ndb_AccessCount = 0;
   ndb->ndb_Generation = 0;
+  /* PORT (AmiTCP_NG): record the scratch buffer's real capacity; addaccessent()
+   * bounds-checks against ndb_AccessMax, which setup_accesscontroltable() then
+   * lowers to match the shrink-wrapped table. */
+  ndb->ndb_AccessMax = (LONG)(TMPACTSIZE / sizeof (struct AccessItem));
   if ((ndb->ndb_AccessTable =
        bsd_malloc(TMPACTSIZE, M_NETDB, M_WAITOK)) == NULL) {
     bsd_free(ndb, M_NETDB);
@@ -317,6 +321,20 @@ node_alloc(size_t nodesize, UBYTE *name, UBYTE **alias, int *aliasp)
       (*aliasp)++;
       nodesize += strlen((char *)*alias++) + 1 + sizeof (char*);
     }
+  }
+  /*
+   * gn_EntSize is a signed 16-bit field. Refuse an entry whose payload would
+   * overflow it: an unbounded ARexx "ADD HOST/SERVICE/NET/PROTOCOL" (the config
+   * ARexx port has no line-length cap, unlike the config-file path) could push
+   * nodesize past 32767, silently truncating gn_EntSize; a later lookup would
+   * then feed the corrupted (sign-extended) length to allocDataBuffer/copyGenent
+   * and bcopy a bogus ~4GB run into the caller's data buffer. Fail the add cleanly
+   * instead (callers map a NULL return to an out-of-memory error).
+   */
+  if (nodesize - sizeof (struct GenentNode) > 32767) {
+    log(LOG_ERR, "netdb: refusing oversized entry (%lu bytes).",
+	(unsigned long)nodesize);
+    return NULL;
   }
   gn = bsd_malloc(nodesize, M_NETDB, M_WAITOK);
   /*
@@ -623,13 +641,22 @@ adddomainent(struct NetDataBase *ndb,
   UBYTE Buffer[REPLYBUFLEN];
   LONG  BufLen = sizeof (Buffer);
   struct DomainentNode *dn;
-  short  nodesize;
+  int    nodesize;		/* an int, not a short: the size must not be
+				 * truncated before it is even range-checked */
 
   if (ReadItem(Buffer, BufLen, &rdargs->RDA_Source) <= 0) {
-    *errstrp = ERR_SYNTAX; 
+    *errstrp = ERR_SYNTAX;
     return RETURN_WARN;
   }
   nodesize = sizeof (*dn) + strlen((char *)Buffer) + 1;
+  /* Bound the payload before it is stored in the 16-bit dn_EntSize, as
+   * node_alloc() does for the other entry types. ReadItem() caps Buffer at
+   * REPLYBUFLEN so this cannot trip today; keep the guard so the field's
+   * invariant holds here too rather than by luck of the caller. */
+  if (nodesize - (int)sizeof (struct GenentNode) > 32767) {
+    *errstrp = ERR_MEMORY;
+    return RETURN_FAIL;
+  }
   if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) == NULL) {
     *errstrp = ERR_MEMORY;
     return RETURN_FAIL;
@@ -658,9 +685,46 @@ addaccessent(struct NetDataBase *ndb,
   ULONG host, mask;
   UWORD port, flags = ACF_CONTINUE;
 
-  if (ndb->ndb_AccessCount >= TMPACTSIZE / sizeof (struct AccessItem)) {
-    *errstrp = (const UBYTE *)"Too many access control items\n";
-    return retval; /* copy propagation expected */
+  /*
+   * PORT (AmiTCP_NG) security fix: bound against the table's REAL capacity, and
+   * grow it when it is full.
+   *
+   * This used to compare against TMPACTSIZE/sizeof(struct AccessItem) -- a
+   * constant describing the scratch buffer used while PARSING a netdb file.
+   * setup_accesscontroltable() shrink-wraps the live table to exactly
+   * ndb_AccessCount items afterwards, so from then on the constant was an
+   * over-estimate by the whole difference and every add through the ARexx
+   * "ADD ACCESS" path wrote a 12-byte item past the end of the allocation.
+   *
+   * Growing rather than simply refusing: the shrink leaves zero headroom by
+   * construction, so a bound-only fix would make ADD ACCESS fail permanently
+   * from the first boot -- correct, but it would silently retire a documented
+   * feature. NDB_ACCESS_GROW keeps the reallocation rare.
+   */
+#define NDB_ACCESS_GROW 16
+  if (ndb->ndb_AccessCount >= ndb->ndb_AccessMax) {
+    struct AccessItem *grown;
+    LONG newmax = ndb->ndb_AccessMax + NDB_ACCESS_GROW;
+
+    /* Keep the original ceiling as an absolute cap so a runaway caller cannot
+     * grow this without limit. */
+    if (newmax > (LONG)(TMPACTSIZE / sizeof (struct AccessItem))) {
+      *errstrp = (const UBYTE *)"Too many access control items\n";
+      return retval; /* copy propagation expected */
+    }
+    grown = bsd_realloc(ndb->ndb_AccessTable,
+			newmax * sizeof (struct AccessItem) + sizeof (ULONG),
+			M_NETDB, M_WAITOK);
+    if (grown == NULL) {
+      /* bsd_realloc leaves the old block intact on failure -- do NOT overwrite
+       * the live pointer with NULL, or controlaccess() would walk through it. */
+      *errstrp = (const UBYTE *)"Out of memory adding access control item\n";
+      return retval;
+    }
+    ndb->ndb_AccessTable = grown;
+    ndb->ndb_AccessMax   = newmax;
+    /* Re-mark the terminator at the new end. */
+    *((ULONG *)&ndb->ndb_AccessTable[ndb->ndb_AccessCount]) = 0;
   }
   
   if ((rdargs = ReadArgs(ACCESS_TEMPLATE, Args, rdargs)) != NULL) {
@@ -751,6 +815,14 @@ addaccessent(struct NetDataBase *ndb,
     ndb->ndb_AccessTable[ndb->ndb_AccessCount].ai_mask = mask;
     ndb->ndb_AccessTable[ndb->ndb_AccessCount].ai_flags = flags;
     ndb->ndb_AccessCount++;
+    /* PORT (AmiTCP_NG): re-mark the end. controlaccess() walks the table until
+     * it finds ai_flags == 0, and the item just written landed ON the previous
+     * terminator. During bulk file parsing setup_accesscontroltable() wrote the
+     * terminator once at the end, so this was never noticed; an ARexx ADD after
+     * boot left the table unterminated and controlaccess() would walk past it.
+     * In bounds: the allocation is ndb_AccessMax items plus this trailing ULONG,
+     * and the growth check above guarantees AccessCount <= AccessMax here. */
+    *((ULONG *)&ndb->ndb_AccessTable[ndb->ndb_AccessCount]) = 0;
 
     retval = 0;
   exit:
@@ -1046,6 +1118,23 @@ LONG reset_netdb(struct CSource *cs,
       }
     }
     NDB->ndb_AccessTable = newnetdb->ndb_AccessTable;
+    /*
+     * PORT (AmiTCP_NG) fix: the COUNT and the CAPACITY must travel with the
+     * table. Only the pointer used to be transplanted, so after a reload NDB
+     * kept whatever ndb_AccessCount it had accumulated -- including growth from
+     * earlier ARexx "ADD ACCESS" commands -- while pointing at the freshly
+     * parsed, exactly-sized table.
+     *
+     * That is not merely untidy. ndb_AccessCount is the WRITE INDEX: a reload
+     * that produced two entries, following a session that had grown the table
+     * to twenty, would leave the next add writing at index 20 of a 2-item
+     * table, and controlaccess() -- which walks from 0 until ai_flags == 0 --
+     * reading the uninitialised gap in between as access-control rules. On a
+     * machine with no MMU that gap is whatever the allocator last left there,
+     * so the stack would make allow/deny decisions from stale heap.
+     */
+    NDB->ndb_AccessCount = newnetdb->ndb_AccessCount;
+    NDB->ndb_AccessMax   = newnetdb->ndb_AccessMax;
     /*
      * Perhaps ugly...
      */

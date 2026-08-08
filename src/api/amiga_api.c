@@ -126,6 +126,16 @@ RCS_ID_C="$Id: amiga_api.c,v 3.7 1994/04/02 11:12:59 jraja Exp $";
 #include <api/apicalls.h>
 
 #include <kern/amiga_subr.h>
+#include <amitcp/socketbasetags.h>	/* PORT (AmiTCP_NG): Log/Error hook messages */
+#include <sys/synch.h>		/* PORT (AmiTCP_NG): SPL0, for the error-hook spl guard */
+/* PORT (AmiTCP_NG): CallHookPkt() for SBTC_ERROR_HOOK. Uses the GLOBAL
+ * UtilityBase (opened in kern/amiga_main.c), unlike kern/amiga_log.c which
+ * renames it to a private base. */
+#if __SASC
+#include <proto/utility.h>
+#elif __GNUC__
+#include <inline/utility.h>
+#endif
 #include <kern/amiga_log.h>
 
 /* strncmp() is not declared by any reachable header in the GNUC/-noixemul
@@ -165,6 +175,133 @@ extern struct Task * AmiTCP_Task; /* reference to AmiTCP/IP task information */
  */
 const char wrongTaskErrorFmt[] =
   "Task %ld (%s) attempted to use library base of Task %ld (%s).";
+
+/*
+ * PORT (AmiTCP_NG): find the calling task's scratch context -- see amiga_api.h.
+ *
+ * The opener's is embedded in the base, so that case is a compare. A task that
+ * shares the base gets one of its own, created by ng_ctx_ensure() when it first
+ * enters the library; this only walks the list to find it.
+ *
+ * On a miss it deliberately returns the OPENER's context rather than NULL. The
+ * callers reach fields straight through this pointer and have no error path --
+ * that is what keeps the resolver and netdb sources untouched -- so NULL would
+ * be an immediate crash on a machine with no MMU to catch it. Falling back
+ * means the two tasks share one set of scratch buffers, which is wrong but is
+ * exactly the behaviour that shipped before any of this existed. It happens
+ * only if the allocation failed, and is warned about once per base rather than
+ * on every call.
+ */
+/*
+ * PORT (AmiTCP_NG): find the base this task opened OR is sharing.
+ * See the note at the declaration in api/amiga_api.h for why this is separate
+ * from FindSocketBase().
+ */
+struct SocketBase *FindCallerBase(struct Task *task)
+{
+  struct Node *libNode;
+  struct SocketBase *p;
+  struct ng_taskctx *c;
+
+  Forbid();
+  for (libNode = socketBaseList.lh_Head; libNode->ln_Succ;
+       libNode = libNode->ln_Succ) {
+    p = (struct SocketBase *)libNode;
+    if (p->thisTask == task) {
+      Permit();
+      return p;
+    }
+    /*
+     * Walk unconditionally rather than gating on SBFF_CAN_SHARE. The flag is
+     * an ordinary settable tag -- clearing it does not retract the contexts
+     * already created -- so gating on it would make a sharer that had already
+     * called in invisible again the moment the opener turned sharing off,
+     * which is the very bug this function exists to fix. The walk costs one
+     * pointer read on a base that has no sharers.
+     */
+    for (c = (struct ng_taskctx *)p->ctxList.mlh_Head;
+         c->tc_node.mln_Succ != NULL;
+         c = (struct ng_taskctx *)c->tc_node.mln_Succ)
+      if (c->tc_task == task) {
+        Permit();
+        return p;
+      }
+  }
+  Permit();
+  return NULL;
+}
+
+/*
+ * PORT (AmiTCP_NG): make sure the CALLING task has a scratch context of its own.
+ *
+ * Called at vector entry, from CHECK_TASK(), and only when the base is actually
+ * shared -- an unshared base never gets here, so nothing changes for the vast
+ * majority of programs. Vector entry is the right place: we are at spl0 with no
+ * Forbid() held, so allocating is safe. Doing it lazily further in is not --
+ * tsleep() and much of the socket layer run under splnet(), which IS Forbid().
+ *
+ * Without this a sharer silently used the OPENER's buffers, so two tasks
+ * resolving names at once would overwrite each other's hostent.
+ *
+ * The list is walked and extended under Forbid(), which is enough: the walk is
+ * short and bounded, nothing here blocks, and the alternative -- syscall_
+ * semaphore -- is not held by the netdb and resolver vectors that need this.
+ * Allocation happens OUTSIDE the Forbid().
+ */
+struct ng_taskctx *ng_ctx_ensure(struct SocketBase *p)
+{
+  struct Task *t = SysBase->ThisTask;
+  struct ng_taskctx *c;
+
+  if (p->ctx.tc_task == t)
+    return &p->ctx;
+
+  Forbid();
+  for (c = (struct ng_taskctx *)p->ctxList.mlh_Head;
+       c->tc_node.mln_Succ != NULL;
+       c = (struct ng_taskctx *)c->tc_node.mln_Succ)
+    if (c->tc_task == t) {
+      Permit();
+      return c;
+    }
+  Permit();
+
+  c = (struct ng_taskctx *)AllocVec(sizeof(*c), MEMF_CLEAR|MEMF_PUBLIC);
+  if (c == NULL)
+    return NULL;			/* caller falls back to the opener's */
+
+  c->tc_task    = t;
+  c->res_socket = -1;
+  res_init(&c->res_state);
+
+  Forbid();
+  AddTail((struct List *)&p->ctxList, (struct Node *)&c->tc_node);
+  Permit();
+  return c;
+}
+
+struct ng_taskctx *ng_ctx(struct SocketBase *p)
+{
+  struct Task *t = SysBase->ThisTask;
+  struct ng_taskctx *c;
+
+  if (p->ctx.tc_task == t)		/* the opener: the common case */
+    return &p->ctx;
+
+  for (c = (struct ng_taskctx *)p->ctxList.mlh_Head;
+       c->tc_node.mln_Succ != NULL;
+       c = (struct ng_taskctx *)c->tc_node.mln_Succ)
+    if (c->tc_task == t)
+      return c;
+
+  if (!p->ctxWarned) {
+    p->ctxWarned = TRUE;
+    log(LOG_WARNING, "task %s shares a library base but has no scratch context "
+	"of its own yet -- using the opener's",
+	t->tc_Node.ln_Name ? (STRPTR)t->tc_Node.ln_Name : (STRPTR)"?");
+  }
+  return &p->ctx;
+}
 
 /*
  * Instead of using exec/initializers.h we looked it as a reference
@@ -297,6 +434,16 @@ struct Library * SAVEDS RAF2(ELL_Open,
   newBase->errnoPtr = (VOID *)&newBase->defErrno;
   newBase->errnoSize = sizeof newBase->defErrno;
   newBase->thisTask = SysBase->ThisTask;
+  /*
+   * PORT (AmiTCP_NG): claim the embedded context for the opening task and start
+   * the sharer list empty. ng_ctx()'s fast path compares against ctx.tc_task,
+   * so without this EVERY call -- including every existing single-task program
+   * -- would miss the fast path and fall into the slow-path safety net. It
+   * would still work, via the fallback, which is exactly why this line is easy
+   * to omit and hard to notice: nothing would fail, it would just be wrong.
+   */
+  newBase->ctx.tc_task = newBase->thisTask;
+  NewList((struct List *)&newBase->ctxList);
   newBase->sigIntrMask = SIGBREAKF_CTRL_C;
   
   /* initialize syslog variables */
@@ -308,18 +455,36 @@ struct Library * SAVEDS RAF2(ELL_Open,
 
   /* initialize resolver variables */
   newBase->hErrnoPtr = &newBase->defHErrno;
-  newBase->res_socket = -1;
-  res_init(&newBase->res_state);
+  newBase->ctx.res_socket = -1;
+  res_init(&newBase->ctx.res_state);
 
   /* initialize dtable variables */
 #if 0 /* initialization to zero is implicit */
   newBase->fdCallback = NULL;
 #endif
+  /*
+   * PORT (AmiTCP_NG): no descriptor tables retired yet.
+   *
+   * OUTSIDE the #if 0 above ON PURPOSE. The base is already zeroed (MakeLibrary
+   * clears it, and the word-zero loop earlier covers the whole struct), so this
+   * is redundant today exactly like fdCallback -- but UL_Close() WALKS this list
+   * and frees what it finds, so a stale pointer here would hand FreeMem() memory
+   * that was never ours. That is worth one instruction of belt and braces, and
+   * worth being real code rather than a comment inside a disabled block claiming
+   * protection it does not provide.
+   */
+  newBase->retiredTables = NULL;
   newBase->dTableSize = FD_SETSIZE;
   if ((newBase->dTable =
        AllocMem(newBase->dTableSize * sizeof (struct socket *) +
 		((newBase->dTableSize - 1) / NFDBITS + 1) * sizeof (fd_mask),
-		MEMF_CLEAR|MEMF_PUBLIC)) != NULL) {
+		MEMF_CLEAR|MEMF_PUBLIC)) == NULL) {
+    /* PORT (AmiTCP_NG): keep dTableSize consistent with dTable. The cleanup
+     * path below calls UL_Close(), which walks dTable[0..dTableSize); leaving
+     * the size set while the pointer is NULL described a 64-entry table at
+     * address 0. UL_Close guards on the pointer too -- belt and braces. */
+    newBase->dTableSize = 0;
+  } else {
     /*	
      * allocate and initialize the timer message reply port
      */
@@ -426,6 +591,103 @@ ULONG * SAVEDS RAF1(UL_Close,
    */
   if (--libPtr->libNode.lib_OpenCnt > 0)
     return NULL;
+
+  /*
+   * PORT (AmiTCP_NG): do not tear down a base other tasks have been sharing.
+   *
+   * Everything below assumes the closer is the only user: it closes the
+   * sockets, frees the descriptor table, the timer and finally the base
+   * itself. If a task sharing this base is inside the library right now -- or
+   * asleep in recv() on one of those sockets, which is exactly what sharing
+   * was implemented for -- that is a use-after-free, and with no MMU it
+   * corrupts silently rather than faulting.
+   *
+   * We cannot wait for them: Exec runs Close under Forbid(), so this must not
+   * block. So remove the base from the list, to make sure nothing new finds
+   * it, and leave it allocated. Leaking one base beats corrupting memory
+   * another task is still using -- the same trade sorflush() already makes
+   * with an orphaned socket.
+   *
+   * The test is "sharing was EVER enabled, OR some task has already called
+   * in". Neither half alone is enough. A context is only created by a sharer's
+   * first call, so a task handed the base but not yet using it is invisible to
+   * the list -- and freeing underneath it is precisely the use-after-free this
+   * guards against. And the live SBFF_CAN_SHARE flag will not do either: an
+   * application may turn sharing off again, quite reasonably, after handing the
+   * pointer over, which would clear the flag while that task is still about to
+   * call in. Hence a latch that is set when sharing is enabled and never
+   * cleared.
+   *
+   * The cost is that this is CONSERVATIVE in the other direction too: a
+   * program that enables sharing leaks its base at close even if no other
+   * task ever touched it, and a base whose sharers have all long since
+   * finished still looks shared. Telling those apart needs an in-flight
+   * count, and incrementing one at vector entry is easy while decrementing it
+   * on the way out is not -- there is no single exit point in the ~140
+   * vectors, and a sharer asleep in tsleep() has released syscall_semaphore,
+   * so it would be invisible to any count based on that. Until that exists
+   * this errs toward the leak, on the side that cannot corrupt memory.
+   */
+  if (libPtr->everShared ||
+      libPtr->ctxList.mlh_Head != (struct MinNode *)&libPtr->ctxList.mlh_Tail) {
+    log(LOG_WARNING,
+	"bsdsocket: base closed after being shared -- not freeing it, its "
+	"sockets and memory are left allocated in case a task is still inside");
+    Remove((struct Node *)libPtr);
+    /*
+     * Still balance the master's open count: it was incremented by ELL_Open()
+     * for this base, and leaving it inflated would permanently prevent the
+     * count reaching zero, so a delayed expunge could never complete and
+     * api_deinit()'s wait for SB_Expunged would block forever.
+     */
+    MasterSocketBase->lib_OpenCnt--;
+    /*
+     * The base deliberately stays allocated so a sharer still inside the
+     * library does not have it pulled out from under it -- but that means
+     * nothing on it may keep pointing INTO the closing program, whose code and
+     * data AmigaOS unloads when it exits. Point every application-supplied
+     * pointer back at the base's own storage.
+     *
+     * thisTask is the sharpest of these: it is the OPENER's Task, and
+     * sowakeup()/sohasoutofband() Signal() through it. Signal() on a recycled
+     * Task structure does not merely write a stale flag word -- under Disable()
+     * it can relink the target through Exec's own queues, so the blast radius
+     * is the scheduler rather than this library. NULL here, and both Signal
+     * sites test for it (kern/uipc_socket2.c, kern/uipc_socket.c). NULL also
+     * stops CHECK_TASK's `thisTask != ThisTask` test from spuriously matching a
+     * task that merely happens to be allocated at the recycled address and
+     * granting it owner access -- so the three CHECK_TASK* macros guard their
+     * log against it too.
+     */
+    libPtr->fdCallback = NULL;
+    libPtr->errnoPtr   = (UBYTE *)&libPtr->defErrno;
+    libPtr->errnoSize  = sizeof libPtr->defErrno;
+    libPtr->hErrnoPtr  = &libPtr->defHErrno;
+    libPtr->LogTag     = NULL;
+    libPtr->thisTask   = NULL;
+    /*
+     * sigIntrMask is genuinely still read: a sharer blocking on this base calls
+     * tsleep(libPtr, ...) directly (api/amiga_syscalls.c), which takes its
+     * interrupt mask from here. Clearing it deliberately narrows what can
+     * interrupt such a sleep -- the owner those signals were meant for has
+     * gone. sigIOMask, sigUrgMask and sigEventMask are unreachable once the
+     * Signal sites are guarded; cleared only as defence in depth.
+     */
+    libPtr->sigIntrMask  = 0;
+    libPtr->sigIOMask    = 0;
+    libPtr->sigUrgMask   = 0;
+    libPtr->sigEventMask = 0;
+    libPtr->sigAddrChangeMask = 0;
+    /*
+     * errorHook is NOT defence in depth -- clearing it is required. The hook
+     * belongs to the closing program: its code and its struct Hook may both be
+     * gone the moment this returns, while the base itself deliberately survives
+     * for any task still sharing it. A surviving sharer taking an error would
+     * otherwise CallHookPkt() into freed memory.
+     */
+    libPtr->errorHook    = NULL;
+    return NULL;
+  }
 #ifdef DEBUG
   log(LOG_DEBUG, "Closing proc 0x%lx base 0x%lx\n", 
       libPtr->thisTask, libPtr);
@@ -440,9 +702,21 @@ ULONG * SAVEDS RAF1(UL_Close,
    * waited. The linger may be interrupted by any signal in sigIntrMask.
    */
   libPtr->fdCallback = NULL; /* don't call the callback any more */
-  for (i = 0; i < libPtr->dTableSize; i++)
-    if (libPtr->dTable[i] != NULL)
-      CloseSocket(libPtr, i);
+  /*
+   * PORT (AmiTCP_NG) security fix: guard the sweep on dTable being present.
+   * ELL_Open() sets dTableSize BEFORE allocating dTable, and calls us to clean
+   * up if that allocation fails -- so we can arrive with dTable == NULL and
+   * dTableSize == FD_SETSIZE. The loop then read NULL[0..63], i.e. the CPU
+   * exception-vector table, whose first entry (the initial SSP) is never zero
+   * on a running machine, so CloseSocket() was called on the very first
+   * iteration with a wild pointer: getSock() would hand back that garbage as a
+   * struct socket * and the close path would dereference and even soclose() it.
+   * (FreeMem below was already guarded the same way.)
+   */
+  if (libPtr->dTable != NULL)
+    for (i = 0; i < libPtr->dTableSize; i++)
+      if (libPtr->dTable[i] != NULL)
+	CloseSocket(libPtr, i);
   
   Remove((struct Node *)libPtr); /* remove this librarybase from our list
 				    of opened library bases */
@@ -457,15 +731,39 @@ ULONG * SAVEDS RAF1(UL_Close,
   if (libPtr->timerPort)
     DeleteMsgPort(libPtr->timerPort);
 
-  freeDataBuffer(&libPtr->selitems);
-  freeDataBuffer(&libPtr->hostents);
-  freeDataBuffer(&libPtr->netents);
-  freeDataBuffer(&libPtr->protoents);
-  freeDataBuffer(&libPtr->servents);
+  /*
+   * Only the opener's own buffers are freed here. A base that was ever shared
+   * never reaches this point -- the guard above returns early and leaks the
+   * whole thing -- so the sharer contexts on ctxList are leaked with it. There
+   * is deliberately no loop freeing them: it could only ever run on a base
+   * with an empty list, and pretending otherwise would read as though the
+   * sharer teardown were solved.
+   */
+  freeDataBuffer(&libPtr->ctx.selitems);
+  freeDataBuffer(&libPtr->ctx.hostents);
+  freeDataBuffer(&libPtr->ctx.netents);
+  freeDataBuffer(&libPtr->ctx.protoents);
+  freeDataBuffer(&libPtr->ctx.servents);
   
-  if (libPtr->dTable) 
+  if (libPtr->dTable)
     FreeMem(libPtr->dTable, libPtr->dTableSize * sizeof (struct socket *) +
 	    ((libPtr->dTableSize - 1) / NFDBITS + 1) * sizeof (fd_mask));
+
+  /*
+   * PORT (AmiTCP_NG): release the descriptor tables retired by SBTC_DTABLESIZE
+   * resizes. setdtablesize() deliberately does not free them at the time of the
+   * swap, because selscan() may still hold a snapshot of the old pointer and
+   * cannot be locked against for the duration of its scan -- see the reasoning
+   * there. Here is safe: this base is being torn down, so nothing can still be
+   * inside a library call using one of them.
+   */
+  while (libPtr->retiredTables != NULL) {
+    struct ng_retired_dtable *r = libPtr->retiredTables;
+
+    libPtr->retiredTables = r->rd_next;
+    FreeMem(r->rd_mem, r->rd_size);
+    FreeMem(r, sizeof (struct ng_retired_dtable));
+  }
 
   freestart = (void *)((ULONG)libPtr - (ULONG)libPtr->libNode.lib_NegSize);
   size = libPtr->libNode.lib_NegSize + libPtr->libNode.lib_PosSize;
@@ -693,22 +991,156 @@ VOID api_deinit()
   api_state = API_SCRATCH;
 }
 
+/*
+ * PORT (AmiTCP_NG): deliver an error code through the SBTC_ERROR_HOOK if one is
+ * installed. Returns TRUE if the hook took it, FALSE if the caller should write
+ * the variable itself.
+ *
+ * The hook is asked to PERFORM the assignment rather than merely being told
+ * about it -- ehm_Action is documented as "indicating which variable should be
+ * changed" and ehm_Code as "the error code to be set". That is also the only
+ * reading that makes the feature useful: its stated purpose is to work with
+ * shared library bases, where errnoPtr belongs to whichever task opened the
+ * base, so writing it as well would put one task's error in another's variable,
+ * which is the exact fault the hook exists to avoid.
+ *
+ * Called on the context of whatever task is in the library call, as documented.
+ * h_Entry is invoked through utility.library's CallHookPkt() so the register
+ * convention (hook in A0, object in A2, message in A1) is honoured -- calling
+ * h_Entry directly from C would pass the arguments on the stack and jump into
+ * the application with garbage in those registers. If utility.library is not
+ * open the hook is skipped rather than called incorrectly.
+ */
+static BOOL ng_error_hook_deliver(struct SocketBase *libPtr, ULONG action, LONG code)
+{
+  extern struct Library *UtilityBase;
+  struct ErrorHookMsg ehm;
+  struct Hook *hook = libPtr->errorHook;
+
+  if (hook == NULL || UtilityBase == NULL)
+    return FALSE;
+
+  /*
+   * Never call out to application code from inside an spl region. Unlike the
+   * log hook, this one CANNOT be deferred to another task -- routing errno to
+   * the calling task is the entire point of it -- so the hazard is closed by
+   * declining instead, and the error is written directly. Misrouting one errno
+   * in a shared-base program is a bad outcome; hanging the machine is a worse
+   * one, and this codebase already prefers the lesser failure elsewhere (see
+   * UL_Close(), which leaks a base rather than risk a use-after-free).
+   *
+   * No current caller of writeErrnoValue() runs at spl, so this costs one
+   * compare today. It exists so that a future one added inside splnet() -- easy
+   * to do by accident across ~140 vectors -- cannot silently reintroduce a
+   * machine hang.
+   *
+   * The test is `> SPL0`, NOT Exec's usual `TDNestCnt >= 0`. In a shipped build
+   * (DEBUG undefined, sys/synch.h) this port stores the spl LEVEL directly in
+   * TDNestCnt -- SPL0 is 0, SPLNET 2, SPLIMP 3 -- and spl_0() leaves 0 behind
+   * rather than Exec's idle -1. So `>= 0` would read as "forbidden" at the
+   * stack's own baseline and would disable the hook almost everywhere.
+   *
+   * KNOWN LIMIT: this sees spl regions, not a bare Forbid() taken by somebody
+   * else, which is indistinguishable from SPLSOFTCLOCK in the same counter.
+   */
+  if (SysBase->TDNestCnt > SPL0)
+    return FALSE;
+
+  ehm.ehm_Size   = sizeof ehm;
+  ehm.ehm_Action = action;
+  ehm.ehm_Code   = code;
+  (void)CallHookPkt(hook, NULL, (APTR)&ehm);
+  return TRUE;
+}
+
+/*
+ * PORT (AmiTCP_NG): h_errno counterpart of writeErrnoValue(). Exists so that
+ * SBTC_ERROR_HOOK can intercept resolver errors too -- h_errno used to be
+ * assigned straight through a macro at ~17 sites, which no hook could see, and
+ * an error hook that silently missed every DNS failure would be worse than none.
+ */
+void writeHErrnoValue(struct SocketBase * libPtr, int value)
+{
+  if (ng_error_hook_deliver(libPtr, EHMA_Set_h_errno, (LONG)value))
+    return;
+  *libPtr->hErrnoPtr = (LONG)value;
+}
+
+/*
+ * PORT (AmiTCP_NG): SBTC_SIG_ADDRESS_CHANGE_MASK -- tell every base that asked
+ * that an interface address was added, changed or removed.
+ *
+ * Broadcast rather than aimed at one base: an address change is a fact about
+ * the machine, and any number of applications may be watching for it. Forbid()
+ * for the walk, matching FindSocketBase(); thisTask is tested for the usual
+ * reason -- a shared-then-closed base outlives its opener, whose Task Exec may
+ * have recycled, and Signal() through that corrupts the scheduler.
+ */
+void ng_signal_address_change(void)
+{
+  extern struct List socketBaseList;
+  struct Node *libNode;
+
+  Forbid();
+  for (libNode = socketBaseList.lh_Head; libNode->ln_Succ;
+       libNode = libNode->ln_Succ) {
+    struct SocketBase *b = (struct SocketBase *)libNode;
+
+    if (b->sigAddrChangeMask != 0 && b->thisTask != NULL)
+      Signal(b->thisTask, b->sigAddrChangeMask);
+  }
+  Permit();
+}
+
+/*
+ * PORT (AmiTCP_NG): read the caller's errno through the (size, pointer) pair,
+ * snapshotting both under Forbid() so a concurrent _SetErrnoPtr() on a shared
+ * base cannot pair a new size with an old pointer. See the note in amiga_api.h.
+ */
+int readErrnoValue(struct SocketBase * base)
+{
+  BYTE   erri;
+  UBYTE *errp;
+
+  Forbid();
+  erri = base->errnoSize;
+  errp = base->errnoPtr;
+  Permit();
+
+  return (int)errp[erri - 1];
+}
+
 void writeErrnoValue(struct SocketBase * libPtr, int errno)
 {
   /*
    * errnoSize is now restricted to 1, 2 or 4
    */
-  BYTE erri = libPtr->errnoSize;
+  /* PORT (AmiTCP_NG) fix: snapshot the (size, pointer) pair together.
+   * _SetErrnoPtr() can change both from another task on a shared base; reading
+   * them at different moments can pair a new size with an old pointer and write
+   * past the caller's errno. Forbid() is the right tool -- these fields are only
+   * ever touched at task level, and the section is two loads. */
+  BYTE   erri;
+  UBYTE *errp;
+
+  Forbid();
+  erri = libPtr->errnoSize;
+  errp = libPtr->errnoPtr;
+  Permit();
+
+  /* PORT (AmiTCP_NG): SBTC_ERROR_HOOK takes delivery when installed. */
+  if (ng_error_hook_deliver(libPtr, EHMA_Set_errno, (LONG)errno))
+    return;
 
   if (erri == 4) {
-    *(ULONG *)libPtr->errnoPtr = (ULONG)errno;
+    *(ULONG *)errp = (ULONG)errno;
     return;
   }
   if (erri == 2) {
-    *(UWORD *)libPtr->errnoPtr = (UWORD)errno;
+    *(UWORD *)errp = (UWORD)errno;
     return;
   }
   /* size must be 1 */
-  *(UBYTE *)libPtr->errnoPtr = (UBYTE)errno;
+  *(UBYTE *)errp = (UBYTE)errno;
   return;
 }

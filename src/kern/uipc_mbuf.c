@@ -245,11 +245,79 @@ int	max_datalen = 0;		/* MHLEN - max_hdr */
 struct memHeader {
   struct memHeader *next;
   ULONG             size;
+  /*
+   * PORT (AmiTCP_NG): which kind of chunk this is. BOTH m_alloc() (an array of
+   * MSIZE-aligned mbufs) and m_clalloc() (mcluster headers each followed by
+   * mclbytes of raw payload) prepend themselves to the single mbufmem list, and
+   * the two layouts are nothing alike. m_valid() must not apply mbuf geometry
+   * to a cluster chunk -- a 2048-byte cluster body contains sixteen
+   * MSIZE-aligned addresses, none of which are mbufs.
+   */
+  ULONG             ismbuf;	/* nonzero: chunk holds mbufs, not clusters */
 };
 
 static struct memHeader *mbufmem = NULL;
 
 static BOOL initialized = FALSE;
+
+/*
+ * PORT (AmiTCP_NG) security fix: is `m` plausibly a real mbuf from our pool?
+ *
+ * The mbuf_* library vectors hand raw struct mbuf * pointers out to
+ * applications and take them back again, so a caller controls a pointer that
+ * the stack then dereferences and, in MFREE's case, links straight into the
+ * free list -- `(m)->m_next = mfree; mfree = (m);` runs unconditionally. A
+ * forged pointer therefore becomes the next mbuf handed to ANY task, including
+ * the stack's own receive path, which then writes packet data through it. With
+ * no MMU that is a write-what-where primitive available to any local task.
+ *
+ * Every mbuf is MSIZE-aligned by construction (dtom() depends on it) and lives
+ * inside one of the chunks on mbufmem, so those two properties are cheap to
+ * check and exclude arbitrary addresses -- including the low memory the
+ * exception vectors occupy. This CANNOT detect a pointer to an mbuf that was
+ * genuinely ours but has since been freed: catching that would need per-mbuf
+ * generation tags, which this pool does not have. It closes the "point
+ * anywhere" class, not the stale-pointer class.
+ *
+ * Only for the API boundary -- the stack's own paths already hold valid mbufs
+ * and must not pay for this walk.
+ */
+int
+m_valid(struct mbuf *m)
+{
+  struct memHeader *mh;
+  ULONG a = (ULONG)m;
+  spl_t ms;
+  int ok = 0;
+
+  if (m == NULL || (a & (MSIZE - 1)) != 0)
+    return 0;
+
+  ms = splimp();
+  for (mh = mbufmem; mh != NULL; mh = mh->next) {
+    ULONG base = (ULONG)mh;
+
+    /*
+     * Only mbuf chunks have the MSIZE slot geometry -- skip cluster chunks
+     * entirely, or a pointer into live cluster payload would validate.
+     * The lower bound is the first byte AFTER the memHeader: combined with
+     * the alignment test that is exactly the first real mbuf, since no
+     * MSIZE-aligned address can lie between the two. Without it, a chunk
+     * whose AllocMem() base happened to be MSIZE-aligned would accept the
+     * memHeader itself, and freeing "an mbuf" there would overwrite the
+     * mh->next that links the chunk list.
+     */
+    if (!mh->ismbuf)
+      continue;
+    if (a >= base + sizeof(struct memHeader) &&
+	a + MSIZE <= base + mh->size) {
+      ok = 1;
+      break;
+    }
+  }
+  splx(ms);
+  return ok;
+}
 
 LONG mb_read_stats(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 {
@@ -307,7 +375,23 @@ mb_check_conf(void *dp, LONG newvalue)
   }
   else
   if (dp == &mbconf.mclbytes) {
-    if (newvalue >= MINCLSIZE && newvalue <= 65536)
+    /*
+     * The cluster size doubles as the stride between clusters in the pool, so
+     * an unaligned value yields unaligned cluster bases. Every protocol header
+     * is then read through an mtod() cast off that base, which is an Address
+     * Error trap on a 68000/68010 the moment the first packet arrives -- and
+     * the range check alone is parity-blind, so a plausible typo such as
+     * CLUSTERSIZE=1501 gets through. Require 4-byte alignment.
+     *
+     * Strictly, the 68000/68010 traps only on an ODD address, and the cluster
+     * stride is 4 + mclbytes, so an even value alone would keep every base
+     * even forever -- `& 1` would be the minimum correct bound. `& 3` is
+     * chosen deliberately: it costs nothing real (no shipped or documented
+     * CLUSTERSIZE value is excluded), it gives every 32-bit header field
+     * long-alignment rather than merely legal alignment, and it avoids
+     * resting on the AllocMem() base-alignment assumption holding forever.
+     */
+    if (newvalue >= MINCLSIZE && newvalue <= 65536 && (newvalue & 3) == 0)
       return TRUE;
   }
 
@@ -449,6 +533,7 @@ m_alloc(int howmany, int canwait)
    */
   mbstat.m_memused += size;		/* add to the total */
   mh->size = size;
+  mh->ismbuf = 1;		/* mbuf chunk -- see m_valid() */
   mh->next = mbufmem;
   mbufmem = mh;
   mh++;				/* pass by the memHeader */
@@ -491,7 +576,8 @@ m_clalloc(int ncl, int canwait)
   struct memHeader *mh;
   struct mcluster *p;
   ULONG  size;
-  short  i;
+  int    i;		/* must hold ncl (up to clusterchunk == 65536); a short
+			 * wraps negative above 32767 and the link loop never ends */
 
   /*
    * struct mcluster has variable length buffer so its size is not calculated
@@ -535,6 +621,7 @@ m_clalloc(int ncl, int canwait)
    */
   mbstat.m_memused += size;
   mh->size = size;
+  mh->ismbuf = 0;		/* cluster chunk, NOT mbuf slots -- see m_valid() */
   mh->next = mbufmem;
   mbufmem = mh;
   mh++;				/* pass by the memHeader */
@@ -671,6 +758,26 @@ m_prepend(m, len, canwait)
 	int len, canwait;
 {
 	struct mbuf *mn;
+
+	/*
+	 * PORT (AmiTCP_NG) security fix: bound len. Below, `if (len < MHLEN)
+	 * MH_ALIGN(m, len);` then `m->m_len = len;` -- for len >= MHLEN the
+	 * alignment step is skipped and m_len is set to the caller's value with
+	 * no check against the ~MHLEN bytes the mbuf actually holds, and for a
+	 * negative len MH_ALIGN drives m_data far past the end of the 128-byte
+	 * mbuf. Either leaves an mbuf whose m_len lies about its own storage,
+	 * which m_cat() and m_copydata() then use as a copy length -- an
+	 * out-of-bounds read, and a write into the destination for m_cat.
+	 * Stock BSD relied on only ever prepending small constant protocol
+	 * headers; the mbuf_prepend vector (LVO) makes len caller-controlled.
+	 * m_pullup() imposes exactly this ceiling on itself a few functions
+	 * below. Failure frees the chain, matching this function's existing
+	 * MGET-failure contract.
+	 */
+	if (len < 0 || len > MHLEN) {
+		m_freem(m);
+		return (NULL);
+	}
 
 	MGET(mn, canwait, m->m_type);
 	if (mn == NULL) {
@@ -871,8 +978,21 @@ m_adj(struct mbuf *mp, int req_len)
 			}
 		}
 		m = mp;
-		if (mp->m_flags & M_PKTHDR)
+		if (mp->m_flags & M_PKTHDR) {
 			m->m_pkthdr.len -= (req_len - len);
+			/*
+			 * PORT (AmiTCP_NG) fix: floor it. req_len is caller
+			 * controlled through the mbuf_adj vector and is not
+			 * bounded by the chain's real length, so trimming more
+			 * than the chain holds drove pkthdr.len negative. The
+			 * per-mbuf m_len fields above are already clamped to 0
+			 * the same way; a negative total is a corrupted
+			 * invariant that later code reading it as a size would
+			 * see as enormous.
+			 */
+			if (m->m_pkthdr.len < 0)
+				m->m_pkthdr.len = 0;
+		}
 	} else {
 		/*
 		 * Trim from tail.  Scan the mbuf chain,

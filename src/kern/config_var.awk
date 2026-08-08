@@ -63,11 +63,11 @@ BEGIN {
   print endcomment;
   if (CTARGET) {
     print "";
-    print "\#include <sys/param.h>";
-    print "\#include <sys/socket.h>";
-    print "\#include <netinet/in.h>";
-    print "\#include <kern/amiga_includes.h>";
-    print "\#include <kern/amiga_config.h>";
+    print "#include <sys/param.h>";
+    print "#include <sys/socket.h>";
+    print "#include <netinet/in.h>";
+    print "#include <kern/amiga_includes.h>";
+    print "#include <kern/amiga_config.h>";
     print "";
   }
 }

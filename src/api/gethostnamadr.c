@@ -169,7 +169,7 @@ typedef union {
 /*
  * hostent structure in SocketBase
  */
-#define HOSTENT ((struct hostent *)libPtr->hostents.db_Addr)
+#define HOSTENT ((struct hostent *)NG_CTX(libPtr)->hostents.db_Addr)
 
 /*
  * longword align given pointer (i.e. divides by 4)
@@ -243,7 +243,7 @@ static char *
       if ((n = dn_expand((u_char *)answer->buf,
 			 (u_char *)eom, (u_char *)cp, (u_char *)bp,
 			 buflen)) < 0) {
-	h_errno = NO_RECOVERY;
+	set_h_errno(NO_RECOVERY);
 	return NULL;
       }
       cp += n + QFIXEDSZ;
@@ -272,9 +272,9 @@ static char *
      * no questions and inverse query :o
      */
     if (hp->aa)
-      h_errno = HOST_NOT_FOUND;
+      set_h_errno(HOST_NOT_FOUND);
     else
-      h_errno = TRY_AGAIN;
+      set_h_errno(TRY_AGAIN);
     return NULL;
   }
   ap = HS->host_aliases;
@@ -284,6 +284,15 @@ static char *
   
   haveanswer = 0;
   while (--ancount >= 0 && cp < eom) {
+    /*
+     * PORT (AmiTCP_NG) defence-in-depth: stop once the output buffer is
+     * exhausted. The per-record commits below (CNAME alias, h_name) decrement
+     * buflen without re-checking it, so a crafted CNAME chain can drive it to
+     * exactly 0; dn_expand() then bounds its own writes (its terminator fix
+     * makes buflen<=0 return -1), but bailing here keeps the accounting sane.
+     */
+    if (buflen <= 0)
+      break;
     if ((n = dn_expand((u_char *)answer->buf, (u_char *)eom,
 		       (u_char *)cp, (u_char *)bp, buflen)) < 0)
       break;
@@ -440,7 +449,7 @@ static char *
     return bp;
   }
   else {
-    h_errno = TRY_AGAIN;
+    set_h_errno(TRY_AGAIN);
     return NULL;
   }
 }
@@ -462,13 +471,23 @@ ng_gethostbyname_impl(struct SocketBase *libPtr, const char *name)
   /*
    * check if name consists only dots and digits.
    */
+  /* PORT (AmiTCP_NG): reject a NULL name rather than parsing address 0 as a
+   * C string. Reads at address 0 do not trap on this no-MMU target, so the
+   * lookup would silently walk the exception-vector table instead of failing.
+   * res_querydomain() guards its own name argument the same way. */
+  if (name == NULL) {
+    writeErrnoValue(libPtr, EFAULT);
+    set_h_errno(0);
+    return ((struct hostent *) NULL);
+  }
+
   if (isdigit(name[0])) {
     struct in_addr inaddr;
     u_long * lptr;
-    
+
     if (!inet_aton(name, &inaddr)) {
       writeErrnoValue(libPtr, EINVAL);
-      h_errno = 0;
+      set_h_errno(0);
       return NULL;
     }
     
@@ -480,10 +499,10 @@ ng_gethostbyname_impl(struct SocketBase *libPtr, const char *name)
      * longer than the 15 chars of "255.255.255.255"). Size the allocation from
      * the real name length instead of a fixed 28 so the strcpy can never overrun.
      */
-    if (allocDataBuffer(&libPtr->hostents,
+    if (allocDataBuffer(&NG_CTX(libPtr)->hostents,
 			sizeof (struct hostent) + 12 + strlen(name) + 1) == FALSE) {
       writeErrnoValue(libPtr, ENOMEM);
-      h_errno = 0;
+      set_h_errno(0);
       return NULL;
     }
     HOSTENT->h_addrtype = AF_INET;
@@ -517,7 +536,7 @@ ng_gethostbyname_impl(struct SocketBase *libPtr, const char *name)
     if (hit != NULL)
       return hit;
     if (neg) {			/* cached "not found": fail fast, no query */
-      h_errno = HOST_NOT_FOUND;
+      set_h_errno(HOST_NOT_FOUND);
       return NULL;
     }
   }
@@ -586,7 +605,9 @@ ng_gethostbyaddr_impl(struct SocketBase *libPtr, const UBYTE *addr, int len, int
   /* Reject a bogus length: for AF_INET the only valid addr length is 4. len
    * comes straight from the public gethostbyaddr() vector, and is used below as
    * a bcopy/bcmp length -- an over-large value overruns the library's heap. */
-  if (type != AF_INET || len != sizeof(struct in_addr))
+  /* PORT (AmiTCP_NG): `addr` was never checked, only type/len -- see the NULL
+   * guard in the by-name path above for why that matters here. */
+  if (addr == NULL || type != AF_INET || len != sizeof(struct in_addr))
     return ((struct hostent *) NULL);
 
   /*
@@ -670,7 +691,7 @@ static struct hostent * makehostent(struct SocketBase * libPtr,
   n = i + sizeof (struct hostent) + HS->h_addr_count * sizeof (char *) +
     HS->host_alias_count * sizeof (char *);
     
-  if (allocDataBuffer(&libPtr->hostents, n) == FALSE) {
+  if (allocDataBuffer(&NG_CTX(libPtr)->hostents, n) == FALSE) {
     writeErrnoValue(libPtr, ENOMEM);    
     return NULL;
   }
@@ -787,9 +808,15 @@ sethostname(const char * name, size_t namelen)
   if (namelen > MAXHOSTNAMELEN)
     namelen = MAXHOSTNAMELEN;
 
+  /* host_name/host_namelen are process-global (one instance shared by every task
+   * with the library open) and updated non-atomically. Forbid()/Permit() so a
+   * concurrent _gethostname() reader cannot copy host_namelen bytes while the
+   * content is mid-rewrite (a torn hostname). Cheap -- no blocking calls held. */
+  Forbid();
   memcpy(host_name, name, namelen);
   host_name[namelen] = '\0';
   host_namelen = namelen;
+  Permit();
 
   return 0;
 }
@@ -871,19 +898,27 @@ LONG SAVEDS RAF3(_gethostname,
    * signed LONG to -1, which becomes a ~4GB size_t for memcpy() and an
    * out-of-bounds name[-1] write -- machine corruption on this MMU-less target.
    */
-  if (namelen <= 0)
+  /* PORT (AmiTCP_NG) security fix: `name` itself was never checked, only its
+   * length. gethostname(NULL, 64) memcpy'd over the CPU exception vectors at
+   * address 0 and then wrote a terminator past them. */
+  if (name == NULL || namelen <= 0)
     API_STD_RETURN(EINVAL, 0);
 
   /*
    * Copy the name to the user buffer. stccpy() ensures that the buffer
    * is not written over and that it will be null-terminated.
    */
-  if (namelen > host_namelen)
+  /* Snapshot host_namelen and copy host_name under Forbid() so a concurrent
+   * sethostname() cannot shorten the content between our length read and the
+   * copy (which would read stale trailing bytes). The caller-buffer terminator
+   * is written after Permit(). */
+  Forbid();
+  if (namelen > (LONG)host_namelen)
     namelen = host_namelen;
   else
     namelen--;			/* make space for the trailing '\0' */
-
   memcpy(name, host_name, namelen);
+  Permit();
   name[namelen] = '\0';
 
   API_STD_RETURN(0, 0);
@@ -938,6 +973,7 @@ ULONG SAVEDS RAF1(_gethostid,
 #if 0     
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   if (id_addr == 0)
     findid(&id_addr);

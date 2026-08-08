@@ -239,7 +239,11 @@ main(int argc, char *argv[])
       if (nthLibrary) {
 	if (taskname = bsd_malloc(16, M_CFGVAR, M_WAITOK)) {
 	  strcpy(taskname, "AmiTCP");
-	  taskname[6] = '.'; taskname[7] = '0' + nthLibrary;
+	  /* PORT (AmiTCP_NG): terminate. strcpy's NUL landed at [6] and is
+	   * overwritten by the '.' below, so without this the task name is
+	   * unterminated and anything that prints or strlen()s it -- including
+	   * Exec's own task-list tools -- runs off the 16-byte block. */
+	  taskname[6] = '.'; taskname[7] = '0' + nthLibrary; taskname[8] = '\0';
 	}
       } else {
 #endif
@@ -597,6 +601,20 @@ init_all(void)
     return FALSE;
 
   /*
+   * PORT (AmiTCP_NG): first message through the normal queued log path, placed
+   * here rather than at the end of log_init() because vlog() timestamps with
+   * GetSysTime() and timer.device is only open as of the line above.
+   *
+   * It is not decoration. log_validate_dest() writes its banner with a direct
+   * FWrite() from NETTRACE, so the banner alone only proves the file is writable.
+   * This line proves the whole chain -- claim a buffer, PutMsg, wake NETTRACE,
+   * format, write. A log holding the banner but not this line is a diagnosis
+   * (message delivery is broken) rather than a mystery.
+   */
+  log(LOG_NOTICE, "AmiTCP_NG %s starting, logging to '%s' at level %ld",
+      AMITCP_NG_VER, log_dest_name, log_level);
+
+  /*
    * initialize API
    */
   if (!api_init())
@@ -645,6 +663,15 @@ deinit_all(void)
   spl0();
 
   api_hide();			/* hides the API from users */
+
+  /*
+   * Close any socket that was released for hand-off but never claimed. Must
+   * happen HERE -- after api_hide() has stopped new releases, but while the
+   * interfaces, timers and mbuf pool are all still alive, since closing a
+   * socket frees its buffers back into that pool. By the time api_deinit()
+   * runs at the end of this function, mbdeinit() has already freed it.
+   */
+  reapReleasedSockets();
 
   /*
    * Deinitialize network database.
@@ -780,6 +807,10 @@ static void ng_stack_process(void)
   if (!log_init())			goto fail;
   if (!mbinit())			goto fail;
   if ((timermask = timer_init()) == 0L)	goto fail;
+  /* First message through the queued log path -- see the same call in init_all(),
+   * and note it MUST follow timer_init() (vlog() timestamps via GetSysTime()). */
+  log(LOG_NOTICE, "AmiTCP_NG %s starting, logging to '%s' at level %ld",
+      AMITCP_NG_VER, log_dest_name, log_level);
   if ((sanamask  = sana_init())  == 0L)	goto fail;
   domaininit();
   if (init_netdb() != 0)		goto fail;
@@ -825,9 +856,24 @@ static void ng_stack_process(void)
 
   initialized = FALSE;
   ng_stack_running = FALSE;
-  /* Subsystem teardown (deinit_all() MINUS the api_* calls -- the library's
-   * Close/Expunge own the library lifecycle). */
+  /* Subsystem teardown (deinit_all() MINUS the api_init/api_show/api_deinit
+   * calls -- the library's Close/Expunge own the library lifecycle). */
   spl0();
+  /*
+   * PORT (AmiTCP_NG) fix: reclaim released-but-never-obtained sockets here
+   * too. This teardown was written as "deinit_all() minus the api_* calls" on
+   * the assumption that Close/Expunge would handle that side -- but neither
+   * ELL_Expunge() nor UL_Close() calls api_hide() or reapReleasedSockets(),
+   * and deinit_all() itself only runs from the standalone main() build and
+   * from panic(). So on the self-starting library build -- the one that
+   * actually ships -- nothing ever swept releasedSocketList, and each socket
+   * left on it leaked its struct socket plus an AllocMem'd SocketNode, the
+   * latter being system memory lost until reboot.
+   *
+   * It must run BEFORE the subsystem teardown below: closing a socket returns
+   * its buffers to the mbuf pool that mbdeinit() is about to free.
+   */
+  reapReleasedSockets();
   netdb_deinit();
   sana_deinit();
   timer_deinit();

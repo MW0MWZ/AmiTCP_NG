@@ -125,6 +125,8 @@ RCS_ID_C="$Id: rtsock.c,v 1.14 1993/06/04 11:16:15 jraja Exp $";
 #include <sys/domain.h>
 #include <sys/protosw.h>
 #include <sys/synch.h>
+#include <sys/syslog.h>
+#include <sys/systm.h>		/* log() -- see m_copyback's argument check */
 
 #include <net/if.h>
 #include <net/route.h>
@@ -496,6 +498,21 @@ m_copyback(m0, off, len, cp)
 
 	if (m0 == 0)
 		return;
+	/*
+	 * PORT (AmiTCP_NG) security fix: reject negative arguments, exactly as
+	 * the sibling m_copydata() does. This is reachable straight from the
+	 * public mbuf_copyback vector (LVO -630), which takes off/len as signed
+	 * LONGs in d0/d1 and passes them through unvalidated. With a negative
+	 * off the first loop below is skipped (a negative can never exceed
+	 * m_len), so the second loop reaches
+	 *	bcopy(cp, off + mtod(m, caddr_t), mlen)
+	 * and writes caller-supplied bytes BEFORE the start of the mbuf -- an
+	 * out-of-bounds write at a caller-chosen offset, with no MMU to trap it.
+	 */
+	if (off < 0 || len < 0) {
+		log(LOG_ERR, "m_copyback: bad arguments");
+		return;
+	}
 	while (off > (mlen = m->m_len)) {
 		off -= mlen;
 		totlen += mlen;

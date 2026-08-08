@@ -106,6 +106,17 @@ imax(int a, int b)
   return (a > b ? a : b);
 }
 
+/*
+ * WARNING: min()/max() take UNSIGNED parameters, unlike stock BSD where they
+ * are type-preserving macros. A negative argument converts to a huge unsigned
+ * value, so `max(x, LOWER_BOUND)` is a SILENT NO-OP when x is negative, and
+ * `min(x, y)` returns y for a negative x. Use imin()/imax() (or lmin()/lmax())
+ * whenever an operand can be negative -- a signed sequence-number difference, a
+ * length derived from a signed 16-bit protocol field, an sbspace() result, and
+ * so on. Two real bugs came from this (tcp_input.c's rcv_wnd and tcp_mss's
+ * sanity floor); the signatures are left as-is because most call sites are
+ * genuinely unsigned and changing them would be the riskier edit.
+ */
 static inline unsigned int
 min(unsigned int a, unsigned int b)
 {
@@ -237,7 +248,12 @@ strncpy(register char *s1, register const char *s2, register unsigned int len)
 static inline void
 aligned_bzero_const(void *buf, long size) 
 {
-  short lcount;
+  /* PORT (AmiTCP_NG): long, not short. A 16-bit signed longword count wraps for
+   * sizes at or above ~128 KB, which mbuf clusters and socket buffers can reach.
+   * This whole family is inert in the current build (USE_ALIGNED_COPIES is only
+   * set by the legacy SAS/C Smakefile), so this is a latent trap being closed,
+   * not a live bug. */
+  long lcount;
   long *lbuf = (long *)buf;
   short *sbuf;
 
@@ -277,7 +293,12 @@ aligned_bzero_const(void *buf, long size)
 static inline void
 aligned_bzero(void *buf, long size) 
 {
-  short lcount;
+  /* PORT (AmiTCP_NG): long, not short. A 16-bit signed longword count wraps for
+   * sizes at or above ~128 KB, which mbuf clusters and socket buffers can reach.
+   * This whole family is inert in the current build (USE_ALIGNED_COPIES is only
+   * set by the legacy SAS/C Smakefile), so this is a latent trap being closed,
+   * not a live bug. */
+  long lcount;
   long *lbuf = (long *)buf;
   short *sbuf;
 
@@ -299,7 +320,12 @@ aligned_bzero(void *buf, long size)
 static inline void
 aligned_bcopy_const(const void *src, void *dst, long size) 
 {
-  short lcount;
+  /* PORT (AmiTCP_NG): long, not short. A 16-bit signed longword count wraps for
+   * sizes at or above ~128 KB, which mbuf clusters and socket buffers can reach.
+   * This whole family is inert in the current build (USE_ALIGNED_COPIES is only
+   * set by the legacy SAS/C Smakefile), so this is a latent trap being closed,
+   * not a live bug. */
+  long lcount;
   long *ldst = (long *)dst;
   short *sdst;
   long *lsrc = (long *)src;
@@ -342,7 +368,12 @@ aligned_bcopy_const(const void *src, void *dst, long size)
 static inline void
 aligned_bcopy(const void *src, void *dst, long size) 
 {
-  short lcount;
+  /* PORT (AmiTCP_NG): long, not short. A 16-bit signed longword count wraps for
+   * sizes at or above ~128 KB, which mbuf clusters and socket buffers can reach.
+   * This whole family is inert in the current build (USE_ALIGNED_COPIES is only
+   * set by the legacy SAS/C Smakefile), so this is a latent trap being closed,
+   * not a live bug. */
+  long lcount;
   long *ldst = (long *)dst;
   short *sdst;
   long *lsrc = (long *)src;

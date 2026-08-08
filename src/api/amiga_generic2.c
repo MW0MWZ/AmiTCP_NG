@@ -108,6 +108,7 @@ RCS_ID_C="$Id: amiga_generic2.c,v 3.13 1994/04/07 20:46:52 jraja Exp $";
 
 #include <stdarg.h>
 
+#include <kern/amiga_log.h>	/* log_dest_name, log_hook */
 #include <amitcp/socketbasetags.h>
 
 extern const char * const __sys_errlist[];
@@ -138,8 +139,24 @@ LONG /* SAVEDS */ RAF3(_SetErrnoPtr,
 #endif
   if (size == 4 || size == 2 || size == 1) {
     if (size & 0x1 || !((ULONG)err_p & 0x1)) {	/* either odd size or address even */
+      /*
+       * PORT (AmiTCP_NG) fix: publish the pair indivisibly.
+       *
+       * errnoSize and errnoPtr must agree: writeErrnoValue()/readErrnoValue()
+       * read the size and then cast-dereference the pointer by it. Written as
+       * two plain stores on a preemptive OS, a task sharing this base could see
+       * the NEW size with the OLD pointer -- e.g. size 4 against a caller's
+       * 1-byte errno -- and write three bytes past it.
+       *
+       * Forbid(), not the syscall semaphore: the readers are lock-free BY
+       * DESIGN (API_STD_RETURN deliberately writes errno after releasing the
+       * semaphore), so a semaphore here would serialise against nothing.
+       * Nothing between Forbid() and Permit() can block.
+       */
+      Forbid();
       libPtr->errnoSize = size;
       libPtr->errnoPtr = err_p;
+      Permit();
       return 0;
     }
   }
@@ -226,7 +243,10 @@ VOID SAVEDS RAF4(_Syslog,
 	*p++ = *t2++;
     if (libPtr->LogStat & LOG_PID) {
       char pidbuf[16];
-      sprintf(pidbuf, "[%lx]", libPtr->thisTask);	/* fixed format, <= 16 */
+      /* The task actually logging, not the base's opener -- they differ once
+	 * SBTC_CAN_SHARE_LIBRARY_BASES lets another task in, and stamping the
+	 * opener's pointer on a sharer's line misidentifies it. */
+      sprintf(pidbuf, "[%lx]", SysBase->ThisTask);	/* fixed format, <= 16 */
       for (t2 = pidbuf; *t2 && p < end; )
 	*p++ = *t2++;
     }
@@ -280,6 +300,7 @@ LONG /* SAVEDS */ RAF1(_getdtablesize,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
 
   return (LONG)libPtr->dTableSize;
 }
@@ -318,6 +339,7 @@ setdtablesize(struct SocketBase * libPtr, UWORD size)
   LONG oldsize = (LONG)libPtr->dTableSize;
   LONG copysize;
   struct socket ** dTable;
+  struct socket ** oldTable = libPtr->dTable;	/* retired, not freed -- see below */
   int olddmasksize, copydmasksize, dmasksize;
   
   if (size < oldsize) {
@@ -340,15 +362,68 @@ setdtablesize(struct SocketBase * libPtr, UWORD size)
     return oldsize;
 
   aligned_bcopy(libPtr->dTable, dTable, copysize * sizeof (struct socket *));
-  aligned_bcopy(libPtr->dTable + oldsize, dTable + size, 
+  aligned_bcopy(libPtr->dTable + oldsize, dTable + size,
 		copydmasksize * sizeof (fd_mask));
-  
-  FreeMem(libPtr->dTable, oldsize * sizeof (struct socket *) +
-	  olddmasksize * sizeof (fd_mask));
-  
+
+  /*
+   * PORT (AmiTCP_NG) fix: PUBLISH, THEN RETIRE -- and publish both fields as one
+   * indivisible step.
+   *
+   * This used to FreeMem() the old table and only then store the new pointer and
+   * size, as two separate assignments. Three defects came out of that:
+   *
+   *  1. Between the free and the store, libPtr->dTable pointed at freed memory --
+   *     true even single-threaded.
+   *  2. dTable and dTableSize are a PAIR: the fd_mask bitmap lives inside the same
+   *     allocation at offset (dTable + dTableSize), so every reader derives the
+   *     bitmap address from both. AmigaOS is priority-preemptive, so a task switch
+   *     between the two stores leaves a reader computing the bitmap at the wrong
+   *     offset -- an out-of-bounds write, with no MMU to catch it.
+   *  3. The old block was freed while another task might still hold a pointer to
+   *     it (see below).
+   *
+   * Forbid() here is NOT redundant with the syscall semaphore the caller holds.
+   * The semaphore only excludes other semaphore-holding callers; selscan()
+   * (api/amiga_generic.c) cannot take it -- _WaitSelect blocks, and holding one
+   * global semaphore across a block would stall the whole stack -- so it snapshots
+   * the pair under Forbid() instead. Forbid here is what that snapshot pairs with.
+   * Nothing between Forbid() and Permit() blocks or calls another vector; keep it
+   * that way.
+   */
+  Forbid();
   libPtr->dTable = dTable;
   libPtr->dTableSize = size;
-  
+  Permit();
+
+  /*
+   * The retired table is deliberately NOT freed. No lock can help a reader that
+   * already loaded the old pointer into a local before the swap and is preempted
+   * before using it -- selscan() does exactly that, because it cannot hold a lock
+   * across its whole scan. Retaining the block turns that reader's stale pointer
+   * into a stale-but-VALID read instead of a use-after-free. The blocks are
+   * chained off the base and released in UL_Close(), which is the same trade this
+   * codebase already makes deliberately there: leak rather than risk corruption.
+   *
+   * A caller that resizes repeatedly accumulates retired blocks until it closes
+   * the library. That is bounded and intentional, not an oversight.
+   */
+  {
+    struct ng_retired_dtable *r =
+      AllocMem(sizeof (struct ng_retired_dtable), MEMF_PUBLIC);
+
+    if (r != NULL) {
+      r->rd_mem  = (APTR)oldTable;
+      r->rd_size = oldsize * sizeof (struct socket *) +
+		   olddmasksize * sizeof (fd_mask);
+      Forbid();
+      r->rd_next = libPtr->retiredTables;
+      libPtr->retiredTables = r;
+      Permit();
+    }
+    /* If even that small node cannot be allocated we simply never reclaim this
+     * block. Leaking it is the safe direction; freeing it is the unsafe one. */
+  }
+
   return size;
 }
 
@@ -359,6 +434,38 @@ setdtablesize(struct SocketBase * libPtr, UWORD size)
   break;\
  case (code << SBTB_CODE) | SBTF_SET: /* set */\
   *(ULONG *)&libPtr->baseField = *tagData;\
+  break
+
+/*
+ * PORT (AmiTCP_NG): the same get/set pair for a STACK-WIDE `int`, not a field of
+ * the caller's base. The Roadshow API documents these as affecting the whole
+ * protocol stack rather than the library base they were set through, which is
+ * the only thing that makes sense for one shared IP layer -- so unlike
+ * CASE_LONG() there is deliberately no per-base copy.
+ */
+#define CASE_GLOBAL_INT(code, global)\
+ case (code << SBTB_CODE): /* get */ \
+  *tagData = (ULONG)(global);\
+  break;\
+ case (code << SBTB_CODE) | SBTF_SET: /* set */\
+  (global) = (int)*tagData;\
+  break
+
+/*
+ * As above but for a global whose legal values are 0..(limit-1). An out-of-range
+ * value fails the tag rather than being clamped: these select BEHAVIOUR (how to
+ * treat an ICMP request), and silently substituting a different behaviour for
+ * the one asked for is how a machine ends up answering probes its owner believes
+ * are switched off.
+ */
+#define CASE_GLOBAL_ENUM(code, global, limit)\
+ case (code << SBTB_CODE): /* get */ \
+  *tagData = (ULONG)(global);\
+  break;\
+ case (code << SBTB_CODE) | SBTF_SET: /* set */\
+  if (*tagData >= (ULONG)(limit))\
+    return errIndex;	/* the documented failure answer: which tag failed */\
+  (global) = (int)*tagData;\
   break
 
 #define CASE_WORD(code, baseField)\
@@ -377,15 +484,40 @@ setdtablesize(struct SocketBase * libPtr, UWORD size)
   *(UBYTE *)&libPtr->baseField = (UBYTE)*tagData;\
   break
 
+/*
+ * PORT (AmiTCP_NG): a GET-only global, for the SBTC_NG_* diagnostic codes.
+ * There are enough of these now (the header-prediction miss breakdown alone is
+ * thirteen) that writing each one out longhand is mostly an invitation to
+ * paste the wrong variable next to the right tag. A SET is meaningless for a
+ * read-only counter, so it is left to fall through to the default and be
+ * ignored rather than writing through a caller-supplied pointer.
+ */
+#define CASE_NG_GET(code, expr)\
+ case (code << SBTB_CODE): /* get only */ \
+  *tagData = (ULONG)(expr);\
+  break
+
+/*
+ * NB (AmiTCP_NG): the SET arm is a read-modify-write on libPtr->flags, which
+ * two tasks can reach at once on a shared base, and _SocketBaseTagList() holds
+ * no lock -- hence the Disable()/Enable() below. Without it, two tasks setting
+ * different bits could lose one of them.
+ * Also note `flag` must be an SBFF_ MASK, never an SBFB_ bit number.
+ */
 #define CASE_FLAG(code, flag)\
   case (code << SBTB_CODE): /* get */ \
     *tagData = ((ULONG)libPtr->flags & (flag)) != 0;\
     break;\
   case (code << SBTB_CODE) | SBTF_SET: /* set */\
+    /* Read-modify-write of a byte two tasks may reach once the base is\
+     * shared, and this function holds no lock. Disable() is the cheapest\
+     * thing that makes it indivisible; nothing inside can block. */\
+    Disable();\
     if (*tagData) \
       *(UBYTE *)&libPtr->flags |= (flag);\
     else \
       *(UBYTE *)&libPtr->flags &= ~(flag);\
+    Enable();\
     break
 
 
@@ -666,6 +798,15 @@ extern unsigned long ng_detected_ram;			/* kern/amiga_main.c   */
 extern unsigned long tcp_sendspace, tcp_recvspace;	/* netinet/tcp_usrreq.c */
 extern unsigned long sb_max;				/* kern/uipc_socket2.c  */
 extern unsigned long ng_last_if_baudrate;		/* api/amiga_roadshow_compat.c */
+extern int tcppredack, tcppreddat, tcppcbcachemiss, tcppredwin;
+/* Socket wakeup accounting -- defined in kern/uipc_socket2.c, NOT tcp_input.c. */
+extern unsigned long ng_sowk_calls, ng_sowk_rcv, ng_sowk_wait, ng_sowk_sel, ng_sowk_async;	/* netinet/tcp_input.c  */
+extern u_long ng_tcp_rcvtotal();			/* netinet/tcp_input.c  */
+/* Header-prediction miss attribution (netinet/tcp_input.c tcp_predict_miss). */
+extern int tcppm_state, tcppm_flags, tcppm_tstamp, tcppm_seq, tcppm_win,
+	   tcppm_rexmit, tcppm_dupack, tcppm_sack, tcppm_ack, tcppm_cwnd,
+	   tcppm_ackdata, tcppm_reass, tcppm_space, tcppm_zerowin,
+	   tcppm_ackdup, tcppm_winonly;
 
 ULONG SAVEDS RAF2(_SocketBaseTagList,
 		  struct SocketBase *,	libPtr,		a6,
@@ -679,10 +820,32 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
   ULONG *tagData;
   short tmp;
   UWORD utmp;
+  /*
+   * PORT (AmiTCP_NG): the stack-wide knobs the SBTC_ tags below drive. Declared
+   * locally rather than in a header, matching how the rest of this fork's
+   * Roadshow work reaches them (api/amiga_roadshow_compat.c does the same).
+   * ip_defttl is also declared in netinet/ip_var.h for the IP code itself.
+   */
+  extern int udpcksum, ipforwarding, ipsendredirects, icmpmaskrepl;
+  extern int icmp_process_echo, icmp_process_tstamp, ip_defttl;
+  extern int tcp_ttl, udp_ttl;
+  extern struct Hook *log_hook;	/* SBTC_LOG_HOOK (kern/subr_prf.c) */
 
   static const char * const strErr = "Errlist lookup error";
 
   CHECK_TASK();
+
+  /*
+   * PORT (AmiTCP_NG) fix: a NULL tag list was dereferenced immediately below.
+   * With no MMU that reads address 0 rather than trapping, so the behaviour
+   * depended on whatever the exception-vector table happened to hold -- in
+   * practice a benign "bad tag" return, but if that word ever had its top bit
+   * set the SBTF_REF path would take &tags->ti_Data (address 4, where Exec
+   * keeps SysBase) as a writable target. The fork's newer vectors already
+   * treat a NULL list this way; make this one consistent.
+   */
+  if (tags == NULL)
+    return 0;
 
   while((tag = tags->ti_Tag) != TAG_END) {
     if ((LONG)tag < 0) {		/* TAG_USER is the sign bit */
@@ -698,6 +861,12 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 
       CASE_LONG( SBTC_SIGURGMASK, sigUrgMask );
 
+      /* PORT (AmiTCP_NG): tag 4, the asynchronous socket-event signal. Absent
+       * from AmiTCP 3.0b2 -- this header's numbering jumped 3 -> 6 -- so every
+       * Roadshow-model client that asked for it got "bad tag" and no signal.
+       * Paired with setsockopt(SO_EVENTMASK) and GetSocketEvents(). */
+      CASE_LONG( SBTC_SIGEVENTMASK, sigEventMask );
+
       case (SBTC_ERRNO << SBTB_CODE): /* get */ 
 	*tagData = (ULONG)readErrnoValue(libPtr);
 	break;
@@ -709,15 +878,41 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	*tagData = (ULONG)*libPtr->hErrnoPtr;
 	break;
       case (SBTC_HERRNO << SBTB_CODE) | SBTF_SET: /* set */
-        *libPtr->hErrnoPtr = (LONG) *tagData;
+	/* PORT (AmiTCP_NG): through writeHErrnoValue(), so an installed
+	 * SBTC_ERROR_HOOK sees this the same way it sees an errno set --
+	 * SBTC_ERRNO above already routes through writeErrnoValue(), and two
+	 * structurally identical tags behaving differently is a trap. */
+	writeHErrnoValue(libPtr, (int)*tagData);
 	break;
 
       case (SBTC_DTABLESIZE << SBTB_CODE): /* get */
 	*tagData = (ULONG)libPtr->dTableSize;
 	break;
       case (SBTC_DTABLESIZE << SBTB_CODE) | SBTF_SET: /* set */
-	if ((tmp = (WORD)*tagData) > 0)
+	/*
+	 * PORT (AmiTCP_NG) fix: hold the syscall semaphore across the resize.
+	 *
+	 * Every other reader of the dTable/dTableSize pair -- getSock(), all the
+	 * FD_SET/FD_ISSET/FD_CLR sites, Dup2Socket, the descriptor walk in
+	 * GetSocketEvents -- runs under this semaphore and assumes the pair is
+	 * stable while it is held. _SocketBaseTagList() takes no lock, so on a
+	 * shared base (SBTC_CAN_SHARE_LIBRARY_BASES) a resize could free the table
+	 * another task was indexing.
+	 *
+	 * SCOPED TO THIS ARM ON PURPOSE -- do NOT hoist this around the switch or
+	 * the tag-walk loop. ObtainSyscallSemaphore() is not safely nestable: it
+	 * saves the caller's priority into the BASE (libPtr->myPri) before boosting,
+	 * so a nested obtain overwrites that saved value with the already-boosted
+	 * one and the outer release then never restores the original -- the task
+	 * stays at the net task's priority for good. Widening this hold would do
+	 * exactly that for any tag list that also contains SBTC_SYSTEM_STATUS,
+	 * whose handler (ng_system_status) takes the same semaphore itself.
+	 */
+	if ((tmp = (WORD)*tagData) > 0) {
+	  ObtainSyscallSemaphore(libPtr);
 	  setdtablesize(libPtr, tmp);
+	  ReleaseSyscallSemaphore(libPtr);
+	}
 	break;
 
       CASE_LONG( SBTC_FDCALLBACK,   fdCallback );
@@ -796,6 +991,163 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 #ifdef notyet
       CASE_FLAG( SBTC_COMPAT43, SBFB_COMPAT43 );
 #endif
+
+      /*
+       * PORT (AmiTCP_NG): Roadshow's opt-in to using one library base from more
+       * than one task. Until this is set we refuse non-opener callers in
+       * CHECK_TASK(), as Roadshow does. Note CASE_FLAG() wants the MASK.
+       * The restrictions this does NOT lift are listed at CHECK_TASK().
+       */
+      case (SBTC_CAN_SHARE_LIBRARY_BASES << SBTB_CODE): /* get */
+	*tagData = ((ULONG)libPtr->flags & SBFF_CAN_SHARE) != 0;
+	break;
+      case (SBTC_CAN_SHARE_LIBRARY_BASES << SBTB_CODE) | SBTF_SET: /* set */
+	/* Not CASE_FLAG: enabling also throws a latch that is never cleared,
+	 * because the base pointer can already be in another task's hands
+	 * before that task has called in. Turning sharing back off afterwards
+	 * must not convince UL_Close it is safe to free the base. */
+	Disable();
+	if (*tagData) {
+	  *(UBYTE *)&libPtr->flags |= SBFF_CAN_SHARE;
+	  libPtr->everShared = TRUE;
+	} else
+	  *(UBYTE *)&libPtr->flags &= ~SBFF_CAN_SHARE;
+	Enable();
+	break;
+
+      /*
+       * PORT (AmiTCP_NG): stack-wide protocol behaviour controls. All of these
+       * are Roadshow tags this fork simply did not have -- AmiTCP 3.0b2 predates
+       * them -- so a Roadshow-aware tool could not configure the stack at all.
+       * Each affects the whole stack, not this base, exactly as documented.
+       */
+      CASE_GLOBAL_INT( SBTC_UDP_CHECKSUM,        udpcksum );
+      CASE_GLOBAL_INT( SBTC_IP_FORWARDING,       ipforwarding );
+      CASE_GLOBAL_INT( SBTC_ICMP_SEND_REDIRECTS, ipsendredirects );
+      CASE_GLOBAL_INT( SBTC_ICMP_MASK_REPLY,     icmpmaskrepl );
+
+      /* IR_Process / IR_Ignore / IR_Drop (netinet/ip_icmp.h). */
+      CASE_GLOBAL_ENUM( SBTC_ICMP_PROCESS_ECHO,   icmp_process_echo,   3 );
+      CASE_GLOBAL_ENUM( SBTC_ICMP_PROCESS_TSTAMP, icmp_process_tstamp, 3 );
+
+      /*
+       * SBTC_IP_DEFAULT_TTL. Roadshow has ONE default TTL; 4.4BSD keeps tcp_ttl
+       * and udp_ttl apart. Mirror into both, or the setting would visibly do
+       * nothing to the traffic the caller actually cares about. Range 1..255:
+       * a TTL of 0 is discarded by the first router -- arguably by the sending
+       * host -- so accepting it would quietly disconnect the machine.
+       */
+      case (SBTC_IP_DEFAULT_TTL << SBTB_CODE): /* get */
+	*tagData = (ULONG)ip_defttl;
+	break;
+      case (SBTC_IP_DEFAULT_TTL << SBTB_CODE) | SBTF_SET: /* set */
+	if (*tagData == 0 || *tagData > 255)
+	  return errIndex;
+	ip_defttl = (int)*tagData;
+	tcp_ttl   = ip_defttl;
+	udp_ttl   = ip_defttl;
+	break;
+
+      /*
+       * SBTC_RELEASESTRPTR -- the stack's name and version string. This is the
+       * library's own lib_IdString (RELEASESTRING VSTRING, set in amiga_api.c),
+       * so there is exactly one source of truth and it cannot drift from what
+       * the Version command reports. GET only: the string is ours, not the
+       * caller's, and a SET falls through to `default` and is ignored.
+       */
+      case (SBTC_RELEASESTRPTR << SBTB_CODE):
+	*tagData = (ULONG)libPtr->libNode.lib_IdString;
+	break;
+
+      /*
+       * SBTC_SIG_ADDRESS_CHANGE_MASK -- signal this task when an interface
+       * address is added, changed or removed (netinet/in.c raises it).
+       */
+      CASE_LONG( SBTC_SIG_ADDRESS_CHANGE_MASK, sigAddrChangeMask );
+
+      /*
+       * SBTC_ERROR_HOOK -- install/remove the hook that takes delivery of errno
+       * and h_errno. Per base, because errno is per base.
+       */
+      CASE_LONG( SBTC_ERROR_HOOK, errorHook );
+
+      /*
+       * SBTC_LOG_HOOK -- stack-wide, because there is one logging subsystem.
+       * Installing NULL restores normal recording and display.
+       */
+      case (SBTC_LOG_HOOK << SBTB_CODE): /* get */
+	*tagData = (ULONG)log_hook;
+	break;
+      case (SBTC_LOG_HOOK << SBTB_CODE) | SBTF_SET: /* set */
+	log_hook = (struct Hook *)*tagData;
+	break;
+
+      /*
+       * SBTC_LOG_FILE_NAME -- where the log is being written.
+       *
+       * GET reports the destination ACTUALLY in use, not the one that was
+       * configured: bring-up falls back through ram:, t:, AmiTCP: and sys: if
+       * the configured name cannot be opened, and answering with a name we
+       * failed to open would send the caller looking for a file that is not
+       * there.
+       *
+       * SET is deliberately refused. logfilename is owned by the configuration
+       * layer, whose setvalue() FreeVec()s the previous value before replacing
+       * it -- so handing it a caller's string, or one of our static fallback
+       * names, sets up a free() of memory that was never allocated, which on a
+       * machine with no MMU corrupts the allocator rather than failing. Changing
+       * the live destination also means re-opening it, with the log task mid-
+       * write. Failing the tag is honest and safe; LOGFILENAME= in
+       * AmiTCP:db/AmiTCP.config is the supported way to choose the file.
+       */
+      case (SBTC_LOG_FILE_NAME << SBTB_CODE): /* get */
+	*tagData = (ULONG)log_dest_name;
+	break;
+
+      /*
+       * SBTC_IDN_DEFAULT_CHARACTER_SET -- we do not implement international
+       * domain name translation, so the only value we can honestly report or
+       * accept is IDNCS_ASCII, which is precisely the value that means "no
+       * translation". Accepting IDNCS_ISO_8859_LATIN_1 would promise a
+       * conversion that never happens, and the caller would silently look up
+       * the wrong name; failing the tag tells it to encode names itself.
+       */
+      case (SBTC_IDN_DEFAULT_CHARACTER_SET << SBTB_CODE): /* get */
+	*tagData = IDNCS_ASCII;
+	break;
+      case (SBTC_IDN_DEFAULT_CHARACTER_SET << SBTB_CODE) | SBTF_SET: /* set */
+	if (*tagData != IDNCS_ASCII)
+	  return errIndex;
+	break;
+
+      /*
+       * SBTC_GET_BYTES_RECEIVED / SBTC_GET_BYTES_SENT -- stack-wide octet
+       * totals, summed from the per-interface counters (net/if.c).
+       *
+       * These are the ONLY tags here that write more than a longword, and that
+       * makes the reference flag a safety matter rather than a formality: the
+       * value is an SBQUAD_T ({ULONG high; ULONG low;}, high word first) and the
+       * API documents it as passed by reference. Without SBTF_REF, tagData
+       * points at the TagItem's own ti_Data field, so writing eight bytes would
+       * run four bytes past it and into the NEXT TagItem -- with no MMU, silent
+       * corruption of the caller's tag list. So a by-value request fails the
+       * call instead. (Same 64-bit shape as IFQ_GetBytesIn/Out, where writing
+       * only 32 bits once produced the impossible "16,375,418 bytes" reading.)
+       */
+      case (SBTC_GET_BYTES_RECEIVED << SBTB_CODE):
+      case (SBTC_GET_BYTES_SENT << SBTB_CODE):
+	{
+	  extern void ng_stack_byte_total(int out, ULONG *hip, ULONG *lop);
+	  ULONG hi, lo;
+
+	  if (!((UWORD)tag & SBTF_REF))
+	    return errIndex;
+	  ng_stack_byte_total(((UWORD)tag & ~SBTF_REF) ==
+			      (SBTC_GET_BYTES_SENT << SBTB_CODE), &hi, &lo);
+	  tagData[0] = hi;		/* sbq_High */
+	  tagData[1] = lo;		/* sbq_Low  */
+	}
+	break;
 
       /*
        * PORT (AmiTCP_NG): honestly answer Roadshow's extension-API capability
@@ -880,6 +1232,54 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)ng_last_if_baudrate;
 	break;
 
+      /*
+       * TCP header-prediction accounting. PREDACK + PREDDAT are the fast-path hits;
+       * RCVTOTAL is every TCP segment delivered to tcp_input, so the difference is
+       * the slow path. Reported raw and free-running -- the caller samples twice and
+       * differences, which is what makes them useful during a transfer rather than
+       * as a since-boot total dominated by whatever ran earlier.
+       */
+      case (SBTC_NG_TCP_PREDACK   << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)tcppredack;
+	break;
+      case (SBTC_NG_TCP_PREDDAT   << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)tcppreddat;
+	break;
+      case (SBTC_NG_TCP_RCVTOTAL  << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = (ULONG)ng_tcp_rcvtotal();
+	break;
+
+      CASE_NG_GET( SBTC_NG_TCP_PCBMISS, tcppcbcachemiss );
+      CASE_NG_GET( SBTC_NG_TCP_PREDWIN, tcppredwin      );
+
+      CASE_NG_GET( SBTC_NG_SOWK_CALLS,  ng_sowk_calls );
+      CASE_NG_GET( SBTC_NG_SOWK_RCV,    ng_sowk_rcv   );
+      CASE_NG_GET( SBTC_NG_SOWK_WAIT,   ng_sowk_wait  );
+      CASE_NG_GET( SBTC_NG_SOWK_SEL,    ng_sowk_sel   );
+      CASE_NG_GET( SBTC_NG_SOWK_ASYNC,  ng_sowk_async );
+
+      /*
+       * Why prediction rejected a segment -- one bucket per segment. They do
+       * NOT sum to the slow-path total: segments dropped before prediction is
+       * consulted never reach the attribution. See tcp_predict_miss().
+       */
+      CASE_NG_GET( SBTC_NG_TPM_STATE,   tcppm_state   );
+      CASE_NG_GET( SBTC_NG_TPM_FLAGS,   tcppm_flags   );
+      CASE_NG_GET( SBTC_NG_TPM_TSTAMP,  tcppm_tstamp  );
+      CASE_NG_GET( SBTC_NG_TPM_SEQ,     tcppm_seq     );
+      CASE_NG_GET( SBTC_NG_TPM_WIN,     tcppm_win     );
+      CASE_NG_GET( SBTC_NG_TPM_REXMIT,  tcppm_rexmit  );
+      CASE_NG_GET( SBTC_NG_TPM_DUPACK,  tcppm_dupack  );
+      CASE_NG_GET( SBTC_NG_TPM_SACK,    tcppm_sack    );
+      CASE_NG_GET( SBTC_NG_TPM_ACK,     tcppm_ack     );
+      CASE_NG_GET( SBTC_NG_TPM_CWND,    tcppm_cwnd    );
+      CASE_NG_GET( SBTC_NG_TPM_ACKDATA, tcppm_ackdata );
+      CASE_NG_GET( SBTC_NG_TPM_REASS,   tcppm_reass   );
+      CASE_NG_GET( SBTC_NG_TPM_SPACE,   tcppm_space   );
+      CASE_NG_GET( SBTC_NG_TPM_ZEROWIN, tcppm_zerowin );
+      CASE_NG_GET( SBTC_NG_TPM_ACKDUP,  tcppm_ackdup  );
+      CASE_NG_GET( SBTC_NG_TPM_WINONLY, tcppm_winonly );
+
       default:
 	/*
 	 * PORT (AmiTCP_NG): an unknown tag code must NOT fail the whole call.
@@ -905,7 +1305,22 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	errIndex++;
 	continue;
       case TAG_SKIP:
-	tags++; errIndex++;
+	/*
+	 * PORT (AmiTCP_NG): TAG_SKIP means "skip this item AND the next
+	 * ti_Data items", so the walk must advance by 1 + ti_Data. This
+	 * used to advance by a fixed 2 and never read ti_Data at all,
+	 * which is right only for ti_Data == 1; any other value left the
+	 * walk pointing at memory the caller had marked as NOT a tag
+	 * item, to be reinterpreted as one. Snapshot ti_Data BEFORE
+	 * moving tags -- reading it afterwards would take it from the
+	 * wrong item. The shared increment below supplies the +1.
+	 * See ng_nexttag() in amiga_roadshow_compat.c, which agrees.
+	 */
+	{
+	  ULONG skip = tags->ti_Data;
+
+	  tags += skip; errIndex += skip;
+	}
 	break;
       default:
         return errIndex;	/* fail */

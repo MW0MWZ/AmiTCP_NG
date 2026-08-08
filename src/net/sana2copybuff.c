@@ -248,13 +248,19 @@ ioip_alloc_mbuf(struct IOIPReq *s2rp, ULONG MTU)
  * NOTE: this WILL be called from INTERRUPTS, so compile with stack checking
  *       disabled and use __saveds if near data is needed.
  */
-static SAVEDS BOOL RAF3(m_copy_from_mbuf,
-		 BYTE*,          to,   a0,
-		 struct IOIPReq*,from, a1,
-		 ULONG,          n,    d0)
-#if 0
+/*
+ * Shared implementation. The register-argument hooks below are thin wrappers
+ * around these, because the gcc RAF3 macro declares a hook as taking NO C
+ * arguments (it reads a0/a1/d0 directly), so one hook cannot simply call
+ * another. Extracting the body is what lets the 32-bit-aligned variants exist
+ * without a second copy of the loop -- and a second copy of a loop that writes
+ * wire data into mbufs at interrupt time is exactly what we do not want.
+ */
+static BOOL copy_from_mbuf_body(to, from, n)
+     BYTE            *to;
+     struct IOIPReq  *from;
+     ULONG            n;
 {
-#endif
   register struct mbuf *m = from->ioip_packet;
   register unsigned count;
 
@@ -293,13 +299,11 @@ static SAVEDS BOOL RAF3(m_copy_from_mbuf,
  * NOTE: this WILL be called from INTERRUPTS, so compile with stack checking
  *       disabled and use __saveds if near data is needed.
  */
-static SAVEDS BOOL RAF3(m_copy_to_mbuf,
-		 struct IOIPReq*,to,   a0,
-		 BYTE*,          from, a1,
-		 ULONG,          n,    d0)
-#if 0
+static BOOL copy_to_mbuf_body(to, from, n)
+     struct IOIPReq  *to;
+     BYTE            *from;
+     ULONG            n;
 {
-#endif
   register struct mbuf *f, *m = to->ioip_reserved;
   unsigned totlen = n;
 
@@ -368,9 +372,74 @@ static SAVEDS BOOL RAF3(m_copy_to_mbuf,
   return TRUE;
 }
 
-struct TagItem buffermanagement[3] = {
-    { S2_CopyToBuff,   (ULONG)m_copy_to_mbuf },
-    { S2_CopyFromBuff, (ULONG)m_copy_from_mbuf },
+/*
+ * The register-argument hooks the driver actually calls.
+ *
+ * S2_CopyToBuff / S2_CopyFromBuff are MANDATORY -- every SANA-II driver has
+ * them and the spec requires us to supply them, so they are the floor that
+ * makes any driver work.
+ *
+ * The *32 variants are SANA-II R4. The "32" means the DRIVER guarantees its
+ * buffer is 32-bit aligned; we still do the copy, so there is no correctness
+ * difference for us and the same body serves both. Advertising them is safe by
+ * construction: a driver that predates R4 ignores tags it does not recognise
+ * and keeps calling the mandatory pair, so this cannot break existing hardware.
+ *
+ * We advertise them mainly to FIND OUT. Nothing in this stack has ever offered a
+ * driver anything beyond the original two functions, so we genuinely do not know
+ * whether any real driver would use more -- and that question gates whether the
+ * DMA variants (which return a buffer address instead of copying, and would
+ * remove the per-frame copy entirely) are worth building. Separate counters mean
+ * every machine running this reports what its driver actually chose, rather than
+ * us guessing from one person's hardware.
+ */
+static SAVEDS BOOL RAF3(m_copy_from_mbuf,
+		 BYTE*,          to,   a0,
+		 struct IOIPReq*,from, a1,
+		 ULONG,          n,    d0)
+#if 0
+{
+#endif
+  return copy_from_mbuf_body(to, from, n);
+}
+
+static SAVEDS BOOL RAF3(m_copy_to_mbuf,
+		 struct IOIPReq*,to,   a0,
+		 BYTE*,          from, a1,
+		 ULONG,          n,    d0)
+#if 0
+{
+#endif
+  return copy_to_mbuf_body(to, from, n);
+}
+
+static SAVEDS BOOL RAF3(m_copy_from_mbuf32,
+		 BYTE*,          to,   a0,
+		 struct IOIPReq*,from, a1,
+		 ULONG,          n,    d0)
+#if 0
+{
+#endif
+  from->ioip_if->ss_copyout32++;	/* how often the driver chose the R4 variant */
+  return copy_from_mbuf_body(to, from, n);
+}
+
+static SAVEDS BOOL RAF3(m_copy_to_mbuf32,
+		 struct IOIPReq*,to,   a0,
+		 BYTE*,          from, a1,
+		 ULONG,          n,    d0)
+#if 0
+{
+#endif
+  to->ioip_if->ss_copyin32++;
+  return copy_to_mbuf_body(to, from, n);
+}
+
+struct TagItem buffermanagement[5] = {
+    { S2_CopyToBuff,     (ULONG)m_copy_to_mbuf },		/* mandatory */
+    { S2_CopyFromBuff,   (ULONG)m_copy_from_mbuf },		/* mandatory */
+    { S2_CopyToBuff32,   (ULONG)m_copy_to_mbuf32 },		/* R4, optional */
+    { S2_CopyFromBuff32, (ULONG)m_copy_from_mbuf32 },	/* R4, optional */
     { TAG_END, }
 };
 

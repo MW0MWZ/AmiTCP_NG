@@ -33,6 +33,11 @@ BOOL doAllocDataBuffer(struct DataBuffer * DB, int size);
 
 static inline BOOL allocDataBuffer(struct DataBuffer * DB, int size)
 {
+  if (size < 0)			/* a corrupted/oversized entry size must never be
+				 * mistaken for "the buffer already fits" (which
+				 * would leave db_Addr NULL/stale for the caller's
+				 * bcopy) -- fail cleanly instead */
+    return FALSE;
   if (DB->db_Size < size)
     return doAllocDataBuffer(DB, size);
   else

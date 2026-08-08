@@ -165,6 +165,7 @@ RCS_ID_C="$Id: tcp_input.c,v 3.1 1994/03/26 09:53:54 too Exp $";
 int	tcprexmtthresh = 3;
 int	tcp_do_rfc3042 = 1;	/* RFC 3042 Limited Transmit on the 1st/2nd dup ack (0 disables) */
 int	tcppredack = 0;	/* XXX debugging: times hdr predict ok for acks */
+int	tcppredwin = 0;	/* times hdr predict ok for pure window updates */
 int	tcppreddat = 0;	/* XXX # times header prediction ok for data packets */
 int	tcppcbcachemiss = 0;
 u_long	tcp_now;		/* RFC 1323 timestamp clock; ticks at PR_SLOWHZ (2 Hz) */
@@ -173,9 +174,178 @@ u_long	tcp_now;		/* RFC 1323 timestamp clock; ticks at PR_SLOWHZ (2 Hz) */
  * flood's cost on the net task. */
 #define TCP_CHALLENGE_ACK_LIMIT 10
 struct	tcpiphdr tcp_saveti = {0};
+/* Guard the size GetNetworkStatistics reports (NG_STAT_TCP_OUR = 188). Adding a
+ * field here without updating that constant truncates the tail silently. */
+typedef char ng_tcpstat_size_matches_NG_STAT_TCP_OUR
+	[(sizeof(struct tcpstat) == 188) ? 1 : -1];
 struct	inpcb *tcp_last_inpcb = &tcb;
 
 struct	tcpcb *tcp_newtcpcb();
+
+/*
+ * PORT (AmiTCP_NG): denominator for the header-prediction hit rate reported by the
+ * SBTC_NG_TCP_* diagnostic tags (see rxprofile). The counters above are plain ints
+ * the API layer can extern directly, but tcps_rcvtotal lives in struct tcpstat,
+ * which is a complete type only where netinet/tcp_var.h is included -- and the API
+ * layer deliberately does not include it (api/amiga_roadshow_compat.c reaches
+ * tcpstat through an incomplete type, for its address alone). Read it through here
+ * rather than dragging the TCP headers into api/amiga_generic2.c for one field.
+ */
+u_long
+ng_tcp_rcvtotal()
+{
+	return (tcpstat.tcps_rcvtotal);
+}
+
+/*
+ * PORT (AmiTCP_NG): header-prediction MISS attribution, for rxprofile.
+ *
+ * Knowing the hit rate is not enough to act on. Measured on real hardware the
+ * fast path takes 98% of segments on a DOWNLOAD but only 9% on an UPLOAD, and
+ * the two candidate causes call for completely different responses:
+ *
+ *   - the peer's advertised window moved (tiwin != snd_wnd). A receiver that is
+ *     draining its buffer changes its window constantly, which is normal and
+ *     costs us only CPU -- a pure ACK that merely updates the window does not
+ *     need the general path.
+ *   - snd_cwnd never reached snd_wnd. That is not a CPU problem at all: it means
+ *     the congestion window is capping the transfer, which given this stack's
+ *     history with tcp_quench collapsing cwnd is the more serious reading.
+ *
+ * Guessing between them is exactly the mistake that cost a release during the
+ * window-scaling work, so count instead. Checks are in the same order as the
+ * prediction test itself and the FIRST failing one wins, so a given call puts
+ * the segment in exactly one bucket.
+ *
+ * The buckets do NOT add up to the slow-path total, for two reasons, both
+ * expected -- do not read a mismatch as a missing bucket:
+ *  - tcps_rcvtotal is counted early (see ~line 519) but several paths drop a
+ *    segment before prediction is ever consulted (bad checksum, no matching
+ *    PCB, RST handling). Those are in the slow-path figure and were never
+ *    offered to the fast path; rxprofile reports them as "dropped pre-check".
+ *  - the TIME_WAIT-reopen case (a SYN past the old window on a TIME_WAIT
+ *    connection) does `goto findpcb`, which jumps BACK above this call site, so
+ *    that one segment is attributed twice -- both times to tcppm_state, since
+ *    neither the old nor the new control block is ESTABLISHED. Rare enough that
+ *    suppressing it would cost more (extra per-segment state) than it is worth.
+ */
+int	tcppm_state = 0, tcppm_flags = 0, tcppm_tstamp = 0, tcppm_seq = 0,
+	tcppm_win = 0, tcppm_rexmit = 0, tcppm_dupack = 0, tcppm_sack = 0;
+int	tcppm_ack = 0, tcppm_cwnd = 0;				/* pure-ACK branch */
+int	tcppm_ackdata = 0, tcppm_reass = 0, tcppm_space = 0;	/* data branch     */
+int	tcppm_zerowin = 0;					/* peer window shut */
+/*
+ * Splitting the old "dup/stale ack" bucket. After the window-update fix that
+ * bucket became the dominant miss on upload (75% of a 43% slow path), and its
+ * label hides two completely different events:
+ *   tcppm_ackdup  -- ack unchanged AND window unchanged. A genuine duplicate
+ *                    ACK, i.e. a LOSS signal. It must stay on the slow path so
+ *                    fast retransmit still works.
+ *   tcppm_winonly -- ack unchanged but the window MOVED. Not a loss signal at
+ *                    all -- usually the peer drained its buffer and is
+ *                    advertising more room, though a (legal, discouraged)
+ *                    shrink lands here too. This is the behaviour the fix
+ *                    addressed, arriving in the one form the pure-ACK branch
+ *                    still cannot take (it requires new data to be acked).
+ * Telling them apart decides whether there is another ~32% of segments to move
+ * off the slow path, or whether we are looking at real packet loss.
+ */
+int	tcppm_ackdup = 0, tcppm_winonly = 0;
+
+/*
+ * May this segment move the send window? The SEQ_LT/SEQ_LEQ ordering CHAIN below
+ * is step6's verbatim; two extra guards are AND-ed on top of it that step6 does
+ * not have -- reject a no-op update (tiwin == snd_wnd) and reject a reopen from
+ * a zero window. Factored into a function so
+ * that the fast path and the attribution below cannot drift apart -- the whole
+ * value of the attribution is that it is a faithful mirror of the real test,
+ * and two hand-maintained copies of a four-term sequence comparison would not
+ * stay faithful for long.
+ *
+ * The ordering guard is what stops a delayed or reordered ACK shrinking the
+ * window back: a segment may only move it if it is newer than whichever segment
+ * last set it (higher sequence, or same sequence and higher ack, or both equal
+ * and the window strictly larger). snd_wnd == 0 is excluded because reopening
+ * from a zero window is persist-timer business and belongs on the slow path.
+ */
+static int
+tcp_winupd_ok(tp, ti, tiwin)
+	register struct tcpcb *tp;
+	register struct tcpiphdr *ti;
+	u_long tiwin;
+{
+	return (tiwin != tp->snd_wnd && tp->snd_wnd != 0 &&
+	    (SEQ_LT(tp->snd_wl1, ti->ti_seq) ||
+	     (tp->snd_wl1 == ti->ti_seq &&
+	      (SEQ_LT(tp->snd_wl2, ti->ti_ack) ||
+	       (tp->snd_wl2 == ti->ti_ack && tiwin > tp->snd_wnd)))));
+}
+
+static void
+tcp_predict_miss(tp, ti, tiflags, tiwin, ts_present, ts_val)
+	register struct tcpcb *tp;
+	register struct tcpiphdr *ti;
+	int tiflags;
+	u_long tiwin;
+	int ts_present;
+	tcp_seq ts_val;
+{
+	if (tp->t_state != TCPS_ESTABLISHED)
+		{ tcppm_state++;   return; }	/* handshake/teardown: expected */
+	if ((tiflags & (TH_SYN|TH_FIN|TH_RST|TH_URG|TH_ACK)) != TH_ACK)
+		{ tcppm_flags++;   return; }
+	if (ts_present && !TSTMP_GEQ(ts_val, tp->ts_recent))
+		{ tcppm_tstamp++;  return; }
+	if (ti->ti_seq != tp->rcv_nxt)
+		{ tcppm_seq++;     return; }	/* out of order -- a real hole */
+	if (tiwin == 0)
+		{ tcppm_zerowin++; return; }	/* peer's receive buffer is full */
+	if (tp->snd_nxt != tp->snd_max)
+		{ tcppm_rexmit++;  return; }	/* we have a retransmit outstanding */
+	if (tp->t_dupacks >= tcprexmtthresh)
+		{ tcppm_dupack++;  return; }
+	if (tp->t_flags & TF_SACK_RECOVER)
+		{ tcppm_sack++;    return; }
+
+	/*
+	 * The outer test passed, so one of the two inner branches rejected it.
+	 * Both now test the window themselves, so the order here follows each
+	 * branch's own order rather than a single shared one.
+	 */
+	if (ti->ti_len == 0) {
+		if (SEQ_GT(ti->ti_ack, tp->snd_una) &&
+		    SEQ_LEQ(ti->ti_ack, tp->snd_max)) {
+			/* the pure-ACK branch: rejected on window or on cwnd */
+			if (!(tiwin == tp->snd_wnd || tcp_winupd_ok(tp, ti, tiwin)))
+				tcppm_win++;	/* window moved, but not legally */
+			else
+				tcppm_cwnd++;	/* snd_cwnd below the window */
+		} else if (ti->ti_ack != tp->snd_una) {
+			tcppm_ack++;		/* genuinely out of range */
+		} else if (tiwin != tp->snd_wnd) {
+			/*
+			 * Ack unchanged and the window moved -- but the pure
+			 * window-update branch did NOT take it, so the ordering
+			 * rule rejected the move (stale or reordered segment).
+			 * A LEGAL window update is fast-pathed now and can never
+			 * reach here, so this bucket no longer means "window
+			 * update we could not use"; it means one we refused.
+			 */
+			tcppm_winonly++;
+		} else {
+			tcppm_ackdup++;		/* true duplicate ACK: loss */
+		}
+	} else {
+		if (tiwin != tp->snd_wnd)
+			tcppm_win++;		/* data branch still requires it */
+		else if (ti->ti_ack != tp->snd_una)
+			tcppm_ackdata++;	/* data that also acks new data */
+		else if (tp->seg_next != (struct tcpiphdr *)tp)
+			tcppm_reass++;		/* reassembly queue not empty */
+		else
+			tcppm_space++;		/* no room in the socket buffer */
+	}
+}
 
 /*
  * Insert segment ti into reassembly queue of tcp with
@@ -255,18 +425,45 @@ tcp_reass(tp, ti, m)
 	 * retransmitted by the peer (ordinary loss recovery), so no data is lost
 	 * and no protocol rule broken. Done here, before any queue mutation, so
 	 * a rejected segment leaves the existing queue untouched.
+	 *
+	 * The byte bound alone is not enough: every queued segment pins one whole
+	 * struct mbuf (MSIZE) no matter how small its payload, so a peer sending
+	 * 1-byte gapped segments costs us MSIZE per byte charged -- a ~128x
+	 * amplification that exhausts the shared pool long before `room` is
+	 * reached. So ALSO bound the segment COUNT, to room/MSIZE: that caps this
+	 * queue's mbuf overhead at roughly `room` bytes, keeping total cost in the
+	 * same order as the byte bound already permits. It is deliberately
+	 * proportional rather than a flat constant -- a full-MSS sender only ever
+	 * needs room/MSS segments, ~11x below this cap at every memory tier, so a
+	 * well-behaved peer (including a large-window bulk transfer with one hole)
+	 * never reaches it. The floor keeps very small receive buffers workable.
+	 *
+	 * That ~11x margin is MSS/MSIZE, so it holds at every tier but does shrink
+	 * with a smaller negotiated t_maxseg. RFC 1122 mandates a 536-byte minimum
+	 * MSS, which keeps the margin above 4x for any conforming peer; a peer
+	 * actually sending sub-128-byte segments is indistinguishable from the
+	 * gapped-segment flood this cap exists to stop, so capping it is the
+	 * intended outcome rather than a regression.
 	 */
 	{
 		register struct tcpiphdr *p;
 		long reasslen = 0;
+		long segs = 0;
 		long room = (long)so->so_rcv.sb_hiwat - (long)so->so_rcv.sb_cc;
+		long maxsegs;
 
 		if (room < 0)
 			room = 0;
+		maxsegs = room / MSIZE;
+		if (maxsegs < 8)		/* tiny SO_RCVBUF must still work */
+			maxsegs = 8;
 		for (p = tp->seg_next; p != (struct tcpiphdr *)tp;
-		     p = (struct tcpiphdr *)p->ti_next)
+		     p = (struct tcpiphdr *)p->ti_next) {
 			reasslen += (u_short)p->ti_len;
-		if (reasslen + (long)(u_short)ti->ti_len > room) {
+			segs++;
+		}
+		if (reasslen + (long)(u_short)ti->ti_len > room ||
+		    segs + 1 > maxsegs) {
 			m_freem(m);
 			return (0);
 		}
@@ -595,11 +792,26 @@ findpcb:
 	 * (the reassembly queue is empty), add the data to
 	 * the socket buffer and note that we need a delayed ack.
 	 */
+	/*
+	 * PORT (AmiTCP_NG): the window test used to live here, in the outer
+	 * condition, so a segment whose window had moved was rejected for BOTH
+	 * branches. Measured on real hardware that made the sender side almost
+	 * useless: on an upload 5388 of 5540 rejections were this one test, while
+	 * only 52 were snd_cwnd < snd_wnd. The asymmetry is inherent -- on a
+	 * download the peer is a pure sender whose advertised window never moves
+	 * (98% predicted), but on an upload the peer is a receiver draining its
+	 * buffer, so its window changes on nearly every ACK.
+	 *
+	 * The test is therefore pushed down into the two branches, which want
+	 * different things: the data branch keeps it verbatim (it is already at
+	 * 98% and does not update snd_wnd), while the pure-ACK branch accepts a
+	 * changed window and applies the update inline. See there.
+	 */
 	if (tp->t_state == TCPS_ESTABLISHED &&
 	    (tiflags & (TH_SYN|TH_FIN|TH_RST|TH_URG|TH_ACK)) == TH_ACK &&
 	    (!ts_present || TSTMP_GEQ(ts_val, tp->ts_recent)) &&
 	    ti->ti_seq == tp->rcv_nxt &&
-	    tiwin && tiwin == tp->snd_wnd &&
+	    tiwin != 0 &&
 	    tp->snd_nxt == tp->snd_max &&
 	    tp->t_dupacks < tcprexmtthresh &&		/* not in Reno/NewReno recovery */
 	    (tp->t_flags & TF_SACK_RECOVER) == 0) {	/* not while SACK-recovering: */
@@ -615,13 +827,79 @@ findpcb:
 			tp->ts_recent = ts_val;
 		}
 		if (ti->ti_len == 0) {
+			/*
+			 * Window handling for a pure ACK. Either the window is
+			 * unchanged (the classic case), or this segment is a
+			 * legitimate window update -- in which case take it here
+			 * rather than dropping to the general path for what is a
+			 * couple of assignments.
+			 *
+			 * newwnd is only a CANDIDATE. Nothing is committed until
+			 * we know the fast path is actually being taken, because a
+			 * half-applied update followed by a fall-through to the
+			 * slow path would leave snd_wl1/snd_wl2 moved with none of
+			 * the rest of the slow path's ACK processing done.
+			 *
+			 * The ordering chain inside tcp_winupd_ok is step6's,
+			 * verbatim (the extra guards around it are noted there):
+			 * a segment may
+			 * only move the window if it is newer than the one that
+			 * last set it, so a delayed or reordered ACK can never
+			 * shrink the window back. A zero-window ACK is already
+			 * excluded by the outer test, and snd_wnd == 0 (persist)
+			 * is excluded below -- reopening from zero needs
+			 * tcp_output's persist handling, so it stays on the slow
+			 * path deliberately.
+			 */
+			/* Short-circuit the common case. tcp_winupd_ok() re-checks
+			 * tiwin != snd_wnd itself, so this is behaviour-neutral, but
+			 * it keeps a possible function call off the hottest path in
+			 * the file for the majority case (window unchanged). */
+			int winupd = (tiwin != tp->snd_wnd) &&
+			    tcp_winupd_ok(tp, ti, tiwin);
+			u_long newwnd = winupd ? tiwin : tp->snd_wnd;
+
 			if (SEQ_GT(ti->ti_ack, tp->snd_una) &&
 			    SEQ_LEQ(ti->ti_ack, tp->snd_max) &&
-			    tp->snd_cwnd >= tp->snd_wnd) {
+			    (tiwin == tp->snd_wnd || winupd) &&
+			    tp->snd_cwnd >= newwnd) {
 				/*
 				 * this is a pure ack for outstanding data.
 				 */
 				++tcppredack;
+				/*
+				 * This ACK covers new data, so any duplicate
+				 * count standing against the old snd_una is
+				 * spent -- clear it, exactly as the slow path
+				 * does for the same segment and as the pure
+				 * window-update branch below does. Leaving it
+				 * behind lets an isolated dup ACK from mere
+				 * reordering survive across this fast-pathed
+				 * ACK and combine with two later ones to fire
+				 * a fast retransmit off only two real dups,
+				 * needlessly collapsing cwnd. Inherited from
+				 * the 4.4BSD header prediction, which omits it.
+				 */
+				tp->t_dupacks = 0;
+
+				/*
+				 * Commit the window update, now that the fast
+				 * path is certain. Mirrors step6 exactly,
+				 * max_sndwnd and the pure-window-update stat
+				 * included -- those feed congestion control and
+				 * GetNetworkStatistics, and silently skipping
+				 * them here would make the two paths disagree.
+				 */
+				if (winupd) {
+					if (tp->snd_wl2 == ti->ti_ack &&
+					    tiwin > tp->snd_wnd)
+						tcpstat.tcps_rcvwinupd++;
+					tp->snd_wnd = tiwin;
+					tp->snd_wl1 = ti->ti_seq;
+					tp->snd_wl2 = ti->ti_ack;
+					if (tp->snd_wnd > tp->max_sndwnd)
+						tp->max_sndwnd = tp->snd_wnd;
+				}
 				/*
 				 * RFC 1323 RTTM: prefer the echoed timestamp,
 				 * but only when timestamps were actually
@@ -637,6 +915,21 @@ findpcb:
 				tcpstat.tcps_rcvackbyte += acked;
 				sbdrop(&so->so_snd, acked);
 				tp->snd_una = ti->ti_ack;
+				/*
+				 * Fold this ack's SACK blocks into the sender
+				 * scoreboard. This branch returns without ever
+				 * reaching tcp_sack_update() on the slow path,
+				 * so without this the blocks are parsed and
+				 * silently discarded. Placed AFTER snd_una has
+				 * advanced deliberately: Update/Trim clamp
+				 * against snd_una as their floor, so the new
+				 * value retires anything this ack already
+				 * covered instead of briefly tracking it as an
+				 * island that a later call would have to clean
+				 * up.
+				 */
+				if ((tp->t_flags & TF_SACK_PERMIT) && sackin_n)
+					tcp_sack_update(tp, sackin, sackin_n);
 				m_freem(m);
 
 				/*
@@ -658,8 +951,86 @@ findpcb:
 				if (so->so_snd.sb_cc)
 					(void) tcp_output(tp);
 				return;
+			} else if (ti->ti_ack == tp->snd_una && winupd) {
+				/*
+				 * A PURE WINDOW UPDATE: acknowledges nothing new,
+				 * but the peer legitimately moved its window. On an
+				 * upload these dominate what is left of the slow
+				 * path -- measured on real hardware at 63% of it,
+				 * against 3 genuine duplicate ACKs in the whole
+				 * transfer -- because the peer's application keeps
+				 * draining its receive buffer and advertising the
+				 * room, without us having sent anything new to ack.
+				 *
+				 * Telling this apart from a duplicate ACK is NOT a
+				 * new rule: the slow path's own dup-ack handling
+				 * requires `ti_len == 0 && tiwin == tp->snd_wnd`, so
+				 * an ACK whose window moved is already not treated
+				 * as a loss signal. winupd carries exactly that
+				 * distinction, ordering guard included, so a stale
+				 * or reordered ACK cannot get in here.
+				 *
+				 * This needs its own branch rather than a relaxed
+				 * version of the one above, because two of the
+				 * things that branch does are WRONG here:
+				 *
+				 *  - it advances snd_una and sbdrops the acked
+				 *    data. Nothing was acked; both must not happen.
+				 *  - it restarts TCPT_REXMT. That is only correct
+				 *    when new data was acknowledged. Doing it here
+				 *    would push the retransmit deadline back every
+				 *    time the peer advertised more room -- and the
+				 *    peer sends these constantly -- which could
+				 *    defer a genuinely needed retransmit for as
+				 *    long as the window keeps moving. The slow path
+				 *    deliberately leaves the timer alone for this
+				 *    case; so do we.
+				 *
+				 * What the slow path DOES do, and is easy to miss:
+				 * it clears t_dupacks (tcp_input.c, the else of the
+				 * dup-ack test). Skipping that would leave a stale
+				 * count behind that could later fire a spurious
+				 * fast retransmit.
+				 */
+				++tcppredwin;
+				tp->t_dupacks = 0;
+
+				if (tp->snd_wl2 == ti->ti_ack &&
+				    tiwin > tp->snd_wnd)
+					tcpstat.tcps_rcvwinupd++;
+				tp->snd_wnd = tiwin;
+				tp->snd_wl1 = ti->ti_seq;
+				tp->snd_wl2 = ti->ti_ack;
+				if (tp->snd_wnd > tp->max_sndwnd)
+					tp->max_sndwnd = tp->snd_wnd;
+
+				/*
+				 * Fold this ack's SACK blocks into the sender
+				 * scoreboard before returning -- the slow path
+				 * does it at tcp_sack_update() below, which this
+				 * branch never reaches. This matters more here
+				 * than in the branch above: by cumulative
+				 * sequence this IS a duplicate ack, which is
+				 * exactly the shape a SACK receiver sends while
+				 * a hole is outstanding. snd_una does not move
+				 * in this branch (it requires ti_ack ==
+				 * snd_una), so the clamp floor is unchanged.
+				 */
+				if ((tp->t_flags & TF_SACK_PERMIT) && sackin_n)
+					tcp_sack_update(tp, sackin, sackin_n);
+
+				m_freem(m);
+				/*
+				 * The point of a window update is that we may now
+				 * be able to send more, which is what step6's
+				 * needoutput would have caused.
+				 */
+				if (so->so_snd.sb_cc)
+					(void) tcp_output(tp);
+				return;
 			}
-		} else if (ti->ti_ack == tp->snd_una &&
+		} else if (tiwin == tp->snd_wnd &&	/* window unchanged: see above */
+		    ti->ti_ack == tp->snd_una &&
 		    tp->seg_next == (struct tcpiphdr *)tp &&
 		    ti->ti_len <= sbspace(&so->so_rcv)) {
 			/*
@@ -695,6 +1066,14 @@ findpcb:
 	}
 
 	/*
+	 * Reaching here means header prediction did NOT take this segment, so
+	 * record WHY. Costs a handful of compares, and only on the path that is
+	 * already about to spend hundreds of instructions -- the predicted path
+	 * returned above and never gets here.
+	 */
+	tcp_predict_miss(tp, ti, tiflags, tiwin, ts_present, ts_val);
+
+	/*
 	 * Drop TCP and IP headers; TCP options were dropped above.
 	 */
 	m->m_data += sizeof(struct tcpiphdr);
@@ -711,7 +1090,16 @@ findpcb:
 	win = sbspace(&so->so_rcv);
 	if (win < 0)
 		win = 0;
-	tp->rcv_wnd = max(win, (int)(tp->rcv_adv - tp->rcv_nxt));
+	/*
+	 * PORT (AmiTCP_NG) fix: imax(), not max(). This file's max() takes
+	 * UNSIGNED parameters (kern/amiga_subr.h), so a negative second operand
+	 * converts to a huge unsigned value and wins the comparison. rcv_adv -
+	 * rcv_nxt IS legitimately negative when the peer has sent past our
+	 * advertised right edge -- which is exactly why the expression carries
+	 * an explicit (int) cast -- and rcv_wnd would then be set to ~4 billion.
+	 * Stock 4.4BSD uses imax() here for this reason.
+	 */
+	tp->rcv_wnd = imax(win, (int)(tp->rcv_adv - tp->rcv_nxt));
 	}
 
 	switch (tp->t_state) {
@@ -1113,17 +1501,28 @@ trimthenstep6:
 	/*
 	 * RFC 6675: fold this ACK's SACK blocks into the sender scoreboard before
 	 * the ack ladder runs, so loss recovery (B2) sees the latest picture. Also
-	 * trims blocks the cumulative ack covered. Gated on TF_SACK_PERMIT -- inert
-	 * (scoreboard only maintained, not yet consulted) until the recovery code
-	 * lands. snd_una is still the pre-advance value here, which is what Update
+	 * trims blocks the cumulative ack covered. Gated on TF_SACK_PERMIT. This is
+	 * NOT dormant scaffolding any more: recovery landed in this revision, and
+	 * tcp_output() drives retransmission straight off this scoreboard
+	 * (tcp_sack_pipe/tcp_sack_nextseg/tcp_sack_rescue) whenever TF_SACK_RECOVER
+	 * is set. snd_una is still the pre-advance value here, which is what Update
 	 * clamps against.
 	 *
 	 * NB the ESTABLISHED header-prediction fast path (above) returns before
-	 * reaching here, so a pure in-order ack does NOT freshen/trim the
-	 * scoreboard -- harmless (that path only fires with no loss, hence no
-	 * recovery), and the dup acks that actually signal loss fail the fast
-	 * path's SEQ_GT test and always fall through to here. B2 must therefore
-	 * not assume every ack has run Update.
+	 * reaching here, so it maintains the scoreboard ITSELF -- both of its
+	 * ack-carrying branches call tcp_sack_update() before returning, each
+	 * with the value snd_una holds at that point (advanced, in the
+	 * new-data branch; unchanged, in the pure window-update branch).
+	 *
+	 * That is not merely an optimisation to keep the counters tidy. This
+	 * comment used to say the dup acks that signal loss "fail the fast
+	 * path's SEQ_GT test and always fall through to here", which WAS true
+	 * while the only pure-ack branch required SEQ_GT(ti_ack, snd_una). The
+	 * window-update branch is defined by ti_ack == snd_una -- a duplicate
+	 * ack by cumulative sequence -- so it broke that invariant, and with it
+	 * every inbound SACK block on such a segment was parsed and thrown away.
+	 * Do not reinstate the assumption: if a third fast-path branch is ever
+	 * added, it owes the scoreboard the same call.
 	 */
 	if (tp->t_flags & TF_SACK_PERMIT) {
 		/*
@@ -1903,8 +2302,9 @@ tcp_dooptions(tp, om, ti, ts_present, ts_val, ts_ecr, sack, nsack)
 			/*
 			 * RFC 2018 SACK-permitted. Only meaningful in a SYN. If we
 			 * offered it too (TF_REQ_SACK), SACK is negotiated for this
-			 * connection (TF_SACK_PERMIT). Inert until the block-emit /
-			 * sender-scoreboard code (later commits) reads TF_SACK_PERMIT.
+			 * connection (TF_SACK_PERMIT). Live as of this revision: both
+			 * the block-emit path and the sender scoreboard read
+			 * TF_SACK_PERMIT, and tcp_output() retransmits from it.
 			 */
 			if (optlen != TCPOLEN_SACK_PERMITTED)
 				continue;
@@ -2232,7 +2632,17 @@ tcp_mss(tp, offer)
 	 */
 	if (offer)
 		mss = min(mss, offer);
-	mss = max(mss, 32);		/* sanity */
+	/*
+	 * PORT (AmiTCP_NG) fix: imax(), not max() -- see kern/amiga_subr.h.
+	 * max() takes unsigned parameters, so this "sanity" floor was a no-op
+	 * for a negative mss: it converted to a huge unsigned, compared greater
+	 * than 32, and was returned unchanged. mss then stayed negative into the
+	 * `bufsize < mss` test below, which is also unsigned, so it was always
+	 * true and t_maxseg ended up as the send-buffer high-water mark rather
+	 * than a real segment size. A negative mss is reachable from a bogus
+	 * interface MTU (if_mtu is a signed short).
+	 */
+	mss = imax(mss, 32);		/* sanity */
 	if (mss < tp->t_maxseg || offer != 0) {
 		/*
 		 * If there's a pipesize, change the socket buffer

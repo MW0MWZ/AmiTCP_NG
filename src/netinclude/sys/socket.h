@@ -120,6 +120,42 @@
 #define	SO_TYPE		0x1008		/* get socket type */
 
 /*
+ * PORT (AmiTCP_NG): the asynchronous socket-event option.
+ *
+ * This is NOT a BSD option. It is part of the AmiTCP V4 / Roadshow API, where
+ * the value and its semantics are defined by the Roadshow SDK
+ * (netinclude/sys/socket.h, "a private option which is used exclusively by this
+ * Amiga TCP/IP stack implementation") -- reproduced here for compatibility, with
+ * thanks to Olaf Barthel. AmiTCP 3.0b2, which this fork descends from, predates
+ * the mechanism entirely, which is why it was missing.
+ *
+ * setsockopt(s, SOL_SOCKET, SO_EVENTMASK, &mask, sizeof mask) selects which of
+ * the FD_* events (amitcp/socketbasetags.h) this socket reports through
+ * GetSocketEvents(). Programs that use it treat a failure as fatal -- Amiga
+ * Explorer aborts its post-accept setup on one -- so returning ENOPROTOOPT here
+ * broke every Roadshow-model event-driven client.
+ */
+#define SO_EVENTMASK	0x2001		/* asynchronous socket event mask */
+
+/*
+ * The events themselves: the set selected per-socket with SO_EVENTMASK, and the
+ * set reported through the ULONG that GetSocketEvents() fills in. Roadshow keeps
+ * these in <libraries/bsdsocket.h>; they live here so the stack's own socket code
+ * can see them without including an Amiga API header. Values are Roadshow's and
+ * must not be renumbered -- they are compiled into every existing client.
+ */
+#define FD_ACCEPT	0x01		/* there is a connection to accept() */
+#define FD_CONNECT	0x02		/* connect() completed */
+#define FD_OOB		0x04		/* socket has out-of-band data */
+#define FD_READ		0x08		/* socket is readable */
+#define FD_WRITE	0x10		/* socket is writeable */
+#define FD_ERROR	0x20		/* asynchronous error on socket */
+#define FD_CLOSE	0x40		/* connection closed (graceful or not) */
+
+#define FD_ALL_EVENTS	(FD_ACCEPT|FD_CONNECT|FD_OOB|FD_READ|FD_WRITE| \
+			 FD_ERROR|FD_CLOSE)
+
+/*
  * Structure used for manipulating linger option.
  */
 struct	linger {

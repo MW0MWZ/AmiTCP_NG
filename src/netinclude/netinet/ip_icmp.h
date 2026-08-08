@@ -141,6 +141,19 @@ struct icmp {
 #define	ICMP_TSTAMPREPLY	14		/* timestamp reply */
 #define	ICMP_IREQ		15		/* information request */
 #define	ICMP_IREQREPLY		16		/* information reply */
+/*
+ * PORT (AmiTCP_NG): how an incoming ICMP echo or time stamp request is to be
+ * handled, selected with SocketBaseTags(SBTC_ICMP_PROCESS_ECHO / _TSTAMP).
+ * Values and meanings are the AmiTCP V4 / Roadshow ones (Roadshow SDK
+ * netinclude/libraries/bsdsocket.h), reproduced for compatibility with thanks
+ * to Olaf Barthel. They live in this header rather than with the tags because
+ * the stack's own ICMP code has to see them and must not include an Amiga API
+ * header to do it.
+ */
+#define	IR_Process	0		/* answer the request (the default) */
+#define	IR_Ignore	1		/* no reply, but pass to raw IP */
+#define	IR_Drop		2		/* no reply, account as a bad checksum */
+
 #define	ICMP_MASKREQ		17		/* address mask request */
 #define	ICMP_MASKREPLY		18		/* address mask reply */
 

@@ -511,7 +511,9 @@ tcp_ctlinput(cmd, sa, ip)
 
 	if (cmd == PRC_QUENCH)
 		notify = tcp_quench;
-	else if ((unsigned)cmd > PRC_NCMDS || inetctlerrmap[cmd] == 0)
+	/* PORT (AmiTCP_NG) fix: >= , not > -- cmd == PRC_NCMDS would index one
+	 * past the end of inetctlerrmap[]. See raw_usrreq.c. */
+	else if ((unsigned)cmd >= PRC_NCMDS || inetctlerrmap[cmd] == 0)
 		return;
 	if (ip) {
 		th = (struct tcphdr *)((caddr_t)ip + (ip->ip_hl << 2));

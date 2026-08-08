@@ -64,7 +64,8 @@ STRPTR KW_VARS = (STRPTR)
   "NTH=NTHBASE,DBSANA=DEBUGSANA,DBICMP=DEBUGICMP,DBIP=DEBUGIP,"
   "GTW=GATEWAY,REDIR=IPSENDREDIRECTS,USENS=USENAMESERVER,"
   "ULO=USELOOPBACK,TCPSND=TCP_SENDSPACE,TCPRCV=TCP_RECVSPACE,"
-  "TCPMSS=TCP_MSSDFLT,TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,LOGF=LOGFILENAME";
+  "TCPMSS=TCP_MSSDFLT,TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,"
+  "LOGF=LOGFILENAME,LOGGING,LOGCON=LOGCONSOLE,LOGL=LOGLEVEL";
 
 /* extern declarations */
 
@@ -96,6 +97,9 @@ extern int tcp_mssdflt;
 extern int tcp_iw;
 extern STRPTR consolename ;	 int logname_changed(void *pt, LONG new);
 extern STRPTR logfilename;
+extern LONG log_enabled;
+extern LONG log_console_enabled;
+extern LONG log_level ;	 int loglevel_changed(void *pt, LONG new);
 /* Global variables */
 STRPTR KW_Protocols = (STRPTR)KW_ROUTES;
 struct cfg_variable variables[] = {
@@ -126,5 +130,8 @@ struct cfg_variable variables[] = {
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_mssdflt, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_iw, NULL },
 { VAR_STRP, VF_RW, NULL, &consolename, logname_changed },
-{ VAR_STRP, VF_RW, NULL, &logfilename, logname_changed }
+{ VAR_STRP, VF_RW, NULL, &logfilename, logname_changed },
+{ VAR_ENUM, VF_RW, NULL, &log_enabled, boolean_enum },
+{ VAR_ENUM, VF_RW, NULL, &log_console_enabled, boolean_enum },
+{ VAR_LONG, VF_RW, NULL, &log_level, loglevel_changed }
 };

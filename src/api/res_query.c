@@ -161,7 +161,7 @@ res_query(struct SocketBase *	libPtr,
 #ifdef RES_DEBUG
 			printf("res_query: mkquery failed\n");
 #endif
-			h_errno = NO_RECOVERY;
+			set_h_errno(NO_RECOVERY);
 			goto Return;
 	}
 	n = res_send(libPtr, buf, n, (char *)answer, anslen);
@@ -169,7 +169,7 @@ res_query(struct SocketBase *	libPtr,
 #ifdef RES_DEBUG
 			printf("res_query: send error\n");
 #endif
-			h_errno = TRY_AGAIN;
+			set_h_errno(TRY_AGAIN);
 			goto Return;
 	}
 
@@ -181,19 +181,19 @@ res_query(struct SocketBase *	libPtr,
 #endif
 		switch (hp->rcode) {
 			case NXDOMAIN:
-				h_errno = HOST_NOT_FOUND;
+				set_h_errno(HOST_NOT_FOUND);
 				break;
 			case SERVFAIL:
-				h_errno = TRY_AGAIN;
+				set_h_errno(TRY_AGAIN);
 				break;
 			case NOERROR:
-				h_errno = NO_DATA;
+				set_h_errno(NO_DATA);
 				break;
 			case FORMERR:
 			case NOTIMP:
 			case REFUSED:
 			default:
-				h_errno = NO_RECOVERY;
+				set_h_errno(NO_RECOVERY);
 				break;
 		}
 		n = -1;
@@ -233,7 +233,7 @@ res_search(struct SocketBase *	libPtr,
 		return (-1);
 #endif /* !AMITCP */
 	writeErrnoValue(libPtr, 0);
-	h_errno = HOST_NOT_FOUND;	       /* default, if we never query */
+	set_h_errno(HOST_NOT_FOUND);	       /* default, if we never query */
 	for (cp = name, n = 0; *cp; cp++)
 		if (*cp == '.')
 			n++;
@@ -330,7 +330,7 @@ res_search(struct SocketBase *	libPtr,
 		 * but try the input name below in case it's fully-qualified.
 		 */
 		if (readErrnoValue(libPtr) == ECONNREFUSED) {
-			h_errno = TRY_AGAIN;
+			set_h_errno(TRY_AGAIN);
 			return (-1);
 		}
 		if (h_errno == NO_DATA)
@@ -352,7 +352,7 @@ res_search(struct SocketBase *	libPtr,
 					class, type, answer, anslen)) > 0)
 		return (ret);
 	if (got_nodata)
-		h_errno = NO_DATA;
+		set_h_errno(NO_DATA);
 	return (-1);
 }
 

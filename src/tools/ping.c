@@ -281,8 +281,29 @@ int main(void)
     for (;;) {
       ULONG rd = 1UL << sock; ULONG *rdp = &rd;
       int ihl; struct ng_icmp *ric;
+      struct timeval tnow; long rem_s, rem_us;
 
-      tvto.tv_secs = timeout; tvto.tv_micro = 0;
+      /*
+       * Arm the wait with the time REMAINING until this probe's deadline
+       * (t0 + timeout), not a fresh full timeout. Re-arming the full value on
+       * every discarded packet -- and a raw ICMP socket receives all ICMP not
+       * claimed elsewhere on the host, so unrelated chatter arrives routinely
+       * -- meant -t was never an upper bound and a scripted run could wait
+       * indefinitely with only Ctrl-C to stop it.
+       * Computed in seconds+microseconds rather than converting to a single
+       * microsecond count, which would overflow a 32-bit long (timeout is
+       * clamped to 3600s above, and 3600 * 1000000 does not fit).
+       */
+      timer_now(&tnow);
+      rem_s  = (long)(t0.tv_secs + (ULONG)timeout) - (long)tnow.tv_secs;
+      rem_us = (long)t0.tv_micro - (long)tnow.tv_micro;
+      if (rem_us < 0) { rem_us += 1000000L; rem_s--; }
+      if (rem_s < 0 || (rem_s == 0 && rem_us <= 0)) {
+        if (!quiet) Printf((STRPTR)"Request timeout for icmp_seq %ld\n", i);
+        break;
+      }
+
+      tvto.tv_secs = (ULONG)rem_s; tvto.tv_micro = (ULONG)rem_us;
       sig = SIGBREAKF_CTRL_C;
       n = ng_waitselect(sock + 1, rdp, 0, 0, &tvto, &sig);
       if (n < 0) { if (!quiet) Printf((STRPTR)"ping: select failed (errno %ld)\n", ng_errno()); break; }
@@ -299,7 +320,13 @@ int main(void)
       ihl = (rbuf[0] & 0x0F) * 4;
       if (ihl < 20 || n < ihl + (int)sizeof(struct ng_icmp)) continue;	/* short/malformed */
       ric = (struct ng_icmp *)(rbuf + ihl);
-      if (ric->type != NG_ICMP_ECHOREPLY || ric->id != (UWORD)ident)
+      /* Match the sequence too, not just the id. The id is constant for the
+       * whole run, so a late reply to an earlier, already-timed-out probe
+       * would otherwise be accepted as this one's: counted in `recvd` and
+       * timed against THIS probe's t0, reporting an RTT far shorter than the
+       * real one. That happens exactly on the lossy links where ping matters. */
+      if (ric->type != NG_ICMP_ECHOREPLY || ric->id != (UWORD)ident ||
+          ric->seq != (UWORD)i)
         continue;						/* not our echo reply */
 
       timer_now(&t1);

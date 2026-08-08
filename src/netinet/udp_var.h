@@ -71,6 +71,8 @@ struct	udpiphdr {
 #define	ui_ulen		ui_u.uh_ulen
 #define	ui_sum		ui_u.uh_sum
 
+/* PORT (AmiTCP_NG): see the note on struct tcpstat -- NG_STAT_UDP_FULL in
+ * api/amiga_roadshow_compat.c hardcodes this struct's size. Keep them in step. */
 struct	udpstat {
 				/* input statistics: */
 	u_long	udps_ipackets;		/* total input packets */

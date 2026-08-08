@@ -387,7 +387,7 @@ soclose(so)
 			/*
 			 * Find socket base for the tsleep()
 			 */
-			if ((socketBase = FindSocketBase(FindTask(NULL)))
+			if ((socketBase = FindCallerBase(FindTask(NULL)))
 			    == NULL)
 				goto drop; /* couldn't find */
 			timeo = (so->so_linger.tv_sec 
@@ -587,7 +587,7 @@ sosend(so, addr, uio, top, control, flags)
 	 * a NULL uio, but if one ever does, fall back to this task's base rather
 	 * than dereferencing NULL. */
 	struct SocketBase *procp = uio ? uio->uio_procp
-				       : FindSocketBase(FindTask(NULL));
+				       : FindCallerBase(FindTask(NULL));
 
 	if (uio)
 		resid = uio->uio_resid;
@@ -1129,7 +1129,7 @@ sorflush(so)
 	register struct protosw *pr = so->so_proto;
 	register spl_t s;
 	struct sockbuf asb;
-	struct SocketBase *base = FindSocketBase(FindTask(NULL));
+	struct SocketBase *base = FindCallerBase(FindTask(NULL));
 
 	sb->sb_flags |= SB_NOINTR;
 	/*
@@ -1210,6 +1210,18 @@ sosetopt(so, level, optname, m0)
 			}
 			{
 			  int val = mtod(m, struct linger *)->l_linger;
+
+			  /*
+			   * PORT (AmiTCP_NG) fix: reject a negative linger. It is
+			   * stored into a timeval whose seconds field is consumed as
+			   * unsigned by the tsleep timeout arithmetic, so a negative
+			   * value becomes an effectively infinite wait -- close() would
+			   * block the calling task for ~136 years.
+			   */
+			  if (val < 0) {
+				  error = EINVAL;
+				  goto bad;
+			  }
 #ifdef AMITCP
 			  /*
 			   * l_linger is in seconds
@@ -1240,6 +1252,38 @@ sosetopt(so, level, optname, m0)
 			else
 				so->so_options &= ~optname;
 			break;
+
+#ifdef AMITCP
+		/*
+		 * PORT (AmiTCP_NG): SO_EVENTMASK -- select which asynchronous
+		 * events (FD_*) this socket reports through GetSocketEvents().
+		 * Not BSD; part of the AmiTCP V4 / Roadshow API, and the option
+		 * whose absence broke every Roadshow-model event-driven client.
+		 *
+		 * Unknown bits are rejected rather than ignored. A client that
+		 * asks for an event this stack never raises would otherwise wait
+		 * for a signal that cannot arrive, which is a far worse failure
+		 * than an error it can see at setup time.
+		 */
+		case SO_EVENTMASK: {
+			u_long mask;
+
+			if (m == NULL || m->m_len < sizeof (u_long)) {
+				error = EINVAL;
+				goto bad;
+			}
+			mask = *mtod(m, u_long *);
+			if (mask & ~(u_long)FD_ALL_EVENTS) {
+				error = EINVAL;
+				goto bad;
+			}
+			so->so_eventmask = mask;
+			/* Drop anything already recorded that is no longer wanted,
+			 * so a narrowed mask cannot report a stale event. */
+			so->so_events &= mask;
+			break;
+		    }
+#endif /* AMITCP */
 
 		case SO_SNDBUF:
 		case SO_RCVBUF:
@@ -1280,6 +1324,18 @@ sosetopt(so, level, optname, m0)
 				goto bad;
 			}
 			tv = mtod(m, struct timeval *);
+
+			/*
+			 * PORT (AmiTCP_NG) fix: reject negative timeouts. sb_timeo is
+			 * read back as an unsigned tick count by the send/receive
+			 * sleep paths, so a negative tv_sec/tv_usec does not mean
+			 * "no timeout" -- it means a wait of ~136 years, wedging the
+			 * calling task on the next blocking socket operation.
+			 */
+			if (tv->tv_sec < 0 || tv->tv_usec < 0) {
+				error = EINVAL;
+				goto bad;
+			}
 
 			switch (optname) {
 
@@ -1358,9 +1414,27 @@ sogetopt(so, level, optname, mp)
 			*mtod(m, int *) = so->so_type;
 			break;
 
+#ifdef AMITCP
+		/* PORT (AmiTCP_NG): read back the event selection. Reports what
+		 * was requested, NOT what is currently pending -- pending events
+		 * are collected with GetSocketEvents(), and returning them here
+		 * would let a getsockopt() silently consume them. */
+		case SO_EVENTMASK:
+			m->m_len = sizeof (u_long);
+			*mtod(m, u_long *) = so->so_eventmask;
+			break;
+#endif /* AMITCP */
+
 		case SO_ERROR:
 			*mtod(m, int *) = so->so_error;
 			so->so_error = 0;
+#ifdef AMITCP
+			/* PORT (AmiTCP_NG): this is the documented way to clear
+			 * the error, so it is also where the FD_ERROR latch is
+			 * released -- otherwise the same errno recurring later
+			 * would be silently swallowed as "already reported". */
+			so->so_error_reported = 0;
+#endif
 			break;
 
 		case SO_SNDBUF:
@@ -1405,7 +1479,11 @@ sohasoutofband(so)
 	register struct socket *so;
 {
 #ifdef AMITCP
-	if (so->so_pgid)
+	/* PORT (AmiTCP_NG): thisTask may be NULL -- see the note on the SIGIO
+	 * delivery in kern/uipc_socket2.c. This path matters more, not less: it
+	 * is gated by nothing at all (no SS_ASYNC, no ioctl), so any peer sending
+	 * urgent data reaches it. */
+	if (so->so_pgid && so->so_pgid->thisTask)
 		Signal(so->so_pgid->thisTask, so->so_pgid->sigUrgMask);
 #else
 	struct proc *p;
@@ -1419,5 +1497,12 @@ sohasoutofband(so)
 		so->so_rcv.sb_flags &= ~SB_SEL; /* do not notify us any more */
 		selwakeup(&so->so_rcv.sb_sel);
 	}
+#ifdef AMITCP
+	/* PORT (AmiTCP_NG): out-of-band data arrived. Separate from the SIGURG
+	 * signal above -- that one is the deprecated SetSocketSignals mechanism,
+	 * this is the SO_EVENTMASK/GetSocketEvents one, and an application may be
+	 * using either. */
+	soraise_event(so, FD_OOB);
+#endif
 }
 

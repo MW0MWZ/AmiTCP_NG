@@ -380,6 +380,20 @@ sana_poll(void)
 
 #ifdef COMPAT_AMITCP2
 /*
+ * PORT (AmiTCP_NG): this block does not compile and never has in this fork.
+ *
+ * aiface_find() below contains `struct  = sana2tag_find_exec(name, unit);` --
+ * a declaration with no type -- and sana2tag_find_exec() has no definition
+ * anywhere in the tree. It is AmiTCP 2 compatibility that was never finished.
+ * Nothing in the build defines COMPAT_AMITCP2 (checked docker/ccflags.sh and
+ * src/Smakefile), so it has been inert rather than harmful.
+ *
+ * Failing loudly here rather than leaving the syntax error to be discovered:
+ * anyone enabling this flag deserves to be told it needs finishing, not handed
+ * a parse error a hundred lines further down.
+ */
+#error "COMPAT_AMITCP2 is incomplete in AmiTCP_NG -- aiface_find() is unbuildable (see comment)"
+/*
  * Name points to the full device name.
  * Device name is a legal DOS file name,
  * appended with a slash and a decimal unit number
@@ -652,8 +666,25 @@ iface_make(struct ssconfig *ifc)
 	    /* Address must be full bytes */
 	    ssc->ss_if.if_addrlen  = (devicequery.AddrFieldSize + 7) >> 3;
 	    bcopy(req->ios2_DstAddr, ssc->ss_hwaddr, ssc->ss_if.if_addrlen);
-	    ssc->ss_if.if_mtu      = devicequery.MTU;
-	    ssc->ss_maxmtu         = devicequery.MTU;
+	    /*
+	     * PORT (AmiTCP_NG) security fix: devicequery.MTU is a ULONG coming
+	     * from a third-party SANA-II driver, and it was stored unchecked
+	     * into if_mtu (a SIGNED short) and ss_maxmtu (a UWORD). A driver
+	     * reporting 32768 or more made if_mtu negative, which then feeds the
+	     * MSS and fragmentation arithmetic. Clamp it to something both
+	     * fields can represent, and fall back to the Ethernet default if the
+	     * driver reports a value too small to carry an IP datagram.
+	     */
+	    {
+	      ULONG mtu = devicequery.MTU;
+
+	      if (mtu < 68)
+		mtu = 1500;		/* driver reported nonsense */
+	      else if (mtu > 32767)
+		mtu = 32767;		/* if_mtu is a signed short */
+	      ssc->ss_if.if_mtu = (short)mtu;
+	      ssc->ss_maxmtu    = (UWORD)mtu;
+	    }
 	    ssc->ss_if.if_baudrate = devicequery.BPS;
 	    ssc->ss_hwtype         = devicequery.HardwareType;	
 	    
@@ -770,60 +801,93 @@ sana_scrub_inet(struct ifnet *ifp)
   }
 }
 
-/*
- * Delete the route to `dstaddr` (a host route if `host`, else a network route
- * with an all-ones... no: with the given prefix -- see below) IF it exits via
- * THIS interface. Used to drop routes the DHCP client / interface config
- * installed whose rt_ifa binds to an ifaddr we are about to free: the default
- * route (0.0.0.0/0, RTF_GATEWAY) and the 255.255.255.255 limited-broadcast host
- * route the DHCP client adds so ip_output() can egress a DISCOVER. Leaving either
- * behind would dangle rt_ifa at freed memory once the ifaddr is scrubbed -- silent
- * corruption on this no-MMU port. rtalloc1() does a longest-prefix match, so we
- * only delete on an EXACT key hit via this interface (never a covering route).
- * The CALLER must hold splimp(); rtalloc1()/rtrequest() nest their own splnet().
- */
-static void
-sana_del_iface_route(struct ifnet *ifp, ULONG dstaddr, int host)
-{
-  struct rtentry *rt;
-  struct sockaddr_in dst;
+/* rt_walk() lives in net/rtsock.c; walkarg is opaque (only passed through). */
+struct walkarg;
+extern int rt_walk(struct radix_node *rn,
+		   int (*f)(struct radix_node *, struct walkarg *),
+		   struct walkarg *w);
 
-  bzero((caddr_t)&dst, sizeof(dst));
-  dst.sin_family = AF_INET;
-  dst.sin_len    = sizeof(dst);
-  dst.sin_addr.s_addr = dstaddr;
-  if ((rt = rtalloc1((struct sockaddr *)&dst, 0)) != NULL) {
-    struct sockaddr_in *key = (struct sockaddr_in *)rt_key(rt);
-    if (rt->rt_ifp == ifp && key != NULL && key->sin_addr.s_addr == dstaddr) {
-      struct sockaddr_in mask;
-      bzero((caddr_t)&mask, sizeof(mask));
-      mask.sin_family = AF_INET; mask.sin_len = sizeof(mask);
-      mask.sin_addr.s_addr = 0;			/* net route: 0.0.0.0 mask (default) */
-      /* RTM_DELETE re-finds the node by dst(+netmask) and never dereferences the
-       * gateway argument, so pass rt->rt_gateway directly (no copy). We still hold
-       * rtalloc1()'s reference, so rtrequest() only clears RTF_UP; the rtfree()
-       * below then releases that reference and frees the node. A host route carries
-       * no netmask. */
-      (void)rtrequest(RTM_DELETE, (struct sockaddr *)&dst, rt->rt_gateway,
-		      host ? (struct sockaddr *)0 : (struct sockaddr *)&mask,
-		      rt->rt_flags, (struct rtentry **)0);
-    }
-    rtfree(rt);
+#define SANA_RTPURGE_MAX 32
+struct sana_rtpurge {
+  struct ifnet   *ifp;
+  struct rtentry *rt[SANA_RTPURGE_MAX];
+  int             n;
+  int             overflow;
+};
+
+/*
+ * rt_walk() callback: COLLECT every route that exits via this interface. We must
+ * not delete here -- rt_walk() navigates the tree through the very nodes we'd
+ * free -- so gather them (up to the array; set overflow to re-walk for the rest)
+ * and delete after the walk completes.
+ */
+static int
+sana_collect_ifroute(struct radix_node *rn, struct walkarg *wa)
+{
+  struct sana_rtpurge *w = (struct sana_rtpurge *)wa;
+
+  for (; rn != NULL; rn = rn->rn_dupedkey) {
+    struct rtentry *rt = (struct rtentry *)rn;
+    if (rn->rn_flags & RNF_ROOT)		/* tree sentinel, not a route */
+      continue;
+    if (rt->rt_ifp != w->ifp)
+      continue;
+    if (w->n < SANA_RTPURGE_MAX)
+      w->rt[w->n++] = rt;
+    else
+      w->overflow = 1;
   }
+  return (0);
 }
 
 /*
- * Drop the routes an interface owns beyond its connected-network route (that one
- * is handled by in_ifscrub() inside sana_scrub_inet()): the default route
- * (0.0.0.0/0) and the 255.255.255.255 DHCP broadcast host route. Both bind rt_ifa
- * to one of this interface's ifaddrs, so they MUST go before those ifaddrs are
- * freed. Caller holds splimp().
+ * Drop EVERY route that exits via this interface before its ifaddr(s)/softc are
+ * freed -- a classic BSD if_detach()-style purge. The old code deleted only the
+ * default route and the DHCP 255.255.255.255 host route; any OTHER route bound to
+ * this interface -- an ICMP-redirect (RTF_DYNAMIC) route, or one a caller added
+ * via AddRouteTagList with an on-subnet gateway -- was left RTF_UP in the radix
+ * tree with rt_ifa (freed by sana_scrub_inet) and rt_ifp (freed with the softc)
+ * dangling, and ip_output() would deref it and make a wild if_output() call on the
+ * next packet to that destination (a no-MMU use-after-free). The connected-network
+ * route is caught here too, by its OWN key -- which deletes it correctly even if a
+ * live SIOCSIFNETMASK desynced in_ifscrub()'s delete key (a later in_ifscrub()
+ * delete then simply finds it already gone). Caller holds splimp() -- one
+ * continuous critical section covering the whole collect+delete, so the table
+ * cannot mutate under us.
  */
 static void
 sana_flush_iface_routes(struct ifnet *ifp)
 {
-  sana_del_iface_route(ifp, (ULONG)0,            0);	/* default route 0.0.0.0/0 */
-  sana_del_iface_route(ifp, (ULONG)0xFFFFFFFFUL, 1);	/* DHCP 255.255.255.255 host route */
+  struct sana_rtpurge w;
+  struct radix_node_head *rnh;
+  int i, pass;
+
+  /* Bounded re-walk: each pass deletes up to SANA_RTPURGE_MAX routes, so the cap
+   * covers any realistic per-interface route count while ruling out an infinite
+   * loop should a delete ever fail to make progress. */
+  for (pass = 0; pass < 64; pass++) {
+    w.ifp = ifp; w.n = 0; w.overflow = 0;
+    for (rnh = radix_node_head; rnh != NULL; rnh = rnh->rnh_next) {
+      if (rnh->rnh_af != AF_INET)
+	continue;
+      rt_walk(rnh->rnh_treetop, sana_collect_ifroute, (struct walkarg *)&w);
+    }
+    for (i = 0; i < w.n; i++) {
+      struct rtentry *rt = w.rt[i];
+      /* Delete by the route's OWN key/mask. RTM_DELETE re-finds the node and
+       * never dereferences the gateway arg. We hold no reference: it unlinks the
+       * route and frees it if rt_refcnt == 0; a still-referenced route is unlinked
+       * (RTF_UP cleared, no longer matchable) and freed later by its holder. */
+      (void)rtrequest(RTM_DELETE, rt_key(rt), rt->rt_gateway, rt_mask(rt),
+		      rt->rt_flags, (struct rtentry **)0);
+    }
+    if (!w.overflow)
+      break;
+  }
+  if (pass == 64)
+    log(LOG_ERR, "sana_flush_iface_routes: route purge for %s hit the "
+	"pass cap; some routes may still be bound to the interface\n",
+	ifp->if_name ? ifp->if_name : "?");
 }
 
 /*
@@ -1115,6 +1179,37 @@ sana_unrun(struct sana_softc *ssc)
 
   ssc->ss_if.if_flags &= ~IFF_RUNNING;
 
+  /*
+   * PORT (AmiTCP_NG): replace any SanaPort wakeup this loop consumed.
+   *
+   * WaitIO() above Wait()s on SanaPort's signal bit, which is SHARED by every
+   * interface. If a still-live interface's read or write completed while we
+   * were blocked waiting for one of THIS interface's requests, that Wait()
+   * cleared the bit and removed only its own message -- leaving the other
+   * interface's completion sitting in the port with its wakeup gone, and
+   * sana_poll() (which is gated on that bit) never called again for it. That
+   * is the same permanent silent death described in sana_start(), reached by a
+   * different route.
+   *
+   * ONE signal after the loop is sufficient rather than one per WaitIO():
+   * Exec signals are a level, not a count, and a single sana_poll() drains the
+   * whole port -- so N consumed wakeups are all repaired by one bit. The
+   * network task cannot act on it before we get here anyway, since it blocks
+   * on SanaPortSem, which we hold across the entire loop.
+   *
+   * Guarded, unlike the other two signal sites: this one can run during a full
+   * stack shutdown. UL_Close()'s early return for a base that was ever SHARED
+   * decrements the master open count WITHOUT waiting for sharers (deliberately
+   * -- see api/amiga_api.c), so the count can reach the shutdown threshold
+   * while a sharer task is still inside this loop. If sana_deinit() then gets
+   * as far as DeleteMsgPort(SanaPort)/SanaPort = NULL, this would dereference
+   * NULL. Exotic -- it needs shared-base mode, a shutdown and a slow-aborting
+   * device at once -- and the same window is already a latent hazard for the
+   * WaitIO() above, but the guard is free.
+   */
+  if (SanaPort)
+    Signal(SanaPort->mp_SigTask, 1L << SanaPort->mp_SigBit);
+
   ReleaseSemaphore(&SanaPortSem);
 }
 
@@ -1167,9 +1262,17 @@ sana_ioctl(register struct ifnet *ifp, int cmd, caddr_t data)
       sana_run(ssc, ssc->ss_reqno, ifa);
     if ((ssc->ss_if.if_flags & IFF_RUNNING) && !(ssc->ss_if.if_flags & IFF_UP))
       sana_up(ssc);
-    if ((ifr->ifr_flags & IFF_NOARP) == 0)
+    /*
+     * PORT (AmiTCP_NG) fix: read the flags from the interface, not from `ifr`.
+     * For SIOCSIFADDR the ioctl `data` argument is a struct in_ifaddr * (see
+     * in.c's (*ifp->if_ioctl)(ifp, SIOCSIFADDR, (caddr_t)ia)), NOT a struct
+     * ifreq * -- the two aliases of `data` are not interchangeable per-command.
+     * ifr_flags sits at the same offset as struct ifaddr's ifa_next, so this
+     * was testing the top half of a pointer as if it were IFF_NOARP.
+     */
+    if ((ssc->ss_if.if_flags & IFF_NOARP) == 0)
       alloc_arptable(ssc, 0);
-    
+
   case SIOCAIFADDR:		/* Alter Interface Address */
     switch (ifa->ifa_addr->sa_family) {
 #if INET
@@ -1328,6 +1431,25 @@ sana_watchdog(struct ifnet *ifp)
   struct sana_softc *ssc = (struct sana_softc *)ifp;
 
   sana_rearm_reads(ssc);
+  /*
+   * PORT (AmiTCP_NG): also wake the network task, unconditionally.
+   *
+   * The re-arm above is not enough on its own. It is gated on
+   * `sent < reqno`, and `sent` is only ever decremented by sana_read(), which
+   * runs only from sana_poll() -- so in exactly the state worth recovering
+   * from (sana_poll() not running) the counters are stale, the gate is false,
+   * and this watchdog is a no-op. Signalling is not gated on anything.
+   *
+   * This is the backstop of last resort: it bounds ANY lost-wakeup on
+   * SanaPort -- including causes not yet identified -- at one if_slowtimo tick
+   * (~1s) instead of "until the machine is rebooted". It is exactly what a
+   * `ping 127.0.0.1` does by hand, via schednetisr(), which is how this class
+   * of failure was found. Signalling our own task is safe and cheap: this runs
+   * on the network task itself (if_slowtimo <- timer_poll <- the main loop),
+   * and a signal with nothing to do costs one sana_poll() that finds an empty
+   * port.
+   */
+  Signal(SanaPort->mp_SigTask, 1L << SanaPort->mp_SigBit);
   ssc->ss_if.if_timer = 1;		/* keep firing every if_slowtimo tick */
   return 0;
 }
@@ -1539,7 +1661,8 @@ sana_ip_read(struct sana_softc *ssc, struct IOIPReq *req)
   spl_t s;
 
   /* ios2_SrcAddr is overwritten when sana_read re-submits the request, so grab
-   * the sender's hardware address now (needed to reconstruct the BPF frame). */
+   * the sender's hardware address now (needed to reconstruct the BPF frame,
+   * and to confirm ARP reachability below). */
   bcopy(req->ioip_s2.ios2_SrcAddr, srchw, ssc->ss_if.if_addrlen);
 
   m = sana_read(ssc, req, 0, &ssc->ss_ip.sent, "sana_ip_read",
@@ -1572,6 +1695,32 @@ sana_ip_read(struct sana_softc *ssc, struct IOIPReq *req)
       /* m = NULL; */
     }
     splx(s);
+
+    /*
+     * Reachability confirmation. This takes the ARP table semaphore, so it is
+     * placed after splx() to mirror sana_arp_read(), which likewise drops spl
+     * before calling arpinput() (which locks the same table).
+     *
+     * Be precise about what splx() does here, because it is NOT "we are now
+     * outside Forbid": spl_t in sys/synch.h stamps SysBase->TDNestCnt with a
+     * LEVEL, and `s` was captured as SPLNET -- sana_poll() raised it before
+     * dispatching us and only returns to SPL0 after its whole loop. So this
+     * drops SPLIMP -> SPLNET and remains Forbid-nested, and ObtainSemaphore()
+     * can still Wait() here.
+     *
+     * That is safe for a different reason than the spl level: sana_poll()
+     * holds SanaPortSem across the entire dispatch loop, and teardown
+     * (sana_unrun()) takes the same semaphore before touching the port or the
+     * request lists -- so a teardown cannot proceed while the network task is
+     * blocked on the ARP lock. If SanaPortSem's scope is ever narrowed, THAT
+     * is what breaks this, not the spl level.
+     *
+     * srchw (the frame's SENDER hardware address) is the whole input: it is the
+     * next hop that delivered this packet, which is the thing whose ARP entry
+     * reachability applies to. The packet's IP source is deliberately NOT used
+     * -- see the comment on ng_arp_confirm_inbound().
+     */
+    ng_arp_confirm_inbound(ssc, srchw);
   }
 }
 
@@ -1680,7 +1829,13 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
   struct mbuf *mcopy = (struct mbuf *)NULL;
   struct mbuf *tag;
   struct sana_sendtag *st;
-  UBYTE dst_hw[MAXADDRSANA];		/* resolved destination, stashed in the tag */
+  /* Zeroed rather than left as stack garbage: the broadcast paths return from
+   * arpresolve() without ever writing it, and it is copied into the send tag
+   * and on into ios2_DstAddr regardless. Harmless today (those packets always
+   * carry M_BCAST, so sana_start() issues S2_BROADCAST, which ignores
+   * ios2_DstAddr), but that is an invariant two layers away -- do not put
+   * uninitialised stack bytes on the wire if the invariant ever slips. */
+  UBYTE dst_hw[MAXADDRSANA] = { 0 };	/* resolved destination, stashed in the tag */
   UBYTE ioflags = 0;
   BYTE  pri = 0;
   register struct mbuf *m = m0;
@@ -1724,10 +1879,24 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
 	 * error = error return
 	 */
 	!arpresolve(ssc, m, &idst, dst_hw, &error)) {
-      /* Unresolved: ARP holds the packet on its own queue and re-injects it via
-       * if_output once it resolves. Nothing to send now. */
+      /*
+       * Unresolved: ARP holds the packet on its own queue and re-injects it via
+       * if_output once it resolves. Nothing to send now.
+       *
+       * PORT (AmiTCP_NG): return the error arpresolve set, rather than 0.
+       *
+       * This used to return 0 -- success -- for EVERY unresolved outcome, so
+       * the errno arpresolve carefully produced went nowhere: ip_output() reads
+       * if_output's RETURN VALUE and never an out-parameter, so ENETUNREACH,
+       * ENOBUFS and (now) EHOSTDOWN were all reported to the stack as "sent".
+       * TCP then had no way to learn a destination was unreachable except its
+       * own retransmit timeout -- which is precisely the "transmits into
+       * silence" behaviour the ARP hold-down exists to end. A zero error still
+       * returns 0, so the ordinary "queued, waiting for the reply" case is
+       * unchanged.
+       */
       splx(s);
-      return (0);
+      return (error);
     }
     type = ssc->ss_ip.type;
 
@@ -1800,7 +1969,15 @@ sana_output(struct ifnet *ifp, struct mbuf *m0,
    */
   if (ssc->ss_if.if_addrlen == 6) {
     if (type != 0)
-      ng_bpf_tap_ether(ifp, dst_hw, ssc->ss_hwaddr, (u_short)type, m);
+      /* dst_hw is left UNSET for a broadcast (arpresolve returns success for
+       * M_BCAST without writing it) and for an ARP request (arp_request_out
+       * leaves ss2_host unset), so capturing dst_hw verbatim would put
+       * uninitialised stack bytes -- not ff:ff:ff:ff:ff:ff -- into the .pcap
+       * destination MAC. Substitute the broadcast address for M_BCAST, mirroring
+       * the receive-side taps above. */
+      ng_bpf_tap_ether(ifp,
+		       (m->m_flags & M_BCAST) ? bpf_ether_bcast : dst_hw,
+		       ssc->ss_hwaddr, (u_short)type, m);
     else
       ng_bpf_tap(ifp, m);
   }
@@ -1896,8 +2073,44 @@ sana_start(struct sana_softc *ssc)
   struct sana_sendtag *st;
 
   while (ifp->if_snd.ifq_head != NULL) {
-    if (!(req = (struct IOIPReq*)RemHead((struct List*)&ssc->ss_freereq)))
+    if (!(req = (struct IOIPReq*)RemHead((struct List*)&ssc->ss_freereq))) {
+      /*
+       * PORT (AmiTCP_NG): the request pool is empty while a packet is waiting
+       * to go out. Wake the network task.
+       *
+       * This is the one place the stack can notice that it may be about to
+       * strand itself. `ss_freereq` is ONE pool shared by reads and writes
+       * (sana_send_read() and the RemHead above both draw from it), and the
+       * only code that ever puts a request back is sana_poll() -- via
+       * sana_read() for a completed read, or free_written_packet() for a
+       * completed write. So if sana_poll() ever stops running, both directions
+       * drain this pool and nothing refills it. At zero, nothing is posted to
+       * the device at all; the device therefore completes nothing, signals
+       * nothing, and sana_poll() can never be reached again. The interface is
+       * then silently and permanently dead while the rest of the stack runs
+       * perfectly -- with no error anywhere, because an inbound frame has no
+       * posted read buffer to land in and is dropped below our visibility, and
+       * an outbound one simply parks on if_snd (sana_output returns 0, queued
+       * not failed, so send() succeeds and the caller just times out).
+       *
+       * Unlike looutput(), which calls schednetisr() and so wakes the network
+       * task in software, the whole SANA transmit path is fire-and-forget
+       * BeginIO() -- it never signals. That leaves recovery depending on the
+       * very device that has gone quiet. Signalling here breaks that circle:
+       * ordinary outbound traffic can restart the poll loop.
+       *
+       * Deliberately NOT on the per-packet path: this fires only when the pool
+       * is genuinely exhausted with work pending, which is either burst
+       * overload or the failure above. A spurious signal costs one sana_poll()
+       * that finds nothing.
+       */
+      /* Guarded for the same reason as sana_unrun() above: reachable from an
+       * application task (sana_output() on the send path) and so able to race a
+       * shutdown that has already nulled SanaPort. */
+      if (SanaPort)
+	Signal(SanaPort->mp_SigTask, 1L << SanaPort->mp_SigBit);
       break;				/* no free request -- leave packets queued */
+    }
 
     IF_DEQUEUE(&ifp->if_snd, tag);	/* tag != NULL: head was non-empty */
     st = mtod(tag, struct sana_sendtag *);

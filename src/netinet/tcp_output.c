@@ -1,3 +1,10 @@
+/*
+ * AmiTCP_NG -- a modernised, open fork of AmiTCP/IP 3.0b2.
+ * Modifications for AmiTCP_NG Copyright (C) 2026 Andy Taylor (MW0MWZ).
+ * Licensed under the GNU General Public License, version 2 (see COPYING).
+ * The original AmiTCP/IP and BSD copyright notices are retained below.
+ */
+
 RCS_ID_C="$Id: tcp_output.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 /*
  * Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>,
@@ -327,8 +334,25 @@ again:
 			sack_seq = tp->snd_una;
 			off = 0;
 			len = 1;
-			if (len > (long)so->so_snd.sb_cc)	/* only a FIN outstanding */
+			if (len > (long)so->so_snd.sb_cc) {	/* only a FIN outstanding */
 				len = (long)so->so_snd.sb_cc;
+				if (len == 0) {
+					/*
+					 * Nothing to probe (FIN-only, buffer empty):
+					 * clear the sack state we tentatively set. Without
+					 * this we fall through the TF_SACK_RECOVER block
+					 * with sack_rxmit == 1 still set, and a later,
+					 * unrelated goto send in this same tcp_output() call
+					 * (e.g. a pending TF_ACKNOW) would emit from
+					 * sack_seq. It is harmless today only because
+					 * snd_nxt == snd_una in this state, so the sequence
+					 * happens to match -- a landmine that goes live if
+					 * the zero-window snd_nxt pull-back ever changes.
+					 */
+					sack_rxmit = 0;
+					sack_seq = 0;
+				}
+			}
 		}
 		if (len > 0) {
 			/*
@@ -899,7 +923,27 @@ out:
 			tcp_quench(tp->t_inpcb, 0);
 			return (0);
 		}
-		if ((error == EHOSTUNREACH || error == ENETDOWN)
+		/*
+		 * PORT (AmiTCP_NG): EHOSTDOWN joins the soft-error set.
+		 *
+		 * ARP can now return it (net/sana2arp.c): after an unanswered
+		 * request burst it holds a destination down for ~20 s and fails
+		 * sends outright, so an application learns the host is not
+		 * answering instead of transmitting into silence. That is right
+		 * for a NEW destination -- but on an ESTABLISHED connection the
+		 * hold-down is transient by construction, and a WiFi hiccup that
+		 * happened to land mid-transfer would otherwise hand the
+		 * application a hard error and kill a connection that was about
+		 * to recover. TCPS_HAVERCVDSYN() is exactly that distinction:
+		 * soft once the connection exists, hard before it does.
+		 *
+		 * Note this means the "application finds out" benefit does not
+		 * reach established TCP -- it reaches UDP, raw, and TCP via its
+		 * own timeout. That is the same behaviour as before this change,
+		 * so nothing regresses; it simply is not improved there.
+		 */
+		if ((error == EHOSTUNREACH || error == ENETDOWN ||
+		     error == EHOSTDOWN)
 		    && TCPS_HAVERCVDSYN(tp->t_state)) {
 			tp->t_softerror = error;
 			return (0);
@@ -942,5 +986,3 @@ tcp_setpersist(tp)
 	if (tp->t_rxtshift < TCP_MAXRXTSHIFT)
 		tp->t_rxtshift++;
 }
-
-

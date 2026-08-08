@@ -1,3 +1,10 @@
+/*
+ * AmiTCP_NG -- a modernised, open fork of AmiTCP/IP 3.0b2.
+ * Modifications for AmiTCP_NG Copyright (C) 2026 Andy Taylor (MW0MWZ).
+ * Licensed under the GNU General Public License, version 2 (see COPYING).
+ * The original AmiTCP/IP and BSD copyright notices are retained below.
+ */
+
 RCS_ID_C="$Id: if.c,v 3.1 1994/02/03 03:50:38 ppessi Exp $";
 /*
  * Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>,
@@ -135,6 +142,39 @@ void ifinit(void)
 		if (ifp->if_snd.ifq_maxlen == 0)
 			ifp->if_snd.ifq_maxlen = ifqmaxlen;
 	if_slowtimo();
+}
+
+/*
+ * PORT (AmiTCP_NG): total octets in or out across every interface, for
+ * SocketBaseTags(SBTC_GET_BYTES_RECEIVED / _SENT). Those tags are documented as
+ * "the number of bytes sent by the TCP/IP stack" -- a stack-wide figure, which
+ * this stack does not keep anywhere, so it is summed from the per-interface
+ * counters that ShowNetStatus already reports. Loopback is included: it IS an
+ * interface the stack sent through, and excluding it would make the total
+ * disagree with the interface list a user can see.
+ *
+ * The result is a 64-bit pair because if_ibytes/if_obytes are 32-bit and several
+ * interfaces can carry more than 4 GB between them -- a single 32-bit sum would
+ * silently wrap, which is precisely the class of bug that made these counters
+ * report nonsense before.
+ */
+void
+ng_stack_byte_total(out, hip, lop)
+	int out;
+	u_long *hip, *lop;
+{
+	register struct ifnet *ifp;
+	u_long hi = 0, lo = 0, add, prev;
+
+	for (ifp = ifnet; ifp; ifp = ifp->if_next) {
+		add  = (u_long)(out ? ifp->if_obytes : ifp->if_ibytes);
+		prev = lo;
+		lo  += add;
+		if (lo < prev)		/* carry out of the low word */
+			hi++;
+	}
+	*hip = hi;
+	*lop = lo;
 }
 
 #ifdef vax
@@ -460,11 +500,31 @@ if_qflush(ifq)
  * from softclock, we decrement timers (if set) and
  * call the appropriate interface routine on expiration.
  */
+/*
+ * PORT (AmiTCP_NG): coarse seconds clock, refreshed here once per tick (~1 s).
+ *
+ * arpresolve() needs "what time is it" on the SEND path of every packet, to pace
+ * ARP requests and to decide when a resolved entry should be re-checked. Calling
+ * get_time() there would add a timer.device library-vector call to a path that
+ * already carries a semaphore -- on a 68000, per packet, in exactly the
+ * high-rate multi-connection case the pacing exists to survive. Real BSD reads a
+ * global the clock interrupt maintains; this is the same idea, and 1 s
+ * granularity is finer than anything that consumes it (a 1/s rate limit and 60 s
+ * thresholds).
+ */
+unsigned long ng_now_secs = 0;
+
 void
 if_slowtimo()
 {
 	register struct ifnet *ifp;
-	spl_t s = splimp();
+	spl_t s;
+	struct timeval tvnow;
+
+	get_time(&tvnow);
+	ng_now_secs = (unsigned long)tvnow.tv_sec;
+
+	s = splimp();
 
 	/*
 	 * PORT (AmiTCP_NG): re-enabled (was fully compiled out under #ifndef AMITCP
@@ -728,8 +788,22 @@ ifconf(cmd, data)
 #endif
 				ifrp++;
 			} else {
+				/*
+				 * PORT (AmiTCP_NG) fix: keep this comparison
+				 * signed. `space` is int and sizeof() is size_t,
+				 * so once repeated iterations drove space
+				 * negative the test converted it to a huge
+				 * unsigned value, skipped the break, and let the
+				 * bcopy below run past the caller's ifc_req
+				 * buffer. Unreachable in this build (only
+				 * sockaddr_in, whose sa_len is exactly
+				 * sizeof(struct sockaddr), is ever attached --
+				 * the AF_LINK code that would produce a longer
+				 * one is #ifndef AMITCP), but the guard should
+				 * not depend on that staying true.
+				 */
 				space -= sa->sa_len - sizeof(*sa);
-				if (space < sizeof (ifr))
+				if (space < (int)sizeof (ifr))
 					break;
 #ifdef AMITCP
 				aligned_bcopy_const((caddr_t)&ifr, 

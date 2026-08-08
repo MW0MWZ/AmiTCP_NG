@@ -68,7 +68,18 @@ ULONG netisr = 0L;
 void schednetisr(int isr)
 {
   netisr |= 1<<isr;
-  Signal(SanaPort->mp_SigTask, 1<<SanaPort->mp_SigBit);
+  /*
+   * PORT (AmiTCP_NG): guarded, for the same reason sana_unrun() is (net/if_sana.c).
+   * This is reachable from an APPLICATION task -- looutput() calls it on the
+   * loopback send path -- and UL_Close()'s early return for a base that was ever
+   * shared decrements the master open count without waiting for sharers, so a
+   * straggler can still be in here while sana_deinit() has already reached
+   * SanaPort = NULL. Exotic (it needs shared-base mode plus a shutdown race),
+   * but the test is free and the alternative is a NULL dereference with no MMU.
+   * Losing the wakeup at that point is harmless: the stack is going away.
+   */
+  if (SanaPort)
+    Signal(SanaPort->mp_SigTask, 1<<SanaPort->mp_SigBit);
 }
 
 void schednetisr_nosignal(int isr)

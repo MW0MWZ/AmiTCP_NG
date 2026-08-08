@@ -106,9 +106,12 @@ extern struct ExecBase *SysBase;
 #endif
 
 /*
- * undef math log, because it conflicts with log() used for logging.
+ * PORT (AmiTCP_NG): SAS/C only -- see the same note in kern/amiga_includes.h.
+ * Unconditionally undefining this strips OUR call-site log() macro.
  */
+#if __SASC
 #undef log
+#endif
 
 #include <sys/time.h>
 #include <sys/uio.h>

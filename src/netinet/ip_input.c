@@ -176,6 +176,16 @@ int	ipforwarding = IPFORWARDING;
 int	ipsendredirects = IPSENDREDIRECTS;
 int	ipprintfs = IPPRINTFS;		/* this has effect only if DIAGNOSTIC */
 
+/*
+ * PORT (AmiTCP_NG): SBTC_IP_DEFAULT_TTL (44). Roadshow exposes ONE default TTL
+ * for the whole stack; 4.4BSD instead keeps tcp_ttl and udp_ttl separately and
+ * hard-codes MAXTTL in the raw and ICMP paths. Setting the tag therefore mirrors
+ * this value into tcp_ttl and udp_ttl as well (api/amiga_generic2.c) -- a knob
+ * that moved only the raw-socket TTL would be honest to BSD and useless to the
+ * caller, who means "the TTL my packets go out with".
+ */
+int	ip_defttl = MAXTTL;
+
 struct	ipstat	ipstat = {0};	/* ip statistics */
 struct	ipq	ipq = {0};	/* ip reass. queue */
 u_short	ip_id = {0};		/* ip packet ctr, for ids */
@@ -643,10 +653,17 @@ insert:
 	ip_enq(ip, q->ipf_prev);
 	fp->ipq_nfrags++;
 	next = 0;
+	/*
+	 * PORT (AmiTCP_NG) fix: compare as u_short. ip_off is a SIGNED 16-bit field,
+	 * so any fragment at offset >= 32768 sign-extends negative and can never
+	 * equal the positive `next`, making a fully-arrived datagram look forever
+	 * incomplete -- it would then sit queued until ipq_ttl expiry instead of
+	 * being recognised (and, per the bound below, cleanly rejected).
+	 */
 	for (q = fp->ipq_next; q != (struct ipasfrag *)fp; q = q->ipf_next) {
-		if (q->ip_off != next)
+		if ((u_short)q->ip_off != (u_short)next)
 			return (0);
-		next += q->ip_len;
+		next += (u_short)q->ip_len;
 	}
 	if (q->ipf_prev->ipf_mff)
 		return (0);
@@ -657,8 +674,16 @@ insert:
 	 * whose lengths sum past IP_MAXPACKET (65535) wraps it -- the classic "ping
 	 * of death": downstream code then trusts a small or negative length while a
 	 * large tail rides along in the mbuf chain. Discard the whole reassembly.
+	 *
+	 * The bound is 32767, not IP_MAXPACKET (65535), precisely BECAUSE the field
+	 * is signed: 32768..65535 is legal per RFC 791 but sign-extends negative on
+	 * store, and every downstream consumer then mis-handles it (udp_input's
+	 * `len > ip->ip_len` badlen test, for one, is always true against a negative
+	 * ip_len). Such datagrams are therefore rejected here -- explicitly, with a
+	 * stat bump -- rather than committed as a negative length. Accepting them
+	 * for real would mean widening ip_len across the whole struct ip ABI.
 	 */
-	if (next > IP_MAXPACKET) {
+	if (next > 32767) {
 		ip_freef(fp);
 		ipstat.ips_fragdropped++;
 		return (0);
@@ -857,6 +882,15 @@ ip_dooptions(m)
 		 */
 		case IPOPT_LSRR:
 		case IPOPT_SSRR:
+			/*
+			 * PORT (AmiTCP_NG) security fix: the option must be long
+			 * enough to contain the pointer byte we are about to read.
+			 * The generic check above only enforces optlen <= cnt.
+			 */
+			if (optlen < IPOPT_OFFSET + 1) {
+				code = &cp[IPOPT_OLEN] - (u_char *)ip;
+				goto bad;
+			}
 			if ((off = cp[IPOPT_OFFSET]) < IPOPT_MINOFF) {
 				code = &cp[IPOPT_OFFSET] - (u_char *)ip;
 				goto bad;
@@ -877,7 +911,17 @@ ip_dooptions(m)
 				break;
 			}
 			off--;			/* 0 origin */
-			if (off > optlen - sizeof(struct in_addr)) {
+			/*
+			 * PORT (AmiTCP_NG) security fix: cast the sizeof to int.
+			 * optlen is int but sizeof is size_t, so the subtraction was
+			 * evaluated UNSIGNED: for optlen < 4 it wrapped to ~0xFFFFFFFF
+			 * and this test was false for every possible off, letting an
+			 * attacker-chosen off (up to 254) reach the bcopy below and
+			 * read far past the option -- and past the mbuf, which on this
+			 * no-MMU target does not trap. Keeping it signed makes a short
+			 * option take the end-of-route branch, as intended.
+			 */
+			if (off > optlen - (int)sizeof(struct in_addr)) {
 				/*
 				 * End of source route.  Should be for us.
 				 */
@@ -909,6 +953,12 @@ ip_dooptions(m)
 			break;
 
 		case IPOPT_RR:
+			/* PORT (AmiTCP_NG) security fix: see IPOPT_LSRR above -- the
+			 * option must be long enough to hold the pointer byte. */
+			if (optlen < IPOPT_OFFSET + 1) {
+				code = &cp[IPOPT_OLEN] - (u_char *)ip;
+				goto bad;
+			}
 			if ((off = cp[IPOPT_OFFSET]) < IPOPT_MINOFF) {
 				code = &cp[IPOPT_OFFSET] - (u_char *)ip;
 				goto bad;
@@ -917,7 +967,14 @@ ip_dooptions(m)
 			 * If no space remains, ignore.
 			 */
 			off--;			/* 0 origin */
-			if (off > optlen - sizeof(struct in_addr))
+			/*
+			 * PORT (AmiTCP_NG) security fix: cast the sizeof to int. As in
+			 * the LSRR/SSRR case above this comparison was unsigned, so for
+			 * optlen < 4 it was false for every off and execution fell
+			 * through to the bcopy below -- a 4-byte WRITE at cp + off with
+			 * off attacker-chosen up to 254, landing outside the mbuf.
+			 */
+			if (off > optlen - (int)sizeof(struct in_addr))
 				break;
 			ipaddr.sin_addr = ip->ip_dst;
 			/*
@@ -956,6 +1013,18 @@ ip_dooptions(m)
 				    sizeof(struct in_addr) > ipt->ipt_len)
 					goto bad;
 				ia = ifptoia(m->m_pkthdr.rcvif);
+				if (ia == 0)
+					continue;	/* interface carries no address
+							 * (e.g. brought UP with no
+							 * ADDRESS=): IA_SIN(0) would
+							 * splice low memory into the
+							 * option and echo it back. Skip
+							 * the whole option, as stock
+							 * 4.4BSD and the PRESPEC case
+							 * below do -- NOT `break`, which
+							 * would fall through and stamp a
+							 * timestamp into the slot
+							 * reserved for addr+ts. */
 				/* sin = cp+ipt_ptr-1 may be ODD (attacker-controlled);
 				 * a struct store here is an Address Error trap on
 				 * 68000/010. bcopy (CopyMem) is alignment-safe, as the
@@ -1039,7 +1108,16 @@ save_rte(option, dst)
 	if (ipprintfs)
 		printf("save_rte: olen %ld\n", olen);
 #endif
-	if (olen > sizeof(ip_srcrt) - (1 + sizeof(dst)))
+	/*
+	 * PORT (AmiTCP_NG) security fix: bound olen BELOW as well as above.
+	 * ip_nhops is computed as (olen - IPOPT_OFFSET - 1) / 4 in unsigned
+	 * arithmetic, so an olen under 3 wraps it to ~1073741823, which
+	 * ip_srcroute() then uses as an array index and a length. The callers
+	 * now reject such options before reaching here; this keeps the
+	 * invariant local to the function that depends on it.
+	 */
+	if (olen < IPOPT_OFFSET + 1 ||
+	    olen > sizeof(ip_srcrt) - (1 + sizeof(dst)))
 		return;
 	bcopy((caddr_t)option, (caddr_t)ip_srcrt.srcopt, olen);
 	ip_nhops = (olen - IPOPT_OFFSET - 1) / sizeof(struct in_addr);

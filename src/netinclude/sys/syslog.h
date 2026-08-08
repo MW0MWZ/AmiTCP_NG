@@ -63,8 +63,34 @@
 #ifndef SYS_SYSLOG_H
 #define SYS_SYSLOG_H
 
-#define	_PATH_LOG	"t:AmiTCP.log"
+/*
+ * PORT (AmiTCP_NG): the default log lives on RAM:, not T:.
+ *
+ * T: is an ASSIGN, normally to RAM:T, made by the Startup-Sequence. The
+ * self-starting LIBS:bsdsocket.library comes up on the first library call from
+ * ANY program, which can be earlier in the boot than that assign -- and the stack
+ * process runs with pr_WindowPtr = -1 (amiga_main.c), so a missing assign fails
+ * the Open() silently instead of putting up a requester. RAM: needs no assign,
+ * always exists, and is the same physical place T: usually points at anyway.
+ */
+#define	_PATH_LOG	"ram:AmiTCP.log"
 #define _PATH_CON       "con:0/0/600/100/AmiTCPIP Log/AUTO/INACTIVE"
+
+/*
+ * PORT (AmiTCP_NG): fallback log destinations, tried in order when the
+ * configured one cannot be opened at bring-up (log_validate_dest()).
+ *
+ * These matter most when the user has set LOGFILENAME= to somewhere that is not
+ * there yet (an unmounted volume, a drawer that does not exist) -- including the
+ * disk destination this stack's own config file suggests for a log that survives
+ * a reboot. Without them that is an unreachable log with no way to tell it apart
+ * from "nothing was logged" -- exactly the state this fork was found in.
+ *
+ * ram: stays in the list even though it is also the default: it needs no assign
+ * and always exists, so it must remain reachable when an override fails.
+ */
+#define _PATH_LOG_FALLBACKS \
+	"ram:AmiTCP.log", "t:AmiTCP.log", "AmiTCP:AmiTCP.log", "sys:AmiTCP.log"
 
 
 /*
@@ -84,6 +110,54 @@
 #define	LOG_NOTICE	5	/* normal but significant condition */
 #define	LOG_INFO	6	/* informational */
 #define	LOG_DEBUG	7	/* debug-level messages */
+
+/*
+ * PORT (AmiTCP_NG): default logging verbosity -- the highest (least important)
+ * priority that will actually be recorded. Everything above it is discarded at
+ * the call site (see the log() macro in sys/systm.h), before the arguments are
+ * even evaluated.
+ *
+ * Logging is compiled into EVERY build -- there is no build without it and no
+ * flag that removes it -- and it is on by default, quietly, with the console
+ * window off. Three separate switches, because they are three separate
+ * questions:
+ *
+ *   LOGGING=ON|OFF     is anything recorded at all           (default ON)
+ *   LOGLEVEL=0..7      how much                              (default 5, below)
+ *   LOGCONSOLE=ON|OFF  is it ALSO thrown at a CON: window    (default OFF)
+ *
+ * Splitting the console out is what lets the first default be ON. While one
+ * switch controlled both, "record errors so a panic leaves a trace" and "put a
+ * window in front of the user" were the same request, so the only way to stop
+ * the window was to stop recording -- and a machine that then died had nothing
+ * to show for it. Apart is strictly better: a quiet file that is always there,
+ * and a window only when asked for.
+ *
+ * The rest of the design:
+ *   - Nothing is compiled out, so any machine can produce a full debug log by
+ *     editing one line of AmiTCP.config. No special build, no hand-delivered
+ *     binary, nothing that depends on reaching the machine.
+ *   - The console is opened LAZILY, on the first message actually bound for it,
+ *     so LOGCONSOLE=OFF costs no window, no CON: handler and no DOS Open().
+ *
+ * There is deliberately NO per-build variation. An earlier revision made a
+ * -beta default to LOG_DEBUG, on the theory that testers want everything; that
+ * put the diagnostic behaviour of the binary in the hands of a build flag rather
+ * than the user, which is exactly the arrangement that once shipped a "ready for
+ * diagnosis" beta with its tracer silently switched off. One default, everywhere,
+ * and the user decides.
+ *
+ * The level below is only what applies once LOGGING=ON; LOGLEVEL= overrides it.
+ */
+#define NG_LOG_LEVEL_DEFAULT	LOG_NOTICE	/* 5 -- drops info + debug */
+
+/*
+ * PORT (AmiTCP_NG): note there is deliberately no "LOGLEVEL=0 means off". 0 is
+ * LOG_EMERG, the priority panic() logs at; making it mean "off" would silently
+ * discard the one message you most need, and would be indistinguishable in a
+ * config file from someone asking for emergencies only. Off is its own switch,
+ * LOGGING= -- see log_enabled in kern/amiga_log.c.
+ */
 
 #define	LOG_PRIMASK	0x07	/* mask to extract priority part (internal) */
 				/* extract priority */

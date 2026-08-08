@@ -30,55 +30,62 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 
 ## Features
 
-- **BSD sockets** — the full `bsdsocket.library` API (TCP, UDP, raw) with a
-  drop-in Roadshow ABI, so existing Amiga network software works unchanged.
-- **Protocols** — TCP, UDP, ICMP (`ping`), IP with routing and broadcast, and ARP.
-- **Interfaces** — any SANA-II network device plus software loopback (`lo0`,
-  always on), so `127.0.0.1` and same-host traffic work out of the box.
-- **Address configuration** — DHCP client, static, or **RFC 3927 IPv4
-  link-local** (ZeroConf) auto-assignment when no DHCP server answers.
-- **Name resolution** — DNS resolver (`gethostbyname`, `getaddrinfo`, reentrant
-  `gethostby*_r`, …) with a **search domain** and a RAM-tiered response cache.
-- **Modern TCP** — **SACK** loss recovery (RFC 2018/6675, with D-SACK, PRR and
-  NewReno), **RFC 1323** window scaling + timestamps, and an **RFC 6928** initial
-  window (IW10). Socket buffers, mbuf pool, SANA-II rings and DNS cache all size
-  to installed RAM and link speed; timestamps gate on the CPU (68020+).
-- **Security-hardened** — randomised initial sequence numbers (**RFC 6528**),
-  **RFC 5961** challenge-ACK rate limiting, broadcast/fragment DoS guards, and a
+- **BSD sockets** — the full `bsdsocket.library` API (TCP, UDP, raw) on a drop-in
+  Roadshow ABI, so existing Amiga software works unchanged, with no time limit.
+- **Protocols** — TCP, UDP, ICMP, IP with routing and broadcast, ARP.
+- **Interfaces** — any SANA-II device, plus software loopback (`lo0`, always on).
+- **Addressing** — DHCP client, static, or **RFC 3927** link-local when no DHCP
+  server answers.
+- **Names** — DNS resolver (`gethostbyname`, `getaddrinfo`, the reentrant
+  `gethostby*_r`), search domain, RAM-tiered cache.
+- **Modern TCP** — **SACK** recovery (RFC 2018/6675, with D-SACK, PRR, NewReno),
+  **RFC 1323** window scaling and timestamps, **RFC 6928** initial window, and
+  header prediction that works while *sending*, not only receiving.
+- **Asynchronous socket events** — `SO_EVENTMASK`, `SBTC_SIGEVENTMASK` and
+  `GetSocketEvents()`: the AmiTCP V4 mechanism Roadshow-era clients expect.
+- **Security-hardened** — randomised ISNs (**RFC 6528**), **RFC 5961**
+  challenge-ACK limiting, broadcast and fragment DoS guards, and a
   whole-codebase memory-safety review.
-- **Packet capture (BPF)** — the `bpf_*` vectors: open a channel, filter, and
-  read or inject raw frames — the engine a `tcpdump`/`pcap` port needs.
-- **Roadshow-compatible tooling** — the extension API plus the full command set
-  (`Online`, `Offline`, `AddNetInterface`, `ShowNetStatus`, `ping`, …) and an
-  Amiga Installer.
+- **Packet capture (BPF)** — open a channel, filter, read or inject raw frames.
+- **Diagnostics that ship** — every build can log, off-screen by default;
+  `LOGLEVEL=7` names any library call that fails and the errno it failed with.
+  No debug build to obtain.
+- **Roadshow-compatible tooling** — the extension API and capability flags, the
+  full command set (`Online`, `AddNetInterface`, `ShowNetStatus`, `ping`, …),
+  shared library bases, and an Amiga Installer.
+- **Usable on its own** — `netstat`, `nslookup`, `ftp`, `tftp` and `sntp` ship
+  with it, so a freshly installed Amiga can fetch everything else itself.
+- **Self-tuning** — socket buffers, SANA-II rings, the mbuf pool and the DNS
+  cache size themselves to installed RAM and link speed; per-interface and
+  stack-wide overrides are honoured.
 
 ## Status
 
-- Builds, links, and **runs on emulated AmigaOS 3.2** and **real 68k hardware**,
-  installing a working self-starting `LIBS:bsdsocket.library`.
-- **Emulator-validated** (A2065 over SLIRP): a DNS round-trip, a full **DHCP
-  lease** (`DISCOVER→OFFER→REQUEST→ACK`), **ICMP `ping`**, same-host **UDP
-  broadcast / loopback** discovery, and **BPF** capture + injection.
-- **Real-hardware-validated** (PiStorm + `wifipi.device`): interface bring-up,
-  DHCP lease, default-route install, DNS, `ping`, and end-to-end connectivity
-  over a 100 Mbit WiFi link — where link-speed window auto-tuning roughly doubled
-  single-stream throughput.
-- **Roadshow-compatible** — the full extension API and capability flags, plus a
-  complete command set (`Online`, `Offline`, `AddNetInterface`,
-  `ConfigureNetInterface`, `AddNetRoute`, `DeleteNetRoute`, `RemoveNetInterface`,
-  `NetShutdown`, `GetNetStatus`, `ShowNetStatus`, `ping`) — name-, argument- and
-  output-compatible, so Roadie, NetMon and existing scripts drive the stack
-  unchanged. Ships with an Amiga Installer (install / uninstall / preview).
-- **Self-tuning, with knobs** — socket buffers, SANA-II rings, the mbuf pool and
-  DNS cache size to installed RAM and link speed; per-interface (`iprequests`,
-  `writerequests`, `mtu`) and stack-wide (`tcp.sendspace`/`recvspace`,
-  `tcp.mssdflt`, `tcp.iw`) overrides are honoured, and `ShowNetStatus <iface>`
-  reports the effective MSS and a six-way in/out error/drop breakdown. See
-  [docs/BUILDING.md](docs/BUILDING.md#throughput-and-memory).
-- **CPU-tuned release builds** — a portable **68000** build plus **68020** and
-  **68040** variants; pick the archive matching your machine.
-- A few advanced surfaces stay deferred (IP filter `ipf_*`, monitor hooks,
-  server API) — see [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md).
+- Runs on **emulated AmigaOS 3.2** and **real 68k hardware** as a self-starting
+  `LIBS:bsdsocket.library`.
+- **Emulator-validated** (A2065 over SLIRP): DNS, a full DHCP lease, `ping`,
+  same-host broadcast and loopback, BPF capture and injection, and the
+  socket-event mechanism end to end.
+- **Hardware-validated** (PiStorm + `wifipi.device`): bring-up, DHCP, routing,
+  DNS and connectivity over 100 Mbit WiFi — roughly **56 Mbit down / 52 up**
+  once the SANA-II transmit queue landed. **Amiga Explorer** works.
+- **Roadshow-compatible** — name-, argument- and output-compatible, so Roadie,
+  NetMon and existing scripts drive it unchanged.
+- **Measured, not assumed** — the TCP work came from counters read off real
+  hardware: header prediction was covering 98% of segments downloading and 9%
+  uploading; the cause was the peer's moving window, and the fix took uploads
+  to 57%.
+- **Paced ARP** — the 4.3BSD base broadcast a fresh ARP request for *every*
+  packet to an unresolved address, with no cap, and told the caller it had been
+  sent. Now: one request a second, a bounded burst, then a hold-down that
+  reports the host unreachable instead of transmitting into silence. A resolved
+  entry is re-checked by **unicast** probe rather than trusted for twenty
+  minutes, and ordinary inbound traffic confirms a peer is alive, so an active
+  connection is never probed at all.
+- **CPU-tuned builds** — portable **68000**, plus **68020** and **68040**.
+- **Deferred** — IP filter (`ipf_*`), monitor hooks, server API
+  ([docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md)); IP multicast *receive*
+  is not implemented.
 
 ## Installing
 
@@ -181,6 +188,10 @@ starts. The knobs worth knowing:
 | `GATEWAY=NO`           | Whether to forward IP between interfaces (act as a router). |
 | `TCP_SENDSPACE=<bytes>`| TCP send-buffer size (overrides the auto-tuned default; see below). |
 | `TCP_RECVSPACE=<bytes>`| TCP receive-buffer size (overrides the auto-tuned default). |
+| `LOGGING=ON\|OFF`      | Keep a log at all. Default **ON** — a quiet file, nothing on screen. |
+| `LOGLEVEL=0..7`        | How much. Default 5. **7** also logs every failing library call and its errno, which is how you find out what a program is unhappy with. |
+| `LOGCONSOLE=ON\|OFF`   | Also throw the log at a console window. Default **OFF** — the window puts itself in front of whatever you are doing. |
+| `LOGFILENAME=<path>`   | Default `RAM:AmiTCP.log`. Point it at a disk if you are chasing something that only clears with a reboot. |
 
 A minimal example:
 

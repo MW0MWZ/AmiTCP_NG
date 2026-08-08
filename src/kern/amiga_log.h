@@ -102,6 +102,26 @@ extern struct log_msg *GetLogMsg(struct MsgPort *);
 extern struct MsgPort *logReplyPort;
 extern struct MsgPort *logPort;
 
+/*
+ * PORT (AmiTCP_NG): the logging controls -- LOGGING= (master switch) and
+ * LOGLEVEL= (highest priority recorded, LOG_EMERG 0 .. LOG_DEBUG 7). Defined in
+ * amiga_log.c; also declared in <sys/systm.h>, which is where the log() macro
+ * that reads them on the hot path lives.
+ */
+extern LONG log_enabled;
+extern LONG log_level;
+
+/* The log destination actually opened -- may differ from logfilename when
+ * log_validate_dest() had to fall back. Defined in amiga_log.c. */
+extern STRPTR log_dest_name;
+/* PORT (AmiTCP_NG): SBTC_LOG_HOOK. When non-NULL, the LOG TASK hands each
+ * message to this hook instead of writing it to the file and console. Delivered
+ * from there, never from vlog(), because vlog() runs under splnet() (=Forbid) at
+ * many call sites -- see ng_log_hook_deliver() in kern/subr_prf.c. Stack-wide. */
+extern struct Hook *log_hook;
+/* Returns TRUE if the hook consumed the message (skip file + console). */
+extern int ng_log_hook_deliver(struct log_msg *msg);
+
 struct log_msg {
   struct Message msg;		/* Standard Exec message */
   ULONG level;			/* Level of log message */

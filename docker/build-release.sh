@@ -34,7 +34,233 @@ VER="$(grep -E 'define[[:space:]]+AMITCP_NG_VER' "$ROOT/src/bsdsocket.library_re
 
 # The command-line tools shipped in the release (order = display order).
 NG_TOOLS="AddNetInterface ConfigureNetInterface RemoveNetInterface NetShutdown \
-Online Offline AddNetRoute DeleteNetRoute GetNetStatus ShowNetStatus ping"
+Online Offline AddNetRoute DeleteNetRoute GetNetStatus ShowNetStatus ping netstat tftp nslookup ftp sntp"
+
+# Diagnostics ship ONLY in -beta builds. A stable release carries the ordinary
+# Roadshow-compatible command set and nothing else; a beta is a test build handed to
+# people who are trying to find out why something is slow, so it carries the tools
+# that answer that. Gated on the version string itself rather than a separate flag,
+# so it cannot be forgotten in either direction -- dropping the -beta suffix for the
+# real release automatically drops the diagnostics with it.
+case "$VER" in
+  *-beta*)
+    NG_TOOLS="$NG_TOOLS rxprofile"
+    echo ">>> beta build: including diagnostics (rxprofile)"
+    ;;
+esac
+
+# The installer carries copies of the settings it appends to an EXISTING db/ file on
+# upgrade (it cannot diff two files -- it can only test for a string and append). Each
+# block is guarded by a sentinel that must actually appear in the shipped file, or the
+# guard would never match and every upgrade would append the block again. Verify the
+# pairing here so the duplication cannot silently drift.
+check_installer_sentinel() {
+  local sentinel="$1" dbfile="$2"
+  grep -qF -- "$sentinel" "$ROOT/install/db/$dbfile" || {
+    echo "!!! build-release: installer merge sentinel '$sentinel' is not in install/db/$dbfile" >&2
+    echo "!!! (Install-AmiTCP_NG would re-append its block on every upgrade.)" >&2
+    exit 1; }
+  # NOT a plain grep of the whole installer: the sentinel appears there anyway as
+  # the (set #mf-key "...") argument, so that would pass no matter what. What has
+  # to be true is that the sentinel is in the text that gets APPENDED -- otherwise
+  # the next upgrade will not find it and will append the block all over again.
+  # check_installer_block_matches enforces that; this only pins the shipped side.
+}
+# Structural check on the Installer script. It cannot be executed here (no Installer
+# on the build host), so the one class of error a machine CAN catch is checked: paren
+# balance, and `if` arity. Installer `if` takes cond/then[/else] and nothing more --
+# five bare statements where the then-branch belongs silently disables a whole code
+# path, which is exactly how the db-merge got broken once already.
+python3 - "$ROOT" <<'PYEOF'
+import sys
+src = open(sys.argv[1] + "/install/Install-AmiTCP_NG").read()
+out=[]; instr=incom=esc=False
+for ch in src:
+    if ch == "\n": incom=False; out.append("\n"); continue
+    if incom: continue
+    if instr:
+        if esc: esc=False
+        elif ch == "\\": esc=True
+        elif ch == '"': instr=False; out.append("S")
+        continue
+    if ch == '"': instr=True; continue
+    if ch == ";": incom=True; continue
+    out.append(ch)
+t="".join(out)
+def parse(i):
+    items=[]
+    while i < len(t):
+        c=t[i]
+        if c == "(":
+            sub,i = parse(i+1); items.append(sub); continue
+        if c == ")": return items, i+1
+        if c.isspace(): i+=1; continue
+        j=i
+        while j < len(t) and not t[j].isspace() and t[j] not in "()": j+=1
+        items.append(t[i:j]); i=j
+    return items, i
+tree,_ = parse(0)
+if t.count("(") != t.count(")"):
+    sys.exit("!!! build-release: Install-AmiTCP_NG parens unbalanced")
+bad=[]
+def walk(n, path="top"):
+    if isinstance(n, list):
+        if n and n[0] == "if" and len(n)-1 not in (2,3):
+            bad.append("%s: if with %d args" % (path, len(n)-1))
+        name = n[1] if len(n) > 1 and n and n[0] == "procedure" else path
+        for c in n: walk(c, name)
+walk(tree)
+if bad:
+    sys.exit("!!! build-release: Install-AmiTCP_NG malformed if forms:\n    " + "\n    ".join(bad))
+print("    Install-AmiTCP_NG: parens balanced, all if forms well-formed")
+PYEOF
+echo ">>> installer structure verified"
+
+check_installer_sentinel ng-services-v2 netdb
+check_installer_sentinel HOSTNAME  AmiTCP.config
+check_installer_sentinel LOGGING     AmiTCP.config
+check_installer_sentinel LOGLEVEL    AmiTCP.config
+check_installer_sentinel LOGCONSOLE  AmiTCP.config
+check_installer_sentinel LOGFILENAME AmiTCP.config
+
+# The installer's merge blocks are meant to be VERBATIM copies of the corresponding
+# blocks in install/db/*, so that an upgraded machine ends up with the same file text
+# as a freshly installed one. Nothing enforces that by construction -- the installer
+# stores them as quoted Installer-script strings -- so check it here: unescape each
+# "..."\n line back to plain text and require every line to be present in the shipped
+# file. Catches an edit to one side that was not made to the other.
+check_installer_block_matches() {
+  local marker="$1" dbfile="$2" sentinel="$3"
+  python3 - "$marker" "$dbfile" "$ROOT" "$sentinel" <<'PYEOF'
+import re, sys
+marker, dbfile, root, sentinel = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+inst = open(root + "/install/Install-AmiTCP_NG").read()
+m = re.search(r"\(set " + re.escape(marker) + r" \(cat\n(.*?)\n\)\)", inst, re.S)
+if not m:
+    sys.exit("!!! build-release: cannot find %s block in Install-AmiTCP_NG" % marker)
+lines = []
+for raw in m.group(1).split("\n"):
+    q = re.match(r'\s*"(.*)"\s*$', raw)
+    if not q:
+        sys.exit("!!! build-release: unparsable line in %s: %s" % (marker, raw))
+    t = q.group(1)
+    if not t.endswith("\\n"):
+        sys.exit("!!! build-release: %s line does not end in \\n: %s" % (marker, raw))
+    t = t[:-2]
+    while t.startswith("\\n"):        # leading blank-line escapes are spacing, not content
+        t = t[2:]
+    t = t.replace('\\"', '"').replace("\\\\", "\\")
+    if t:
+        lines.append(t)
+if not lines:
+    sys.exit("!!! build-release: %s produced 0 content lines -- the block asserts "
+             "nothing and would pass vacuously" % marker)
+if sentinel and not any(sentinel in t for t in lines):
+    sys.exit("!!! build-release: sentinel '%s' does not appear in the %s block.\n"
+             "    The block would be appended again on EVERY future upgrade."
+             % (sentinel, marker))
+shipped = open(root + "/install/db/" + dbfile).read().split("\n")
+for t in lines:
+    if t not in shipped:
+        sys.exit("!!! build-release: %s carries a line not in install/db/%s:\n    %s"
+                 % (marker, dbfile, t))
+print("    %s: %d lines match install/db/%s" % (marker, len(lines), dbfile))
+PYEOF
+}
+# KNOWN LIMIT: this is one-directional -- it proves the installer block is a subset
+# of the shipped file, not that the shipped file has nothing the block lacks. Adding
+# a service to install/db/netdb and forgetting the installer block would still ship
+# silently, and existing users would again not receive it. Closing that needs explicit
+# region markers in install/db/*, since not every shipped line belongs to a block.
+check_installer_block_matches "#db-newhostname" AmiTCP.config HOSTNAME
+check_installer_block_matches "#db-newlogging"     AmiTCP.config LOGGING
+check_installer_block_matches "#db-newloglevel"    AmiTCP.config LOGLEVEL
+check_installer_block_matches "#db-newlogconsole"  AmiTCP.config LOGCONSOLE
+check_installer_block_matches "#db-newlogfilename" AmiTCP.config LOGFILENAME
+check_installer_block_matches "#db-newservices" netdb ng-services-v2
+
+# Every setting the shipped AmiTCP.config offers must be the KEY (#mf-key) of one
+# of the installer's merges. Not merely present in some block -- the KEY.
+#
+# This exists because of a real escape: LOGCONSOLE was added to the config and to
+# the #db-newlogging block, and every check here passed, but that block is guarded
+# by LOGLEVEL -- which every machine running the previous release already had. The
+# merge was therefore skipped and the new setting reached new installs only. The
+# checks could not see it: the block WAS a faithful copy of the shipped file, it
+# simply could never be applied again.
+#
+# Keying each setting on its own name makes "add a setting" and "deliver it to
+# existing users" the same action, and this check makes forgetting it fail the
+# build instead of shipping.
+python3 - "$ROOT" <<'PYEOF'
+import re, sys
+root = sys.argv[1]
+cfg  = open(root + "/install/db/AmiTCP.config").read()
+inst = open(root + "/install/Install-AmiTCP_NG").read()
+
+# `#?` so a LIVE setting counts too: HOSTNAME=amiga ships uncommented, and a
+# check that only saw commented examples would not have covered it.
+settings = re.findall(r"^#?([A-Z_]+)=", cfg, re.M)
+# Comment-stripped: a key mentioned in a ';' note is documentation, not a merge.
+keys = set(re.findall(r'\(set #mf-key\s+"([^"]+)"\)', re.sub(r"(?m);.*$", "", inst)))
+missing = [s for s in dict.fromkeys(settings) if s not in keys]
+if missing:
+    sys.exit("!!! build-release: these AmiTCP.config settings are not the key of any\n"
+             "    installer merge, so an existing installation would never receive them:\n"
+             "      " + ", ".join(missing) + "\n"
+             "    Add a (set #mf-key \"<SETTING>\") merge for each -- see #db-newlogconsole.")
+print("    every AmiTCP.config setting has its own merge key (%d checked)"
+      % len(dict.fromkeys(settings)))
+
+# CROSS-BLOCK COLLISION. C:Search is a plain substring match over the whole file,
+# so a block that MENTIONS a later setting's name in its prose plants that name
+# in the file before that setting's own merge runs -- whose search then reports
+# "already present" and silently skips it.
+#
+# This is not hypothetical. It shipped: the LOGGING block's documentation said
+# "LOGLEVEL=7" and "send the file named by LOGFILENAME", so on a 4.1.4 upgrade
+# LOGGING appended, and LOGLEVEL and LOGFILENAME were both skipped -- while the
+# installer told the user everything had been added.
+#
+# For each merge, in invocation order, assert no EARLIER block for the SAME FILE
+# contains this one's key.
+#
+# CASE-INSENSITIVE, because C:Search is. Ground truth is the Search binary this
+# repo ships for the emulator: its ReadArgs template is
+#   FROM/M,SEARCH/A,ALL/S,NONUM/S,QUIET/S,QUICK/S,FILE/S,PATTERN/S,CASE/S
+# -- CASE is an opt-in SWITCH, and the installer's invocation passes only SEARCH
+# and QUIET. So "Logfilename" in someone's prose would match the LOGFILENAME key
+# on a real machine. A case-sensitive check here would call that clean and the
+# setting would silently go missing again, which is the whole bug this guards.
+#
+# Scoped per #mf-file: each C:Search only ever scans its own target, so the netdb
+# block cannot collide with an AmiTCP.config key however similar the words are.
+# Comments are stripped first, so a key mentioned in a ';' note is not mistaken
+# for one in the text that actually gets appended.
+inst_live = re.sub(r"(?m);.*$", "", inst)
+seq = re.findall(r'\(set #mf-file\s+"([^"]+)"\)\s*\n\s*'
+                 r'\(set #mf-key\s+"([^"]+)"\)\s*\n\s*'
+                 r'\(set #mf-add\s+(#[a-z0-9-]+)\)', inst_live)
+def block_text(var):
+    m = re.search(r"\(set " + re.escape(var) + r" \(cat\n(.*?)\n\)\)", inst, re.S)
+    return m.group(1).lower() if m else ""
+clashes = []
+for i, (file_i, key_i, var_i) in enumerate(seq):
+    body = block_text(var_i)
+    for file_j, key_j, _ in seq[i+1:]:
+        if file_j == file_i and key_j.lower() in body:
+            clashes.append("%s (merged earlier into %s) contains the later key '%s'"
+                           % (var_i, file_i, key_j))
+if clashes:
+    sys.exit("!!! build-release: installer merge keys collide by substring --\n"
+             "    an earlier block's text would make a later merge think its\n"
+             "    setting is already present, and skip it:\n      "
+             + "\n      ".join(clashes)
+             + "\n    Reword the prose so it does not name the later setting.")
+print("    no merge key is pre-echoed by an earlier block (%d merges, case-folded)"
+      % len(seq))
+PYEOF
+echo ">>> installer db-merge blocks verified against install/db/*"
 
 # --------------------------------------------------------------------------------
 # build_variant <cpu> <name-suffix>

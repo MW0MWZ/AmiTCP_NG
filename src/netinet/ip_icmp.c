@@ -266,6 +266,23 @@ struct sockaddr_in icmpmask = { 8, 0 };
 struct in_ifaddr *ifptoia();
 
 /*
+ * PORT (AmiTCP_NG): Roadshow-compatible ICMP behaviour controls, settable at
+ * runtime with SocketBaseTags(). Each affects the whole stack, not the library
+ * base it was set through -- that is the documented behaviour, and the only one
+ * that makes sense for a single shared IP layer.
+ */
+int	icmp_process_echo   = IR_Process;	/* SBTC_ICMP_PROCESS_ECHO   (48) */
+int	icmp_process_tstamp = IR_Process;	/* SBTC_ICMP_PROCESS_TSTAMP (49) */
+/*
+ * SBTC_ICMP_MASK_REPLY (45). Disabled by default, matching both Roadshow and
+ * stock 4.4BSD (icmpmaskrepl). NOTE this is a deliberate BEHAVIOUR CHANGE for
+ * this fork: the code below used to answer address-mask requests
+ * unconditionally, which hands any host on the wire the subnet mask for the
+ * asking and is why BSD turned it off.
+ */
+int	icmpmaskrepl = 0;
+
+/*
  * Process a received ICMP message.
  */
 void STKARGFUN
@@ -279,6 +296,10 @@ icmp_input(m, hlen)
 	register int i;
 	struct in_ifaddr *ia;
 	int code;
+	/* PORT (AmiTCP_NG): which IR_* disposal the request-handling cases below
+	 * chose, read at the icmp_ignored label. Only meaningful once one of them
+	 * has jumped there. */
+	int	ignore_action = IR_Ignore;
 	extern u_char ip_protox[];
 	extern struct in_addr in_makeaddr();
 
@@ -355,6 +376,27 @@ icmp_input(m, hlen)
 			icmpstat.icps_badlen++;
 			goto freeit;
 		}
+		/*
+		 * PORT (AmiTCP_NG): the initial m_pullup guaranteed only
+		 * ICMP_ADVLENMIN contiguous, but pr_ctlinput() reads the quoted
+		 * transport header at icmp_ip + (icmp_ip.ip_hl << 2) -- which, for a
+		 * quoted header carrying IP options, lies past that region. If the
+		 * ICMP packet spans mbufs, ctlinput would walk off the first mbuf into
+		 * unrelated memory (garbage, not a fault, on no-MMU). Pull up the full
+		 * ICMP_ADVLEN first. icmp_ip.ip_hl is within ICMP_ADVLENMIN, so it was
+		 * already safe to read above.
+		 */
+		{
+			int adv = hlen + ICMP_ADVLEN(icp);
+			if (m->m_len < adv) {
+				if ((m = m_pullup(m, adv)) == 0) {
+					icmpstat.icps_tooshort++;
+					return;
+				}
+				ip = mtod(m, struct ip *);
+				icp = (struct icmp *)((caddr_t)ip + hlen);
+			}
+		}
 		(void)NTOHS(icp->icmp_ip.ip_len);
 #ifdef ICMPPRINTFS
 		if (icmpprintfs)
@@ -372,10 +414,24 @@ icmp_input(m, hlen)
 		break;
 
 	case ICMP_ECHO:
+		/* PORT (AmiTCP_NG): SBTC_ICMP_PROCESS_ECHO. */
+		if (icmp_process_echo != IR_Process) {
+			ignore_action = icmp_process_echo;
+			goto icmp_ignored;
+		}
 		icp->icmp_type = ICMP_ECHOREPLY;
 		goto reflect;
 
 	case ICMP_TSTAMP:
+		/* PORT (AmiTCP_NG): SBTC_ICMP_PROCESS_TSTAMP. Checked before the
+		 * length test so that a configured IR_Drop disposes of a runt the
+		 * same way it disposes of a well-formed request -- otherwise the
+		 * two are distinguishable from outside, which is exactly what
+		 * turning the reply off is meant to prevent. */
+		if (icmp_process_tstamp != IR_Process) {
+			ignore_action = icmp_process_tstamp;
+			goto icmp_ignored;
+		}
 		if (icmplen < ICMP_TSLEN) {
 			icmpstat.icps_badlen++;
 			break;
@@ -395,6 +451,12 @@ icmp_input(m, hlen)
 		goto reflect;
 
 	case ICMP_MASKREQ:
+		/* PORT (AmiTCP_NG): SBTC_ICMP_MASK_REPLY, off by default. Not
+		 * routed through icmp_ignored: the API defines this one as a plain
+		 * on/off, with no IR_Drop equivalent, so an unanswered request is
+		 * simply passed to raw IP like any other unhandled message. */
+		if (!icmpmaskrepl)
+			goto raw;
 		if (icmplen < ICMP_MASKLEN ||
 		    (ia = ifptoia(m->m_pkthdr.rcvif)) == 0)
 			break;
@@ -467,6 +529,34 @@ reflect:
 		break;
 	}
 
+/*
+ * PORT (AmiTCP_NG): a request the configuration says not to answer
+ * (SBTC_ICMP_PROCESS_ECHO / _TSTAMP set to something other than IR_Process).
+ *
+ *   IR_Ignore  no reply, but the message still reaches anything listening on a
+ *              raw ICMP socket -- so a packet sniffer or a userland ping
+ *              responder still sees it.
+ *   IR_Drop    no reply and no raw delivery, accounted exactly as a checksum
+ *              failure. That accounting is the API's own definition of the
+ *              option ("treated as if it had a checksum error"), not an
+ *              approximation: to anything watching from outside, including the
+ *              statistics, the packet never arrived intact.
+ *
+ * NOTE this block also sits in the ordinary fallthrough path -- every `break`
+ * out of the switch above lands here on its way to raw:, as it always did.
+ * That stays correct because ignore_action is initialised to IR_Ignore and is
+ * only ever assigned immediately before a `goto icmp_ignored`, so a plain
+ * `break` cannot take the IR_Drop branch. Keep it that way: assigning
+ * ignore_action anywhere that subsequently breaks would silently start
+ * discarding unrelated ICMP messages.
+ */
+icmp_ignored:
+	if (ignore_action == IR_Drop) {
+		icmpstat.icps_checksum++;
+		goto freeit;
+	}
+	/* FALLTHROUGH to raw */
+
 raw:
 	icmpsrc.sin_addr = ip->ip_src;
 	icmpdst.sin_addr = ip->ip_dst;
@@ -512,6 +602,13 @@ icmp_reflect(m)
 		ia = in_ifaddr;
 	t = IA_SIN(ia)->sin_addr;
 	ip->ip_src = t;
+	/*
+	 * PORT (AmiTCP_NG): deliberately NOT ip_defttl (SBTC_IP_DEFAULT_TTL). This
+	 * is a reply being sent back along a path a packet has already traversed,
+	 * so BSD maximises the TTL to give it the best chance of arriving; a user
+	 * lowering the default TTL for their own traffic almost certainly does not
+	 * mean "and make my ping replies undeliverable to distant hosts".
+	 */
 	ip->ip_ttl = MAXTTL;
 
 	if (optlen > 0) {

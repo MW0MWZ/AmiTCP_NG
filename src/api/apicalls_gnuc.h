@@ -5,7 +5,7 @@
  */
 
 /* PORT (AmiTCP_NG): local register temp renamed _res -> _api_d0 to avoid colliding
- * with resolv.h's `#define _res (libPtr->res_state)`. */
+ * with resolv.h's `#define _res (NG_CTX(libPtr)->res_state)`. */
 #ifndef API_APICALLS_GNUC_H
 #define API_APICALLS_GNUC_H
 

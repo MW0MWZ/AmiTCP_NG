@@ -129,11 +129,31 @@ APTR SAVEDS RAF1(_RoadshowStubNull,
 /* ------------------------------------------------------------------------- *
  *  GetSocketEvents (LVO -300) -- the one "standard" vector AmiTCP 3.0b2 lacked.
  *
- *  Roadshow apps poll this for per-socket event flags (accept-ready, connect
- *  complete, closed, ...) as a lighter alternative to WaitSelect(). We do not yet
- *  track that event state, so report "no socket currently has events" (return -1,
- *  the documented empty answer) and clear the caller's flag word. TODO: real event
- *  bookkeeping wired to the socket state changes in uipc_socket2.c.
+ *  Returns the next socket with asynchronous events pending, removes those
+ *  events from it, and stores them through eventsp. -1 means "nothing pending",
+ *  which is how an application knows to stop draining.
+ *
+ *  The events themselves are recorded by soraise_event() (kern/uipc_socket2.c)
+ *  on the same wakeup paths select() uses, for sockets that opted in with
+ *  setsockopt(SO_EVENTMASK); the application is told to look by the signal it
+ *  named with SocketBaseTags(SBTC_SIGEVENTMASK).
+ *
+ *  Scanning the descriptor table rather than keeping a ready-queue is deliberate.
+ *  The event is recorded against a `struct socket`, but this call must return a
+ *  DESCRIPTOR, and descriptors are per-SocketBase -- the same socket can be fd 5
+ *  in the task that opened it and absent from every other base. The table is the
+ *  only place that mapping exists, it is small (dTableSize, 64 by default), and
+ *  the scan happens once per delivered signal rather than per packet.
+ *
+ *  FD_ACCEPT is deliberately NOT re-armed here. A bitmask cannot hold two
+ *  pending connections, and re-arming at collection time while so_qlen stayed
+ *  non-zero would mean an application that drains "until -1" before it calls
+ *  accept() never sees -1 -- a hang. The documented per-connection accounting
+ *  is honoured in _accept() instead (api/amiga_syscalls.c), which re-raises
+ *  FD_ACCEPT once if the queue is still non-empty after a connection is taken
+ *  off it. That is exactly one re-arm per accept() call, so it satisfies both
+ *  the accept-once-per-signal client and the drain-in-a-loop client, with no
+ *  way to spin.
  * ------------------------------------------------------------------------- */
 
 LONG SAVEDS RAF2(_GetSocketEvents,
@@ -142,10 +162,50 @@ LONG SAVEDS RAF2(_GetSocketEvents,
 #if 0
 {
 #endif
-  (void)libPtr;
-  if (eventsp != NULL)
-    *eventsp = 0;
-  return (-1);
+  register struct socket *so;
+  register int fd;
+  ULONG events;
+  LONG result = -1;
+  spl_t s;
+
+  CHECK_TASK();
+
+  /*
+   * eventsp is written on every success. A caller that passes NULL cannot be
+   * told WHICH events fired, so consuming them would destroy the only copy --
+   * refuse instead of silently discarding. (EFAULT rather than EINVAL: there is
+   * no MMU here, so an unusable pointer is exactly what this reports.)
+   */
+  if (eventsp == NULL) {
+    writeErrnoValue(libPtr, EFAULT);
+    return (-1);
+  }
+
+  ObtainSyscallSemaphore(libPtr);
+  /*
+   * splnet() against the net task: so_events is written by soraise_event() from
+   * interrupt/net context, and this reads-and-clears it.
+   */
+  s = splnet();
+
+  for (fd = 0; fd < libPtr->dTableSize; fd++) {
+    so = libPtr->dTable[fd];
+    if (so == NULL || so->so_events == 0)
+      continue;
+
+    events = so->so_events;
+    so->so_events = 0;
+    *eventsp = events;
+    result = (LONG)fd;
+    break;
+  }
+
+  splx(s);
+  ReleaseSyscallSemaphore(libPtr);
+
+  if (result < 0)
+    *eventsp = 0;		/* documented empty answer */
+  return (result);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -164,6 +224,7 @@ LONG SAVEDS RAF3(_inet_aton,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   return (LONG)inet_aton((const char *)cp, addr);
 }
@@ -182,6 +243,7 @@ LONG SAVEDS RAF4(_inet_pton,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   if (af != AF_INET) {
     writeErrnoValue(libPtr, EAFNOSUPPORT);
     return (-1);
@@ -233,9 +295,17 @@ STRPTR SAVEDS RAF5(_inet_ntop,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   char tmp[16];
   int len;
 
+  /* Guard NULL pointers before any access: on this no-MMU 68k a NULL dst would
+   * make the bcopy below a wild write into the CPU exception-vector table at
+   * address 0, and a NULL src a garbage read of the same. Fail cleanly instead. */
+  if (src == NULL || dst == NULL) {
+    writeErrnoValue(libPtr, EINVAL);
+    return (NULL);
+  }
   if (af != AF_INET) {
     writeErrnoValue(libPtr, EAFNOSUPPORT);
     return (NULL);
@@ -260,6 +330,7 @@ LONG SAVEDS RAF2(_In_LocalAddr,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct in_addr ia;
 
   (void)libPtr;
@@ -274,6 +345,7 @@ LONG SAVEDS RAF2(_In_CanForward,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct in_addr ia;
 
   (void)libPtr;
@@ -299,6 +371,7 @@ LONG SAVEDS RAF2(_AddDomainNameServer,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct in_addr ns_addr;
   struct NameserventNode *nsn;
 
@@ -327,6 +400,7 @@ LONG SAVEDS RAF2(_RemoveDomainNameServer,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct in_addr ns_addr;
   struct NameserventNode *nsn, *next;
   int found = 0;
@@ -571,8 +645,18 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
        * non-SANA interface (loopback) there is no device ceiling, so honour as given.
        */
       long m = (long)ti->ti_Data;
+      /*
+       * PORT (AmiTCP_NG) security fix: the non-SANA ceiling was 0, and the
+       * clamp below is gated on `ceil > 0`, so for the loopback interface it
+       * was skipped ENTIRELY and any value up to 0x7FFFFFFF reached the naked
+       * (short) cast -- ti_Data is a ULONG under the caller's control, so
+       * ConfigureInterfaceTagList("lo0", {IFC_MTU, 100000}) stored
+       * (short)100000 == -31072. if_mtu is a SIGNED short, and a negative MTU
+       * propagates into the MSS and fragmentation arithmetic. Use SHRT_MAX as
+       * the ceiling when the interface has no device limit of its own.
+       */
       long ceil = (ifp->if_type == IFT_SANA)
-		  ? (long)((struct sana_softc *)ifp)->ss_maxmtu : 0;
+		  ? (long)((struct sana_softc *)ifp)->ss_maxmtu : 32767;
       if (ceil > 0 && m > ceil) m = ceil;
       if (m >= 68)
 	ifp->if_mtu = (short)m;
@@ -887,6 +971,28 @@ ng_route_op(int req, struct TagItem *tags)
   gw.s_addr = 0;
 
   for (tstate = tags; (ti = ng_nexttag(&tstate)) != NULL; ) {
+    /*
+     * Every address tag below carries a STRING pointer. Reject a NULL one up
+     * front: inet_aton() dereferences its argument on the first line of its
+     * parse loop with no guard of its own, and with no MMU that read does not
+     * trap -- it just returns whatever address 0 holds, so a tag list
+     * containing { RTA_Destination, 0 } could quietly parse as 0.0.0.0 and be
+     * ACCEPTED as a route rather than cleanly refused. ng_set_ifaddr() already
+     * guards the identical class of input for the IFC_* tags. These vectors
+     * (AddRouteTagList/DeleteRouteTagList) take a caller-supplied tag list from
+     * arbitrary local callers.
+     */
+    switch (ti->ti_Tag) {
+    case RTA_Destination:
+    case RTA_DestinationNet:
+    case RTA_DestinationHost:
+    case RTA_Gateway:
+    case RTA_DefaultGateway:
+      if (ti->ti_Data == 0) return EINVAL;
+      break;
+    default:
+      break;
+    }
     switch (ti->ti_Tag) {
     case RTA_Destination:
     case RTA_DestinationNet:
@@ -1161,6 +1267,12 @@ VOID SAVEDS RAF2(_ReleaseInterfaceList,
 #define NGIFQ_OutErrors		(TAG_USER + 0x004E4731)	/* if_oerrors: media/device TX errors   */
 #define NGIFQ_OutNoBuf		(TAG_USER + 0x004E4732)	/* TX drops: send-tag mbuf alloc failed */
 #define NGIFQ_InNoBuf		(TAG_USER + 0x004E4733)	/* RX drops: read re-post mbuf alloc fail */
+/* How many of the SANA-II copy callbacks came through the R4 32-bit-aligned
+ * variants. The spec's SANA2CopyStats has no field for these (it predates R4),
+ * so they get private tags rather than being crammed into DMAIn/DMAOut, which
+ * mean something else and which this stack honestly reports as 0. */
+#define NGIFQ_Copy32In		(TAG_USER + 0x004E4734)
+#define NGIFQ_Copy32Out		(TAG_USER + 0x004E4735)
 /* Per-interface I/O counters a monitor (NetMon) queries. This stack's ifnet/SANA softc
  * do not track most of them; we still answer with a plausible value (0, or the I/O
  * request-pool size) so a tool never reads its own uninitialised buffer as the result. */
@@ -1373,6 +1485,12 @@ LONG SAVEDS RAF3(_QueryInterfaceTagList,
       /* RX drops from read re-post mbuf exhaustion -- the receive-side twin of
        * NGIFQ_OutNoBuf; the true mbuf-starvation signal on the download path. */
       *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_rxnobuf : 0;
+      break;
+    case NGIFQ_Copy32In:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_copyin32 : 0;
+      break;
+    case NGIFQ_Copy32Out:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_copyout32 : 0;
       break;
     case IFQ_Overruns:
     case IFQ_UnknownTypes:
@@ -1667,6 +1785,7 @@ VOID SAVEDS RAF2(_freeaddrinfo,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   ng_freeaddrinfo(ai);
 }
@@ -2115,6 +2234,7 @@ BOOL SAVEDS RAF3(_GetDefaultDomainName,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct DomainentNode *dn;
   int found = 0;
 
@@ -2146,6 +2266,21 @@ ng_set_default_domain(const char *name)
   if (name == NULL || *name == '\0')
     return;
 
+  /*
+   * dn_EntSize is a signed 16-bit field. Refuse an oversized name BEFORE
+   * anything is dropped or allocated: SetDefaultDomainName (LVO -708) takes a
+   * bare NUL-terminated string with no length argument at all, so any local
+   * caller controls this length completely, and a ~32KB name would truncate
+   * the stored size. Rejecting up front also means the existing search domains
+   * below are not discarded on a call that was never going to succeed.
+   */
+  nodesize = sizeof(*dn) + strlen(name) + 1;
+  if (nodesize - (int)sizeof(struct GenentNode) > 32767) {
+    log(LOG_ERR, "netdb: refusing oversized domain name (%ld bytes).",
+	(long)nodesize);
+    return;
+  }
+
   LOCK_W_NDB(NDB);
 
   /* Drop any existing search/default domains. */
@@ -2156,8 +2291,8 @@ ng_set_default_domain(const char *name)
     bsd_free(dn, M_NETDB);
   }
 
-  /* Install the new default (node carries its own name string, as adddomainent). */
-  nodesize = sizeof(*dn) + strlen(name) + 1;
+  /* Install the new default (node carries its own name string, as adddomainent).
+   * nodesize was computed and bounds-checked above. */
   if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) != NULL) {
     dn->dn_EntSize = nodesize - sizeof(struct GenentNode);
     dn->dn_Ent.d_name = (char *)(dn + 1);
@@ -2185,9 +2320,17 @@ ng_set_default_domain_if_empty(const char *name)
   if (name == NULL || *name == '\0')
     return;
 
+  /* Bound the name before it reaches the 16-bit dn_EntSize -- see
+   * ng_set_default_domain() above. */
+  nodesize = sizeof(*dn) + strlen(name) + 1;
+  if (nodesize - (int)sizeof(struct GenentNode) > 32767) {
+    log(LOG_ERR, "netdb: refusing oversized domain name (%ld bytes).",
+	(long)nodesize);
+    return;
+  }
+
   LOCK_W_NDB(NDB);
   if (((struct DomainentNode *)NDB->ndb_Domains.mlh_Head)->dn_Node.mln_Succ == NULL) {
-    nodesize = sizeof(*dn) + strlen(name) + 1;
     if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) != NULL) {
       dn->dn_EntSize = nodesize - sizeof(struct GenentNode);
       dn->dn_Ent.d_name = (char *)(dn + 1);
@@ -2205,6 +2348,7 @@ VOID SAVEDS RAF2(_SetDefaultDomainName,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   ng_set_default_domain((const char *)buffer);
 }
@@ -2229,12 +2373,21 @@ VOID SAVEDS RAF2(_SetDefaultDomainName,
 #define NG_NETSTATUS_tcp	6
 #define NG_NETSTATUS_udp	7
 
-/* Roadshow struct byte sizes (field count x 4); ip/tcp appended, udp identical. */
+/* Roadshow struct byte sizes (field count x 4); ip/tcp appended, udp identical.
+ *
+ * THESE MUST MATCH THE REAL STRUCTS. They were both one field short -- tcpstat
+ * is 47 longs and udpstat 9, not 46 and 8 -- so the LAST field of each was
+ * silently truncated and read back as 0 forever: tcps_rcvwinupd (which the
+ * header-prediction fast path increments) and udps_opackets (every UDP packet
+ * this machine has ever sent). Nothing reported these stats, so nobody noticed.
+ * A compile-time assert now sits next to each struct definition, where the type
+ * is complete; this file only has incomplete types, deliberately, so it cannot
+ * check them itself. If you add a field, the build breaks -- fix both places. */
 #define NG_STAT_IP_OUR		80	/* our ipstat  = 20 longs */
 #define NG_STAT_IP_FULL		96	/* Roadshow    = 24 longs */
-#define NG_STAT_TCP_OUR		184	/* our tcpstat = 46 longs */
+#define NG_STAT_TCP_OUR		188	/* our tcpstat = 47 longs */
 #define NG_STAT_TCP_FULL	208	/* Roadshow    = 52 longs */
-#define NG_STAT_UDP_FULL	32	/* both        =  8 longs */
+#define NG_STAT_UDP_FULL	36	/* both        =  9 longs */
 
 /* our ipstat/tcpstat/udpstat globals (address only -- incomplete types suffice) */
 struct ipstat;   extern struct ipstat  ipstat;
@@ -2484,6 +2637,7 @@ VOID SAVEDS RAF2(_FreeRouteInfo,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   if (buf != NULL)
     FreeVec((APTR)buf);
@@ -2508,6 +2662,7 @@ BOOL SAVEDS RAF3(_RemoveInterface,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct ifnet *ifp;
   int error;
 
@@ -2610,6 +2765,7 @@ LONG SAVEDS RAF6(_CreateAddrAllocMessageA,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct TagItem *tstate, *ti;
   struct ng_aam *aam;
   char *base;
@@ -2722,6 +2878,7 @@ VOID SAVEDS RAF2(_DeleteAddrAllocMessage,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   if (aam != NULL)
     FreeVec((APTR)aam);
@@ -2810,6 +2967,7 @@ struct List * SAVEDS RAF2(_ObtainRoadshowData,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct ng_rsd_handle *h;
   struct List *l;
   ULONG i;
@@ -2852,6 +3010,7 @@ VOID SAVEDS RAF2(_ReleaseRoadshowData,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   if (list != NULL)
     FreeVec((APTR)list);			/* list == &handle->rh_List */
@@ -2867,6 +3026,7 @@ BOOL SAVEDS RAF5(_ChangeRoadshowData,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct ng_rsd_handle *h = (struct ng_rsd_handle *)list;
   struct RoadshowDataNode *n = NULL;
   ULONG i;
@@ -2937,6 +3097,10 @@ extern void         m_copyback(struct mbuf *, int, int, caddr_t);
 extern void         m_cat(struct mbuf *, struct mbuf *);
 extern void         m_adj(struct mbuf *, int);
 extern struct mbuf *m_pullup(struct mbuf *, int);
+/* Sanity-check a caller-supplied mbuf pointer before we dereference or free it
+ * -- see the note on its definition in kern/uipc_mbuf.c. Declared here for the
+ * same reason as the rest of this list. */
+extern int          m_valid(struct mbuf *);
 
 /* mbuf_get (LVO -654). */
 struct mbuf * SAVEDS RAF1(_mbuf_get,
@@ -2944,6 +3108,7 @@ struct mbuf * SAVEDS RAF1(_mbuf_get,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   return (m_get(NG_M_DONTWAIT, NG_MT_DATA));
 }
@@ -2954,6 +3119,7 @@ struct mbuf * SAVEDS RAF1(_mbuf_gethdr,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   return (m_gethdr(NG_M_DONTWAIT, NG_MT_DATA));
 }
@@ -2965,8 +3131,25 @@ struct mbuf * SAVEDS RAF2(_mbuf_free,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL)
+  /*
+   * PORT (AmiTCP_NG) security fix: every vector in this group that takes a
+   * struct mbuf * from the caller now sanity-checks it with m_valid() rather
+   * than merely testing for NULL. These vectors hand raw mbuf pointers out to
+   * applications and accept them back, so the pointer is caller-controlled --
+   * and MFREE() links whatever it is given straight into the free list
+   * ((m)->m_next = mfree; mfree = (m)), after which the next allocation by ANY
+   * task, including the stack's own receive path, hands that address out as an
+   * mbuf and writes through it. With no MMU that is a write-what-where
+   * primitive for any local task; a NULL check only excluded address 0, not
+   * address 4 onwards in the exception-vector table. m_valid() confirms the
+   * pointer is MSIZE-aligned and inside one of our pool chunks. It cannot
+   * detect a pointer to an mbuf that was ours and has since been freed -- that
+   * needs generation tags the pool does not have -- so a double free through
+   * these vectors is still possible; this closes the "point anywhere" class.
+   */
+  if (!m_valid(m))
     return (NULL);
   return (m_free(m));
 }
@@ -2978,8 +3161,9 @@ VOID SAVEDS RAF2(_mbuf_freem,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m != NULL)
+  if (m_valid(m))		/* see mbuf_free above */
     m_freem(m);
 }
 
@@ -2991,8 +3175,11 @@ struct mbuf * SAVEDS RAF3(_mbuf_prepend,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL)
+  /* see mbuf_free above for m_valid(). len is bounded inside m_prepend(): an
+   * oversized or negative value corrupts the new mbuf's m_len/m_data. */
+  if (!m_valid(m))
     return (NULL);
   return (m_prepend(m, (int)len, NG_M_DONTWAIT));
 }
@@ -3005,8 +3192,12 @@ struct mbuf * SAVEDS RAF3(_mbuf_pullup,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL)
+  /* see mbuf_free above. A negative len is not rejected here: m_pullup()'s own
+   * min(min(max(len, max_protohdr), space), n->m_len) clamp degrades it to
+   * "pull up about max_protohdr bytes", matching upstream BSD behaviour. */
+  if (!m_valid(m))
     return (NULL);
   return (m_pullup(m, (int)len));
 }
@@ -3020,8 +3211,10 @@ struct mbuf * SAVEDS RAF4(_mbuf_copym,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL)
+  /* see mbuf_free above. m_copym() rejects a negative off/len itself. */
+  if (!m_valid(m))
     return (NULL);
   return (m_copym(m, (int)off, (int)len, NG_M_DONTWAIT));
 }
@@ -3034,8 +3227,11 @@ LONG SAVEDS RAF3(_mbuf_adj,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL)
+  /* see mbuf_free above. An over-large len can no longer drive pkthdr.len
+   * negative -- m_adj() floors it. */
+  if (!m_valid(m))
     return (-1L);
   m_adj(m, (int)len);
   return (0L);
@@ -3049,8 +3245,11 @@ LONG SAVEDS RAF3(_mbuf_cat,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (first == NULL || second == NULL)
+  /* see mbuf_free above -- BOTH chains are caller-supplied, and m_cat() frees
+   * mbufs of `second` as it splices, so an invalid `second` reaches MFREE. */
+  if (!m_valid(first) || !m_valid(second))
     return (-1L);
   m_cat(first, second);
   return (0L);
@@ -3067,8 +3266,10 @@ LONG SAVEDS RAF5(_mbuf_copyback,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL || data == NULL)
+  /* see mbuf_free above. m_copyback() rejects a negative off/len itself. */
+  if (!m_valid(m) || data == NULL)
     return (-1L);
   m_copyback(m, (int)off, (int)len, data);
   return (0L);
@@ -3084,8 +3285,10 @@ LONG SAVEDS RAF5(_mbuf_copydata,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
-  if (m == NULL || data == NULL)
+  /* see mbuf_free above. m_copydata() rejects a negative off/len itself. */
+  if (!m_valid(m) || data == NULL)
     return (-1L);
   m_copydata(m, (int)off, (int)len, data);
   return (0L);
@@ -3241,6 +3444,34 @@ static long d_addroute(struct Library *sb, void *tags) {  /* AddRouteTagList -41
   __asm__ __volatile__("jsr a6@(-414)":"=r"(_d0),"+r"(_a0):"r"(_a6):"d1","a1","memory");
   return _d0;
 }
+static long d_delroute(struct Library *sb, void *tags) {  /* DeleteRouteTagList -420 */
+  register long _d0 __asm("d0"); register void *_a0 __asm("a0")=tags;
+  register struct Library *_a6 __asm("a6")=sb;
+  __asm__ __volatile__("jsr a6@(-420)":"=r"(_d0),"+r"(_a0):"r"(_a6):"d1","a1","memory");
+  return _d0;
+}
+/*
+ * Remove the transient limited-broadcast host route (255.255.255.255/32, gw
+ * 0.0.0.0) that a DISCOVER needs to leave a chosen interface. It MUST NOT outlive
+ * the exchange: while it exists, ip_broadcast_flood()'s directed-egress logic
+ * (ip_output.c) pins EVERY limited broadcast on the box to that one interface, so
+ * ordinary application broadcasts would stop flooding all segments. Called the
+ * moment each DISCOVER window closes. Idempotent -- a missing route just yields
+ * ESRCH, which we ignore.
+ *
+ * The radix table tracks no ownership, so this deletes by key alone: in the
+ * pathological case where an operator manually pinned an identical
+ * 255.255.255.255/32 (gw 0.0.0.0) route (e.g. via AddNetRoute), a closing DISCOVER
+ * window would collaterally remove it. Accepted -- that is a far narrower footgun
+ * than the permanent all-broadcast pinning this scoping fixes.
+ */
+static void ng_del_discover_route(struct Library *sb) {
+  struct TagItem rtags[3];
+  rtags[0].ti_Tag = RTA_DestinationHost; rtags[0].ti_Data = (ULONG)"255.255.255.255";
+  rtags[1].ti_Tag = RTA_Gateway;         rtags[1].ti_Data = (ULONG)"0.0.0.0";
+  rtags[2].ti_Tag = 0;
+  (void)d_delroute(sb, rtags);
+}
 static long d_adddns(struct Library *sb, void *addrstr) {  /* AddDomainNameServer -516 */
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=addrstr;
   register struct Library *_a6 __asm("a6")=sb;
@@ -3263,11 +3494,33 @@ static UBYTE *dhcp_put(UBYTE *p, UBYTE code, UBYTE len, const void *val)
   return p;
 }
 
-/* Find option `code` in a received packet; returns value ptr + sets *len, or NULL. */
-static UBYTE *dhcp_find(struct dhcp_pkt *pkt, UBYTE code, int *len)
+/* Find option `code` in a received packet; returns value ptr + sets *len, or NULL.
+ *
+ * `rlen` is the length d_recvfrom() actually returned for THIS datagram. It is
+ * required: the options array is a fixed 312 bytes, but a datagram may be far
+ * shorter, and the rx buffer is reused across every receive of the exchange.
+ * Scanning to the fixed end would therefore read whatever an EARLIER datagram
+ * left behind and hand it back as an option of the packet just received -- an
+ * attacker who can reach UDP port 68 could prime the tail with one oversized
+ * bogus datagram (wrong xid, ignored for message-type logic but still copied
+ * into the buffer) and have a later short, xid-matching ACK inherit it as
+ * DHO_ROUTERS/DHO_DNS, i.e. gateway and resolver hijack. Bound the scan to what
+ * really arrived. (ng_dhcp_exchange also clears rx before each receive; either
+ * measure alone would close this, both together are cheap.)
+ */
+static UBYTE *dhcp_find(struct dhcp_pkt *pkt, int rlen, UBYTE code, int *len)
 {
-  UBYTE *p = pkt->options + 4;			/* skip magic cookie */
-  UBYTE *end = pkt->options + sizeof(pkt->options);
+  int hdr = (int)((UBYTE *)pkt->options - (UBYTE *)pkt);
+  int avail = rlen - hdr;
+  UBYTE *p, *end;
+
+  if (avail < 4)				/* no magic cookie -> no options */
+    return NULL;
+  if (avail > (int)sizeof(pkt->options))
+    avail = (int)sizeof(pkt->options);
+
+  p = pkt->options + 4;				/* skip magic cookie */
+  end = pkt->options + avail;
   while (p < end && *p != DHO_END) {
     UBYTE c = *p++;
     UBYTE l;
@@ -3336,7 +3589,10 @@ static void d_dbg(const char *label, long v)
 }
 #define D_LOG(label, v) d_dbg((label), (long)(v))
 #else
-#define D_LOG(label, v)
+/* ((void)0), not empty: an empty expansion turns `if (x) D_LOG(...)` into
+ * `if (x);` -- which compiles, warns under -Wextra, and is the classic shape of
+ * a real bug hiding in plain sight. */
+#define D_LOG(label, v)	((void)0)
 #endif
 
 /* --- RFC 3927 IPv4 link-local (ZeroConf) acquisition --- */
@@ -3498,13 +3754,23 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
       D_LOG((msgtype == DHCPDISCOVER) ? "tx_discover_r" : "tx_request_r", r);
       sent++;
     }
+    /* Clear rx before every receive: it is reused across the whole DORA
+     * exchange and every background retry, so anything a previous (possibly
+     * hostile) datagram left past this one's length must not survive into the
+     * option scan. Belt and braces with dhcp_find's rlen bound. */
+    for (r = 0; r < (long)sizeof(*rx); r++) ((char *)rx)[r] = 0;
+    /* NOTE: from/fromlen are deliberately NULL. Filtering on the sender's IP
+     * would break relayed DHCP (the reply legitimately arrives from the relay
+     * agent, not the server). xid plus the server-id option is the standard
+     * validation and is what this client uses -- do not "fix" this to a
+     * source-address check. */
     r = d_recvfrom(sb, s, rx, sizeof(*rx), 0, (void*)0, (void*)0);
     if (r >= 0) D_LOG("rx_r", r);
     if (r >= 240 && rx->xid == xid && rx->op == BOOTREPLY) {
-      UBYTE *mt = dhcp_find(rx, DHO_MSG_TYPE, (int*)0);
+      UBYTE *mt = dhcp_find(rx, (int)r, DHO_MSG_TYPE, (int*)0);
       int t = mt ? *mt : 0;
       if (msgtype == DHCPDISCOVER && t == DHCPOFFER) {
-        UBYTE *sid = dhcp_find(rx, DHO_SERVER_ID, (int*)0);
+        UBYTE *sid = dhcp_find(rx, (int)r, DHO_SERVER_ID, (int*)0);
         L->addr = rx->yiaddr;
         if (sid) L->serverid = ((ULONG)sid[0]<<24)|((ULONG)sid[1]<<16)|((ULONG)sid[2]<<8)|sid[3];
         msgtype = DHCPREQUEST; i = -1;		/* restart timing for REQUEST */
@@ -3513,23 +3779,23 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
       if (msgtype == DHCPREQUEST && t == DHCPACK) {
         UBYTE *op; int ol;
         L->addr = rx->yiaddr;
-        if ((op = dhcp_find(rx, DHO_SUBNET_MASK, &ol)) && ol>=4)
+        if ((op = dhcp_find(rx, (int)r, DHO_SUBNET_MASK, &ol)) && ol>=4)
           L->mask = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
-        if ((op = dhcp_find(rx, DHO_ROUTERS, &ol)) && ol>=4)
+        if ((op = dhcp_find(rx, (int)r, DHO_ROUTERS, &ol)) && ol>=4)
           L->router = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
         /* DHO_DNS may carry several servers (4 bytes each); capture up to
          * NG_DHCP_MAXDNS of them. ol is already clamped to the packet by dhcp_find. */
-        if ((op = dhcp_find(rx, DHO_DNS, &ol)) && ol >= 4) {
+        if ((op = dhcp_find(rx, (int)r, DHO_DNS, &ol)) && ol >= 4) {
           int di;
           for (di = 0; (di + 1) * 4 <= ol && di < NG_DHCP_MAXDNS; di++)
             L->dns[di] = ((ULONG)op[di*4]<<24)|((ULONG)op[di*4+1]<<16)|
                          ((ULONG)op[di*4+2]<<8)|op[di*4+3];
         }
-        if ((op = dhcp_find(rx, DHO_LEASE_TIME, &ol)) && ol>=4)
+        if ((op = dhcp_find(rx, (int)r, DHO_LEASE_TIME, &ol)) && ol>=4)
           L->lease = ((ULONG)op[0]<<24)|((ULONG)op[1]<<16)|((ULONG)op[2]<<8)|op[3];
         /* DHO_DOMAIN (option 15): the search domain. dhcp_find clamps `ol` to the
          * packet, and we cap at the buffer, so the copy is bounded both ways. */
-        if ((op = dhcp_find(rx, DHO_DOMAIN, &ol)) && ol > 0) {
+        if ((op = dhcp_find(rx, (int)r, DHO_DOMAIN, &ol)) && ol > 0) {
           int k = (ol < (int)sizeof(L->domain) - 1) ? ol : (int)sizeof(L->domain) - 1;
           bcopy((caddr_t)op, (caddr_t)L->domain, k);
           L->domain[k] = 0;
@@ -3661,6 +3927,7 @@ ng_dhcp_background(struct Library *sb, long s, struct dhcp_pkt *tx,
       struct ng_lease L;
       int rc = ng_dhcp_exchange(sb, s, tx, rx, mac, (ULONG)ctx ^ 0x52455452UL,
 				(long)LL_RETRY_DORA * 5, ctx, &L);
+      ng_del_discover_route(sb);	/* DISCOVER window closed: unpin the limited broadcast */
       if (rc == NG_DHCP_GOT) {
 	D_LOG("bg_dhcp_ok", L.addr & 0xffff);
 	(void)ng_apply_lease(sb, ifname, &L);	/* upgraded to a real lease -- done */
@@ -3688,7 +3955,15 @@ ng_dhcp_background(struct Library *sb, long s, struct dhcp_pkt *tx,
 }
 
 /* The helper Process: run the exchange, apply the result, ReplyMsg the aam. */
-static SAVEDS void ng_dhcp_task(void)
+/* NOT SAVEDS: this is a CreateNewProc()'d Process, entered with an arbitrary a6
+ * -- not a library base. Under a compiler where SAVEDS expands to __saveds (the
+ * __SASC branch of sys/cdefs.h) the prologue would store that garbage a6 into
+ * the global SysBase and fault on the first library call, exactly as documented
+ * for ng_stack_process() in kern/amiga_main.c. Harmless under the bebbo gcc
+ * build this ships with, where SAVEDS expands to nothing -- removed so it does
+ * not become a live bug if the SASC path is ever revived. log_task() in
+ * kern/amiga_log.c, spawned the same way, already omits it. */
+static void ng_dhcp_task(void)
 {
   struct Process *me = (struct Process *)FindTask(NULL);
   struct ng_dhcp_ctx *ctx = (struct ng_dhcp_ctx *)me->pr_Task.tc_UserData;
@@ -3751,6 +4026,7 @@ static SAVEDS void ng_dhcp_task(void)
   {
     struct ng_lease L;
     int rc = ng_dhcp_exchange(sb, s, tx, rx, mac, xid, deadline, ctx, &L);
+    ng_del_discover_route(sb);	/* DISCOVER window closed: unpin the limited broadcast */
     if (rc == NG_DHCP_ABORT) { aam->aam_Result = AAMR_Aborted; goto reply; }
     if (rc == NG_DHCP_GOT) {
       if (ng_apply_lease(sb, ifname, &L) != 0) { aam->aam_Result = AAMR_AddrChangeFailed; goto reply; }
@@ -3836,6 +4112,7 @@ VOID SAVEDS RAF2(_BeginInterfaceConfig,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   struct ng_dhcp_ctx *ctx;
   struct Process *proc;
 
@@ -3883,6 +4160,7 @@ VOID SAVEDS RAF2(_AbortInterfaceConfig,
 #if 0
 {
 #endif
+  NG_ENSURE_STACK();
   (void)libPtr;
   if (aam == NULL)
     return;

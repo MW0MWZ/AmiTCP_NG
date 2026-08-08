@@ -186,7 +186,11 @@ rip_output(m, so)
 			ip->ip_src.s_addr = 0;
 		if ((sin = satosin(rp->rinp_rcb.rcb_faddr)))
 		    ip->ip_dst = sin->sin_addr;
-		ip->ip_ttl = MAXTTL;
+		/* PORT (AmiTCP_NG): the configurable default (SBTC_IP_DEFAULT_TTL),
+		 * not a hard-coded MAXTTL. This is an ordinary outgoing packet on a
+		 * user's socket, so it is exactly what that setting is meant to
+		 * govern. icmp_reflect() deliberately still uses MAXTTL -- see there. */
+		ip->ip_ttl = ip_defttl;
 	}
 	return (ip_output(m,
 	   (rp->rinp_flags & RINPF_HDRINCL)? (struct mbuf *)0: rp->rinp_options,

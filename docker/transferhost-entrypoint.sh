@@ -46,6 +46,21 @@ fi
 #   :9000  SOURCE -- on connect, streams zeros as fast as the peer will take them
 #                    (download / RX test: the Amiga receives)
 #   :9001  SINK   -- reads and discards everything (upload / TX test: the Amiga sends)
+# TFTP. --create lets a PUT land a new file; --permissive and --user root stop it
+# refusing writes on ownership grounds (tftpd-hpa drops to "nobody" by default and
+# then cannot create anything in a share owned by someone else). Right for a
+# throwaway test host, wrong anywhere else.
+#
+# TWO PORTS, and the second one is not optional for emulator testing: amiberry's
+# SLIRP has its OWN built-in TFTP server and INTERCEPTS udp/69 destined anywhere,
+# so a guest behind SLIRP never reaches this container on the standard port -- it
+# gets SLIRP's "Access violation" instead, which looks exactly like a server
+# misconfiguration. Point the guest at PORT 6969 to actually test TFTP.
+echo ">>> starting tftpd on udp/69 and udp/6969 (6969 bypasses SLIRP's own tftpd) ..."
+mkdir -p "$SHARE"
+in.tftpd --listen --address 0.0.0.0:69   --secure --create --permissive --user root "$SHARE" &
+in.tftpd --listen --address 0.0.0.0:6969 --secure --create --permissive --user root "$SHARE" &
+
 echo ">>> starting raw TCP throughput source :9000 + sink :9001 ..."
 # SOURCE: stream /dev/zero -> client (bidirectional; the client just recv's).
 socat TCP-LISTEN:9000,fork,reuseaddr,nodelay OPEN:/dev/zero &
@@ -55,6 +70,7 @@ socat -u TCP-LISTEN:9001,fork,reuseaddr,nodelay OPEN:/dev/null,create &
 echo "========================================================================"
 echo " AmiTCP_NG transfer test host is UP"
 echo "   share dir : $SHARE"
+echo "   tftp      : udp/69 and udp/6969 (get and put; use 6969 from SLIRP)"
 echo "   test files: $(cd "$SHARE" && ls -1 test-*.bin 2>/dev/null | tr '\n' ' ')"
 echo "   SMB       : //$IP/share            (guest, or user amiga / pass amiga)"
 echo "   FTP       : ftp://amiga@$IP/       (pass amiga)"

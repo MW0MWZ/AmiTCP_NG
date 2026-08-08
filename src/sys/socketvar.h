@@ -135,6 +135,31 @@ struct socket {
 	struct  SocketBase *so_pgid;	/* owner for signals */
 	u_long	so_oobmark;		/* chars to oob mark */
 /*
+ * PORT (AmiTCP_NG): asynchronous socket events (the AmiTCP V4 / Roadshow
+ * mechanism -- FD_* in amitcp/socketbasetags.h).
+ *   so_eventmask  what the application asked for, via setsockopt(SO_EVENTMASK).
+ *                 Zero (the default) means this socket reports nothing and the
+ *                 whole mechanism costs one test per wakeup.
+ *   so_events     what has happened and not yet been collected by
+ *                 GetSocketEvents(). Only bits also present in so_eventmask are
+ *                 ever recorded, so the collector never has to mask again.
+ * Both are owned by the net task and only ever touched at splnet() or from a
+ * library call holding the syscall semaphore.
+ */
+	u_long	so_eventmask;		/* events this socket reports */
+	u_long	so_events;		/* events pending collection */
+/*
+ *   so_error_reported  the so_error value already announced as FD_ERROR.
+ *                 Without it FD_ERROR is sticky: so_error is deliberately not
+ *                 cleared when reported (getsockopt(SO_ERROR) is the documented
+ *                 way to clear it), and udp_notify() sets it on a socket that
+ *                 then keeps running -- so a single ICMP port-unreachable would
+ *                 otherwise attach FD_ERROR to every subsequent FD_READ for the
+ *                 life of the socket. Comparing against the value, not a flag,
+ *                 also means a DIFFERENT error arriving later is reported again.
+ */
+	u_short	so_error_reported;	/* so_error already reported as FD_ERROR */
+/*
  * Variables for socket buffering.
  */
 	struct	sockbuf {

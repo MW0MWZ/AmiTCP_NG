@@ -12,12 +12,33 @@ GCCINC=/opt/m68k-amigaos/lib/gcc/m68k-amigaos/6.5.0b/include
 # tasks (e.g. NETTRACE log_task), which hung the stack; libnix has no such need.
 NG_INC="-nostdinc -Isrc/netinclude -Isrc -Isrc/conf -Isrc/protos -isystem $NDK -isystem $LIBNIX -isystem $SYSINC -isystem $GCCINC"
 NG_DEF="-DAMITCP -DKERNEL -DTCPDEBUG -DDIRECTED_BROADCAST -DICMPPRINTFS"
+# NOTE: there is deliberately NO per-build diagnostic behaviour any more. A -DNG_BETA
+# used to make a pre-release default to LOG_DEBUG; that put what the binary reports in
+# the hands of a build flag instead of the user, and is how a beta once shipped with
+# its tracer silently off. Logging is now identical in every build: compiled in,
+# switched off, one config line away. build-release.sh still reads the -beta suffix
+# itself to decide which diagnostic TOOLS to ship -- that is a separate question.
 # SOCKBUF_DEBUG enables the sbcheck() socket-buffer consistency validator, now called
 # from sbappend() -- it walks the whole buffer (O(n)) on every append, which would undo
 # the O(1) sb_mbtail append in a shipped build. So it is OFF by default (production) and
 # turned on only for validation runs:  NG_SOCKBUF_DEBUG=1 bash docker/run-bench.sh ...
 NG_SOCKBUF_DEBUG="${NG_SOCKBUF_DEBUG:-0}"
 [ "$NG_SOCKBUF_DEBUG" = 1 ] && NG_DEF="$NG_DEF -DSOCKBUF_DEBUG"
+# The API failure tracer (api/amiga_libcallentry.h) -- every library vector that
+# returns an error logs its own name and that errno -- has NO build flag. It is
+# compiled into every build, always, and LOGLEVEL= alone decides whether it says
+# anything. This used to be NG_APITRACE=0/1 and that was a mistake worth recording:
+#   - It costs 2,184 bytes of code and NO measurable speed. The tracer sits only on
+#     the 25 API_STD_RETURN sites, i.e. the ERROR return of a vector, never on the
+#     data path; when LOGLEVEL excludes LOG_DEBUG the log() macro (sys/systm.h)
+#     stops at two compares without evaluating its arguments.
+#   - A build flag is the wrong place for it. Its entire purpose is diagnosing a
+#     machine the author cannot reach, and a diagnostic that has to be specially
+#     built and hand-delivered cannot do that. It once shipped switched OFF in a
+#     pre-release that was described as ready for exactly that job.
+# Now: any build, any machine, set LOGGING=ON and LOGLEVEL=7 in AmiTCP.config.
+# Contrast NG_SOCKBUF_DEBUG above, which IS correctly a build flag -- it puts an
+# O(n) buffer walk on every append and would undo the O(1) send path.
 # NG_CKSUM_ASM=1 (default) builds the hand-tuned 68k assembly checksum (in_cksum_asm.S)
 # and compiles the C in_cksum() out; =0 falls back to the portable C version. This ONE
 # switch must gate BOTH the -D (which empties in_cksum.c) AND the .S assembly step in

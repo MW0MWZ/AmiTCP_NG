@@ -225,11 +225,80 @@ static struct log_msg *log_poll(void);
 static void log_task(void);
 static void log_close(struct log_msg *msg);
 static BPTR logOpen(STRPTR name);
+static void log_validate_dest(void);	/* PORT (AmiTCP_NG), NETTRACE only */
 
 static struct log_msg *log_messages = NULL;
 static char *log_buffers = NULL;
 static LONG log_messages_mem_size, log_buffers_mem_size;
 static int GetLogMsgFail;
+
+/*
+ * PORT (AmiTCP_NG): the two logging controls. Both are plain LONGs rather than
+ * compile-time constants because both are settable at runtime -- from
+ * AmiTCP.config at bring-up (LOGGING=, LOGLEVEL=) and over ARexx thereafter.
+ *
+ * log_enabled is the master switch (LOGGING=ON|OFF), and it is OFF by default in
+ * every build. It is separate from the level on purpose: turning logging off and
+ * back on must not lose the verbosity you had chosen, and "off" must not be
+ * expressible as a priority number that also means something else (0 is
+ * LOG_EMERG, what panic() logs at).
+ *
+ * ON by default -- but see log_console_enabled below, which is what makes that
+ * acceptable. The two used to be one switch, and the console is the intrusive
+ * half: it opens a window that puts itself in front of whatever the user is
+ * doing. Tying the log FILE to that meant the only way to stop the window was to
+ * stop recording anything, so a machine that hit a panic had nothing to show for
+ * it. Split, the sensible default falls out on its own -- a quiet file that is
+ * there when something breaks, and no window unless asked.
+ *
+ * log_level is the highest (least important) priority recorded. Read on the hot
+ * path by the log() macro in sys/systm.h -- keep both cheap to load.
+ */
+LONG log_enabled = 1;
+
+/*
+ * PORT (AmiTCP_NG): LOGCONSOLE=ON|OFF, the console half of logging, OFF by
+ * default. Purely about the extra copy that goes to a CON: window; it does not
+ * gate the log file, and it does not gate whether messages are formatted -- a
+ * message is written to the file either way.
+ *
+ * The window is opened LAZILY, on the first message that is actually destined
+ * for it (log_poll()), so leaving this off costs no window, no CON: handler and
+ * no DOS Open() at all.
+ */
+LONG log_console_enabled = 0;
+LONG log_level = NG_LOG_LEVEL_DEFAULT;
+
+/*
+ * PORT (AmiTCP_NG): result of the bring-up validation of the log destination.
+ * log_open_error holds the IoErr() from the LAST failed Open(); it is reported in
+ * the banner when a fallback had to be used, and is the only trace left if every
+ * candidate failed (in which case there is, by definition, nowhere to log it).
+ */
+static LONG log_open_error = 0;
+
+/*
+ * PORT (AmiTCP_NG): the destination ACTUALLY in use, which is not always the one
+ * that was configured -- log_validate_dest() falls back when the configured name
+ * cannot be opened.
+ *
+ * It is deliberately a separate variable rather than just reassigning logfilename.
+ * logfilename is owned by the configuration layer: setvalue() (kern/amiga_config.c)
+ * bsd_malloc()s each value it stores and sets VF_FREE, meaning "bsd_free() the old
+ * value before replacing it". Pointing logfilename at one of the fallback string
+ * LITERALS would leave VF_FREE set on a pointer Exec never allocated, and the next
+ * LOGFILENAME= would call FreeVec() on it -- which reads a size header from below a
+ * literal and links the result into the free-memory list. With no MMU that is silent
+ * corruption of the allocator itself, surfacing later as an unrelated crash.
+ *
+ * Leaving logfilename alone also keeps the retry-the-configured-name-first behaviour
+ * when logging is reopened at runtime, which is what the user asked for.
+ */
+STRPTR log_dest_name = NULL;
+
+/* Same ownership rule for the console: the name actually in use, never the
+ * config-owned consolename. NULL means "not chosen yet -- take consolename". */
+static STRPTR con_dest_name = NULL;
 
 
 UBYTE consoledefname[] = _PATH_CON;
@@ -413,6 +482,27 @@ log_task(void)
   if ((logUtilityBase = OpenLibrary((STRPTR)"utility.library", 37L)) == NULL)
     goto fail;
 
+  /*
+   * PORT (AmiTCP_NG): open and validate the log destination NOW, at bring-up,
+   * rather than lazily on the first message.
+   *
+   * Upstream opened the file inside log_poll() on demand, and every failure path
+   * there reports itself by calling log() -- i.e. through the very queue whose
+   * destination has just been proven unusable. The result was a stack that logs
+   * absolutely nothing, with no way to tell "nothing was logged" apart from
+   * "logging is broken", which is exactly the state this fork was found in.
+   *
+   * Doing it here means the destination is known-good (or known-bad, with an
+   * IoErr) before a single message is queued, and the banner it writes is proof
+   * on disk that the whole chain works. This runs before the rendezvous below, so
+   * log_init() cannot return to a caller that then logs into a black hole.
+   *
+   * A failure here is deliberately NOT fatal: no log file is a degraded stack,
+   * not a broken one, and refusing to network because T: is missing would be a
+   * far worse failure than being quiet.
+   */
+  log_validate_dest();
+
   /* Allocate message to reply startup */
   if ((initmsg = AllocMem(sizeof(struct log_msg), MEMF_CLEAR|MEMF_PUBLIC))
       == NULL)
@@ -444,6 +534,30 @@ log_task(void)
   initmsg = NULL;
 
   sigmask = logmask | rexxmask | SIGBREAKF_CTRL_F;
+
+  /*
+   * PORT (AmiTCP_NG) fix -- LOST WAKEUP. Re-arm the log signal before the service
+   * loop, because the rendezvous above almost certainly consumed it.
+   *
+   * Exec signals are a LEVEL, not a count: one Wait() clears the bit however many
+   * PutMsg()s set it. The `do { Wait(logmask); } while (initmsg != GetMsg(logPort))`
+   * above waits for our own init message to come back -- but any log() call made by
+   * the parent in that window (log_init() ends with one, and it runs before this
+   * process is scheduled again) queues a SECOND message on logPort and sets the
+   * same bit. The Wait() clears it, GetMsg() returns initmsg first (FIFO), the loop
+   * exits satisfied -- and the other message is left sitting on the port with its
+   * wakeup already spent. We then Wait() forever on a signal nobody will send again.
+   *
+   * That message is not lost so much as postponed indefinitely: the NEXT log() to
+   * arrive re-signals and drains it. On a stack that logs only on error, "the next
+   * one" may never come, which is why this looked like logging being dead rather
+   * than one message being late.
+   *
+   * SetSignal() re-asserts the bit so the first Wait() returns immediately and the
+   * normal log_poll() path drains whatever is queued -- including the LOG_CLOSE
+   * case, which is why this is a re-arm and not an inline log_poll() call here.
+   */
+  SetSignal(logmask, logmask);
   
   /* 
    * Main loop of the NETTRACE
@@ -508,7 +622,114 @@ log_task(void)
 static BPTR confile = NULL;
 static BPTR logfile = NULL;
 static BOOL fileopenfail = FALSE, conopenfail = FALSE;
+/*
+ * PORT (AmiTCP_NG): filewritefail is now a latch with nothing behind it. It used
+ * to gate a log() call complaining that the log file could not be written -- a
+ * message that had to be written to the log file to be seen. Removing that left
+ * the flag inert: still set, still reset by logname_changed(), read by nothing.
+ * It is kept rather than deleted only because dropping it would leave log_poll()'s
+ * `error` result unused and fail -Werror; there is no safe channel to report a
+ * failure to write the log to, so that failure is deliberately silent.
+ */
 static BOOL filewritefail = FALSE, conwritefail = FALSE;
+
+/*
+ * PORT (AmiTCP_NG): validate the log destination at NETTRACE bring-up.
+ *
+ * Tries the configured name (LOGFILENAME=, default _PATH_LOG) and then each
+ * _PATH_LOG_FALLBACKS candidate in turn, keeping the first that opens. Writes a
+ * banner naming the file it settled on, the build, and the active log level --
+ * so an empty log and a broken log are never the same observation, and a bug
+ * report can say which of the two it is.
+ *
+ * NETTRACE ONLY: uses logDOSBase (see the #define above), which the caller has
+ * just opened.
+ */
+static void log_validate_dest(void)
+{
+  static char *fallbacks[] = { _PATH_LOG_FALLBACKS };
+  UBYTE banner[128];
+  struct CSource cs;
+  int i;
+
+  /*
+   * The configured name first. logfilename is whatever readconfig() left it as --
+   * the config file is parsed before log_init() in both the program and the
+   * library bring-up paths, so an explicit LOGFILENAME= is already in effect here.
+   */
+  /*
+   * LOGGING=OFF: open nothing. Deliberately WITHOUT setting fileopenfail -- that
+   * flag means "this destination is known bad, stop trying", which is not the
+   * case here. Leaving it clear is what lets log_poll() open the file for real if
+   * logging is switched back on at runtime.
+   */
+  if (!log_enabled)
+    return;
+
+  log_open_error = 0;
+  log_dest_name = logfilename;
+  if ((logfile = logOpen(logfilename)) == NULL) {
+    log_open_error = IoErr();
+
+    for (i = 0; i < (int)(sizeof fallbacks / sizeof fallbacks[0]); i++) {
+      if ((logfile = logOpen((STRPTR)fallbacks[i])) != NULL) {
+	log_dest_name = (STRPTR)fallbacks[i];
+	break;
+      }
+      log_open_error = IoErr();
+    }
+  }
+
+  if (logfile == NULL) {
+    /*
+     * Nowhere to log. Latch the "already complained" flags so log_poll() does not
+     * retry the whole candidate list -- and, more importantly, does not call log()
+     * about it from inside the routine that drains the log queue.
+     */
+    fileopenfail = TRUE;
+    return;
+  }
+
+  cs.CS_Buffer = banner;
+  cs.CS_Length = sizeof banner;
+  cs.CS_CurChr = 0;
+
+  csprintf(&cs, "--- AmiTCP_NG %s log opened (level %ld",
+	   AMITCP_NG_VER, log_level);
+  if (log_open_error)
+    csprintf(&cs, ", fell back to '%s' after DOS error %ld",
+	     log_dest_name, log_open_error);
+  csprintf(&cs, ") ---\n");
+
+  FWrite(logfile, banner, cs.CS_CurChr, 1);
+  Flush(logfile);
+}
+
+/*
+ * PORT (AmiTCP_NG): report a console problem to the LOG FILE, not through log().
+ *
+ * log_poll() is the routine that drains the log queue; calling log() from inside
+ * it to complain about a destination is circular, and it was the "only once"
+ * latches on those calls that made the original total failure invisible. The log
+ * file is known-good here -- log_validate_dest() proved it at bring-up.
+ *
+ * NETTRACE only (uses logDOSBase). Callers must gate this on the relevant
+ * one-shot latch: a console that never becomes available (headless machine, no
+ * public screen, self-start before Workbench) would otherwise get one line per
+ * message appended forever, which on a 512K machine logging to RAM: is unbounded
+ * growth from the diagnostics themselves.
+ */
+static void log_console_problem(char *what, STRPTR name)
+{
+  if (logfile == NULL)
+    return;
+  FPuts(logfile, (STRPTR)"log: ");
+  FPuts(logfile, (STRPTR)what);
+  FPuts(logfile, (STRPTR)" '");
+  FPuts(logfile, name);
+  FPuts(logfile, (STRPTR)"' -- logging to file only\n");
+  Flush(logfile);
+}
 
 static char *months =
   "Jan\0Feb\0Mar\0Apr\0May\0Jun\0Jul\0Aug\0Sep\0Oct\0Nov\0Dec";
@@ -547,9 +768,19 @@ struct log_msg *log_poll()
   while (msg = (struct log_msg *)GetMsg(logPort)) { 
     struct CSource cs;
 
-    /* All except LOG_EMERG to both log and console */
+    /*
+     * The file always; the console only if the user asked for one.
+     *
+     * PORT (AmiTCP_NG): LOGCONSOLE= (log_console_enabled) is the new half of
+     * this decision. Everything still reaches the FILE -- that is what a log is
+     * for, and it is what makes it safe to leave logging on by default.
+     *
+     * The LOG_EMERG exclusion is upstream's and is kept: panic() writes its own
+     * message to the console directly and also puts up a requester, so echoing
+     * it here would say the same thing twice.
+     */
     where = TOLOG;
-    if (msg->level != LOG_EMERG)
+    if (log_console_enabled && msg->level != LOG_EMERG)
       where |= TOCONS;
 
     if (msg->level == LOG_CLOSE) {
@@ -592,67 +823,122 @@ struct log_msg *log_poll()
 	(msg->string)[i] = ' ';
     }
 
-    if (where & TOCONS) {
-      /* If console is not open, open it */
-      while (confile == NULL) {
-	if ((confile = logOpen(consolename)) == NULL) {
-	  if (!conopenfail) /* log only once */
-	    log(LOG_ERR,"Opening console log '%s' failed", consolename);
-	  if (consolename == consoledefname) {
-	    conopenfail = TRUE;	    
-	    break;
-	  }
-	  /* try again with the default name */
-	  consolename = consoledefname;
-	  conopenfail = conwritefail = FALSE;
-	}
-      }
-      if (confile != NULL) {
-	int error = 
-	  FPuts(confile, buffer) == -1 ||
-	    FWrite(confile, msg->string, msg->chars, 1) != 1 ||
-	      FPutC(confile, '\n') == -1;
-	Flush(confile);
-	if (error && !conwritefail) {	/* To avoid loops */
-	  conwritefail = TRUE;
-	  log(LOG_ERR, "log: Write failed to console '%s'", consolename);
-	}
-      }
-    }
+    /*
+     * PORT (AmiTCP_NG): SBTC_LOG_HOOK. An installed hook REPLACES the file and
+     * console -- the API describes it as calling the hook "rather than sending
+     * log messages to the process which records and displays them".
+     *
+     * Delivered here, on the log task, rather than from vlog() where the API
+     * documents it: vlog() is called from inside splnet() regions, and splnet()
+     * here disables task switching, so calling application code from there could
+     * stop the whole machine. See ng_log_hook_deliver() (kern/subr_prf.c) for the
+     * full reasoning. The message still passes through the same queue in the same
+     * order, so nothing an application can observe changes except the context.
+     *
+     * ReplyMsg() below still returns the buffer to the pool on this path, exactly
+     * as for a message that was written to the file.
+     *
+     * Jumps to the COMMON exit rather than `continue`ing: the lost-message
+     * accounting lives after ReplyMsg(), and skipping it would mean that with a
+     * hook permanently installed the "N log messages lost" warning could never
+     * be raised at all.
+     */
+    if (ng_log_hook_deliver(msg))
+      goto log_replied;
+
+    /*
+     * PORT (AmiTCP_NG): the FILE is written first, and the console second.
+     *
+     * Upstream did the console first. That put the one destination which is
+     * guaranteed to survive a reboot -- and which is what anyone asking for a bug
+     * report actually wants -- behind an Open("CON:...") that has to negotiate
+     * with intuition and a public screen. Any way that stalls or is slow takes the
+     * log file down with it, for a message that had already been formatted and
+     * was one FWrite() from being safely on disk.
+     *
+     * Neither block reports its own failure through log() any more. Doing so fed
+     * a message back into the queue that log_poll() is in the middle of draining,
+     * to complain about the destination that message would have to be written to
+     * -- circular by construction, and silent by design once the "only once"
+     * latches were set. A file failure is now recorded by log_validate_dest() at
+     * bring-up instead; a console failure is reported to the log file, which is
+     * known-good by the time we get here.
+     */
     if (where & TOLOG) {
-      /* If log file is not open, open it */
-      while (logfile == NULL) {
-	if ((logfile = logOpen(logfilename)) == NULL) {
-	  if (!fileopenfail) /* log only once */
-	    log(LOG_ERR,"Opening log file '%s' failed", logfilename);
-	  if (logfilename == logfiledefname) {
-	    fileopenfail = TRUE;	    
-	    break;
-	  }
-	  /* try again with the default name */
-	  logfilename = logfiledefname;
-	  fileopenfail = filewritefail = FALSE;
-	}
-      }
+      /*
+       * Normally already open (log_validate_dest() did it at bring-up). This
+       * re-opens after a LOGFILENAME= change at runtime, which logname_changed()
+       * signals by closing the file and clearing fileopenfail.
+       */
+      if (logfile == NULL && !fileopenfail)
+	log_validate_dest();
+
       if (logfile != NULL) {
-	int error = 
+	int error =
 	  FPuts(logfile, buffer) == -1 ||
 	    FWrite(logfile, msg->string, msg->chars, 1) != 1 ||
 	      FPutC(logfile, '\n') == -1;
 	Flush(logfile);
 	if (error && !filewritefail) {	/* To avoid loops */
 	  filewritefail = TRUE;
-	  log(LOG_ERR, "log: Write failed to file '%s'", logfilename);
+	}
+      }
+    }
+    if (where & TOCONS) {
+      /* If console is not open, open it */
+      if (con_dest_name == NULL)
+	con_dest_name = consolename;		/* start from what is configured */
+      while (confile == NULL) {
+	if ((confile = logOpen(con_dest_name)) == NULL) {
+	  /* Once per NAME: a custom CONSOLENAME= failing and the default failing
+	   * are two different things to know about. conopenfail is reset below
+	   * when we fall back, so each gets one line and no more. */
+	  if (!conopenfail)
+	    log_console_problem("cannot open console", con_dest_name);
+	  if (con_dest_name == consoledefname) {
+	    conopenfail = TRUE;
+	    break;
+	  }
+	  /* Fall back to the default name -- in our OWN variable. Assigning to
+	   * consolename here (as this did) would point a config-layer pointer at a
+	   * static array while its VF_FREE flag still said "bsd_free() me", and the
+	   * next CONSOLENAME= would FreeVec() memory Exec never allocated. See the
+	   * note on log_dest_name. */
+	  con_dest_name = consoledefname;
+	  conopenfail = conwritefail = FALSE;
+	}
+      }
+      if (confile != NULL) {
+	int error =
+	  FPuts(confile, buffer) == -1 ||
+	    FWrite(confile, msg->string, msg->chars, 1) != 1 ||
+	      FPutC(confile, '\n') == -1;
+	Flush(confile);
+	if (error && !conwritefail) {	/* To avoid loops */
+	  conwritefail = TRUE;
+	  log_console_problem("write failed to console", con_dest_name);
 	}
       }
     }
 
+  log_replied:
     ReplyMsg((struct Message *)msg);
     if (GetLogMsgFail != TotalFail) {
       int t = GetLogMsgFail;	/* Check if we have lost messages */
 
+      /*
+       * PORT (AmiTCP_NG) fix: the running total reported was TotalFail, the count
+       * from BEFORE this batch -- so it always lagged by exactly the number just
+       * lost, and read 0 the first time messages were dropped. It is t.
+       *
+       * The message is queued (not written directly) on purpose: the pool has just
+       * been shown to be under pressure, and ReplyMsg() above has freed a slot, so
+       * this is the one place in log_poll() where re-entering the queue is both
+       * safe and correct -- it self-limits, since it only fires when the count
+       * moves.
+       */
       log(LOG_WARNING,"%ld log messages lost (total %ld lost)\n",
-	  t - TotalFail, TotalFail);
+	  t - TotalFail, t);
       TotalFail = t;
     }
   }
@@ -730,6 +1016,21 @@ BPTR logOpen(STRPTR name)
  * DosBase used by these functions is the one of the NETTRACE, and is
  * not initialized at that time!
  */
+/*
+ * PORT (AmiTCP_NG): validate LOGLEVEL= before it is applied.
+ *
+ * vlog() filters with `priority > log_level`, which quietly assumes log_level is
+ * in range. A negative one -- `LOGLEVEL=-1`, an easy typo -- would filter out
+ * EVERYTHING including LOG_EMERG, and panic() logs at LOG_EMERG: the one message
+ * you most need would be the one silenced. Returning FALSE makes setvalue()
+ * reject the assignment with ERR_VALUE and leave the old level in force, rather
+ * than accepting a value that disables the log.
+ */
+int loglevel_changed(void *p, LONG new)
+{
+  return (new >= LOG_EMERG && new <= LOG_DEBUG);
+}
+
 int logname_changed(void *p, LONG new)
 {
   if (p == &logfilename) {	/* Is logname requested? */
@@ -754,6 +1055,7 @@ int logname_changed(void *p, LONG new)
       Close(confile);
       confile = NULL;
     }
+    con_dest_name = NULL;	/* re-read consolename on the next message */
     conopenfail = conwritefail = FALSE;
     /*
      * setvalue() (who called this) will set the new value when we return 

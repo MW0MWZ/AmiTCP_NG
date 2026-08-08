@@ -96,6 +96,17 @@ struct NetDataBase {
   struct MinList         ndb_NameServers;
   struct MinList         ndb_Domains;
   LONG			 ndb_AccessCount; /* tmp var, but reduces code size */
+  /*
+   * PORT (AmiTCP_NG) security fix: how many items ndb_AccessTable can ACTUALLY
+   * hold. addaccessent() used to bound-check against the compile-time constant
+   * TMPACTSIZE/sizeof(struct AccessItem), which is only true while the table is
+   * still the big scratch buffer alloc_netdb() made. setup_accesscontroltable()
+   * then shrink-wraps it to exactly ndb_AccessCount items -- no spare capacity,
+   * for ANY count -- so every later add (the ARexx "ADD ACCESS" command, which
+   * writes straight into the live table) wrote past the end of the allocation
+   * with caller-supplied bytes. This field is the real bound.
+   */
+  LONG			 ndb_AccessMax;
   struct AccessItem *	 ndb_AccessTable;
   ULONG			 ndb_Generation; /* bumped by reset_netdb(); stale-cursor guard */
 };

@@ -243,11 +243,29 @@ rtalloc1(dst, report)
 	    ((rn->rn_flags & RNF_ROOT) == 0)) {
 		newrt = rt = (struct rtentry *)rn;
 		if (report && (rt->rt_flags & RTF_CLONING)) {
-			if ((err = rtrequest(RTM_RESOLVE, dst, SA(0),
-					      SA(0), 0, &newrt)) ||
-			    ((rt->rt_flags & RTF_XRESOLVE)
-			      && (msgtype = RTM_RESOLVE))) /* intended! */
-			    goto miss;
+			/*
+			 * PORT (AmiTCP_NG) fix: restore the stock 4.4BSD structure here.
+			 * The compressed compound test this replaces fell through to
+			 * `return (newrt)` on a FAILED clone with newrt still pointing at
+			 * the cloning PARENT and no reference taken on it -- while every
+			 * caller balances the pointer it gets back with rtfree()/RTFREE().
+			 * That unearned decrement drives rt_refcnt below the true holder
+			 * count, so the route can be freed while still referenced: a
+			 * dangling ro_rt, i.e. use-after-free on the next packet.
+			 * Take the reference explicitly on the error path. The XRESOLVE
+			 * path needs no fixup -- its clone was created and referenced by
+			 * the successful rtrequest() call.
+			 */
+			err = rtrequest(RTM_RESOLVE, dst, SA(0), SA(0), 0, &newrt);
+			if (err) {
+				newrt = rt;
+				rt->rt_refcnt++;
+				goto miss;
+			}
+			if ((rt = newrt) && (rt->rt_flags & RTF_XRESOLVE)) {
+				msgtype = RTM_RESOLVE;
+				goto miss;
+			}
 		} else
 			rt->rt_refcnt++;
 	} else {
@@ -411,13 +429,17 @@ rtioctl(req, data)
 	 * disclosure) and oversizing the route allocation. suser() is compiled out
 	 * under AMITCP, so this SIOCADDRT path is unprivileged -- clamp it.
 	 */
+	/* Reject any sa_len that isn't 0 (defaulted to 16) or exactly 16: a short
+	 * 1..15 would under-size the persistent rt_gateway allocation, which
+	 * rtredirect()'s equal() then bcmp()s 16 bytes of -- an OOB read past the
+	 * route node. The ortentry storage is a fixed 16-byte sockaddr either way. */
 	if (entry->rt_dst.sa_len == 0)
 		entry->rt_dst.sa_len = 16;
-	else if (entry->rt_dst.sa_len > sizeof(struct sockaddr))
+	else if (entry->rt_dst.sa_len != sizeof(struct sockaddr))
 		return (EINVAL);
 	if (entry->rt_gateway.sa_len == 0)
 		entry->rt_gateway.sa_len = 16;
-	else if (entry->rt_gateway.sa_len > sizeof(struct sockaddr))
+	else if (entry->rt_gateway.sa_len != sizeof(struct sockaddr))
 		return (EINVAL);
 #endif
 	if ((entry->rt_flags & RTF_HOST) == 0)

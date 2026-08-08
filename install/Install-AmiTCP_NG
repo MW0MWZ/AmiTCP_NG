@@ -3,7 +3,7 @@
 ;                         open TCP/IP stack (a drop-in bsdsocket.library).
 ;
 ;  AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
-;  $VER: Install-AmiTCP_NG 2.0
+;  $VER: Install-AmiTCP_NG 2.1
 ;
 ;  At startup you choose one of three actions:
 ;
@@ -28,7 +28,15 @@
 ;  created; it need not live on the boot disk.
 ; =============================================================================
 
+; @app-name is the Installer's own variable and it is NOT reliably ours: an install
+; reported the completion trailer as "Test App ... Work drawer" despite this line, so
+; the Installer clearly keeps its own notion of the app name somewhere we do not set.
+; Anything that must actually say AmiTCP_NG uses #app below instead -- in particular
+; the (startup) tag, which is written into S:User-Startup as ";BEGIN <name>" and is how
+; a later upgrade finds and replaces that block. Getting that name from a variable the
+; Installer might override would tag a stranger's name into the user's startup file.
 (set @app-name "AmiTCP_NG")
+(set #app      "AmiTCP_NG")
 
 (set #lib-source    "data/Libs/bsdsocket.library")
 (set #nstart-source "data/S/Network-Startup")
@@ -51,6 +59,13 @@
 
 ; Filled in by the destination question (P_AskDest); the AmiTCP drawer path.
 (set #amitcp-dir "SYS:AmiTCP")
+
+; Set by P_MergeFile: whether it added anything to an existing db/ file, and
+; whether it had to leave existing files alone because C:Search was missing.
+; Reported at the end, so an upgrade never silently changes -- or silently fails
+; to change -- the user's configuration.
+(set #db-merged  0)
+(set #db-nomerge 0)
 
 ; ---------------------------------------------------------------------------
 ;  Ask where the AmiTCP drawer should live. The stack keeps its configuration and
@@ -81,6 +96,235 @@
 		)
 	)
 	(set #amitcp-dir (tackon #dest-parent "AmiTCP"))
+	(set @default-dest #amitcp-dir)		; Installer's idea of "where it went"
+))
+
+; ---------------------------------------------------------------------------
+;  Text added to an EXISTING db/ file that predates a setting we now ship.
+;
+;  KEEP IN STEP WITH install/db/*. These are VERBATIM copies of the corresponding
+;  blocks in the shipped files -- so a user who upgrades ends up with the same text
+;  as a user who installs fresh -- duplicated here only because the Installer cannot
+;  diff two files: it can test whether a string is present and append text, nothing
+;  more. Each block is guarded by a sentinel (#mf-key) that appears in the shipped
+;  file; docker/build-release.sh checks both the sentinel AND that these blocks still
+;  match install/db/*, so they cannot silently drift apart.
+;
+;  A block is appended ONLY when its sentinel is absent, so an existing setting is
+;  never overwritten -- someone who set HOSTNAME=fred keeps it.
+; ---------------------------------------------------------------------------
+; NOTE FOR THE NEXT RELEASE THAT ADDS A SERVICE: this whole block is gated on the
+; single sentinel "ng-services-v2", which is correct only because every line in it
+; shipped together. Anyone already merged past this release HAS that sentinel, so
+; appending another line here would never reach them. Add a NEW block with its own
+; new sentinel (and its own check in docker/build-release.sh) instead.
+(set #db-newservices (cat
+	"\n# ng-services-v2 -- marks which set of service definitions this file carries.\n"
+	"S ftp-data 20/tcp\n"
+	"S time    37/udp\n"
+	"S time    37/tcp\n"
+	"S finger  79/tcp\n"
+	"S netbios-ns  137/udp\n"
+	"S netbios-dgm 138/udp\n"
+	"S netbios-ssn 139/tcp\n"
+	"S microsoft-ds 445/tcp\n"
+	"S submission 587/tcp\n"
+	"S smtps    465/tcp\n"
+	"S imaps    993/tcp\n"
+	"S pop3s    995/tcp\n"
+	"S printer 515/tcp\n"
+	"S syslog  514/udp\n"
+	"S aexplorer 356/tcp\n"
+	"S aexplorer 356/udp\n"
+	"S irc 6667/tcp\n"
+))
+
+(set #db-newhostname (cat
+	"\n"
+	"# This machine's own name -- what gethostname() reports to applications.\n"
+	"# Without it the name is an empty string, which some software handles badly:\n"
+	"# it is not an error, so a program gets \"\" back and carries on with it. Change\n"
+	"# it to whatever you like; if you already had this file, the installer leaves\n"
+	"# your setting alone.\n"
+	"HOSTNAME=amiga\n"
+))
+
+; One merge per SETTING, each keyed on its own name.
+;
+; These were one block guarded by LOGLEVEL. That works exactly once: every
+; machine running the previous release already has LOGLEVEL, so the block could
+; never be applied again and LOGCONSOLE -- added to it later -- reached new
+; installs only. Keyed individually, adding a setting and delivering it to
+; existing users are the same action. docker/build-release.sh now fails the
+; build if a setting in db/AmiTCP.config is not the key of one of these.
+(set #db-newlogging (cat
+	"\n"
+	"# --- Logging -----------------------------------------------------------------\n"
+	"# The stack keeps a quiet log of anything that goes wrong, in a file, and shows\n"
+	"# you nothing. That is the default and most people never need to change it: if\n"
+	"# something breaks there is already a record, and if nothing breaks the file is\n"
+	"# a couple of lines per boot.\n"
+	"#\n"
+	"# Every build can do this. There is no special \"debug build\" to obtain and no\n"
+	"# version that lacks it, so if you are ever asked for a log, raise the detail\n"
+	"# level below to 7, reproduce the problem, and send the file it names.\n"
+	"\n"
+	"# Master switch, default ON. OFF records nothing at all -- not even emergencies,\n"
+	"# so a panic would leave no trace -- and log calls are skipped at the point they\n"
+	"# are made, so nothing is formatted or written and next to no time is spent.\n"
+	"# The detail level below is remembered either way.\n"
+	"#LOGGING=OFF\n"
+))
+
+(set #db-newloglevel (cat
+	"\n"
+	"# How much detail. These are the standard syslog priorities, and each level\n"
+	"# includes everything more serious than it:\n"
+	"#   0 = emergencies only    3 = errors        5 = notices (the default)\n"
+	"#   1 = alerts              4 = warnings      6 = information\n"
+	"#   2 = critical                              7 = debug\n"
+	"# LOGLEVEL=7 is what to set if you have been asked for a debug log; it also turns\n"
+	"# on the API tracer, which names any library call that fails and the errno it\n"
+	"# failed with -- that is what identifies a program the stack is not satisfying.\n"
+	"# Note 0 is \"emergencies only\", NOT off -- use LOGGING=OFF above for that.\n"
+	"#LOGLEVEL=7\n"
+))
+
+(set #db-newlogconsole (cat
+	"\n"
+	"# Also throw log messages at a console window, as well as the file. Default OFF,\n"
+	"# because that window puts itself in front of whatever you are doing -- which is\n"
+	"# useful while you are watching for something and a nuisance the rest of the\n"
+	"# time. It has no effect on the log FILE, which is written either way, and while\n"
+	"# it is off no window and no console handler are opened at all.\n"
+	"# CONSOLENAME= chooses which window; the default is a plain CON: on the Workbench\n"
+	"# screen.\n"
+	"#LOGCONSOLE=ON\n"
+))
+
+(set #db-newlogfilename (cat
+	"\n"
+	"# Where it is written. The default is RAM:AmiTCP.log, which needs no assign and\n"
+	"# is always available -- but it is gone at the next reboot, so if you are chasing\n"
+	"# something that only clears with a reboot, point this at a disk instead. If the\n"
+	"# file cannot be opened the stack falls back to T:, then AmiTCP:, then SYS:, and\n"
+	"# says which one it settled on (and why) in the first line of the log.\n"
+	"#LOGFILENAME=RAM:AmiTCP.log\n"
+))
+
+
+
+; ---------------------------------------------------------------------------
+;  Add #mf-add to <amitcp-dir>/db/#mf-file, but only if #mf-key is not already in
+;  it. If the file is absent entirely, our shipped copy is installed instead.
+;
+;  Presence is tested with C:Search (0 = found, 5 = not found). Without it we
+;  cannot tell what the user already has, and appending blind could override a
+;  setting of theirs -- so in that case we change nothing and say so at the end.
+; ---------------------------------------------------------------------------
+(procedure P_MergeFile
+(
+	(set #mf-path (tackon #amitcp-dir (cat "db/" #mf-file)))
+	; RAM: rather than T: -- T: is an assign that need not exist; RAM: always does.
+	(set #mf-tmp  "RAM:AmiTCP_NG-merge.tmp")
+
+	(if (= (exists #mf-path (noreq)) 0)
+		; Not present at all -- install ours whole.
+		(copyfiles
+			(prompt "Installing " #mf-file " into " #amitcp-dir "/db")
+			(help @copyfiles-help)
+			(source (tackon #db-source #mf-file))
+			(dest (tackon #amitcp-dir "db"))
+		)
+		; Present -- append only what is missing.
+		(if (= #mf-cansearch 1)
+		  (
+			; 5 is Search's "not found". 0 is found; anything else (20 = cannot
+			; open the file, or C:Search failing for its own reasons) means we
+			; do NOT know what is in there -- and appending on a maybe is how a
+			; setting gets duplicated. Treat only 5 as absent.
+			;
+			; NB these three statements MUST stay wrapped in the ( ) above: `if`
+			; takes cond/then/else and nothing more, so leaving them bare made it
+			; a five-argument if -- which broke the merge for everyone who has
+			; C:Search, i.e. the normal case.
+			(set #mf-rc (run (cat "C:Search >NIL: \"" #mf-path "\" SEARCH \"" #mf-key "\" QUIET")))
+			(if (<> #mf-rc 0)
+			  (if (<> #mf-rc 5) (set #db-nomerge 1)))
+			(if (= #mf-rc 5)
+				(
+					; Clear any temp left by an interrupted earlier run, so that
+					; its existence after (textfile) below is proof THIS write
+					; happened. #mf-tmp is one name reused by all three merges,
+					; so a leftover from another file's merge would otherwise be
+					; mistaken for ours and spliced into the wrong db file.
+					(if (>= (exists #mf-tmp (noreq)) 1)
+						(delete #mf-tmp (optional "force")))
+
+					; Proceed ONLY if the temp is genuinely gone. This makes the
+					; whole merge independent of what (delete) actually did: if
+					; the file is somehow still there, we skip this merge and
+					; leave the user's file alone rather than risk copying stale
+					; content over it. Skipping is recoverable; corrupting is not.
+					(if (<> (exists #mf-tmp (noreq)) 0)
+						(set #db-nomerge 1))
+					(if (= (exists #mf-tmp (noreq)) 0)
+						(
+							(textfile
+								(dest #mf-tmp)
+								(include #mf-path)
+								(append #mf-add)
+							)
+
+							; Only overwrite the user's file once the merged copy
+							; is actually there. The original is the thing we
+							; cannot get back, so nothing touches it until the
+							; replacement exists.
+							(if (>= (exists #mf-tmp (noreq)) 1)
+								(
+									(copyfiles
+										(prompt "Adding " #mf-desc " to your existing " #mf-file)
+										(help @copyfiles-help)
+										(source #mf-tmp)
+										(dest (tackon #amitcp-dir "db"))
+										(newname #mf-file)
+									)
+									(delete #mf-tmp (optional "force"))
+									(set #db-merged 1)
+								)
+							)
+						)
+					)
+				)
+			)
+		  )
+			(set #db-nomerge 1)
+		)
+	)
+))
+
+; ---------------------------------------------------------------------------
+;  Build #db-note: what P_MergeFile did to the user's existing db/ files, for the
+;  completion message. Deliberately does NOT name which settings were added --
+;  #db-merged is one flag covering three independently-triggerable blocks, so
+;  naming them could describe something that did not happen.
+; ---------------------------------------------------------------------------
+(procedure P_DbNote
+(
+	(set #db-note "")
+	(if (= #db-merged 1)
+		(set #db-note (cat
+			"\n\nSettings added by this release were appended to the existing files in "
+			#amitcp-dir "/db. Anything you had already set was left exactly as it was."))
+	)
+	(if (= #db-nomerge 1)
+		(set #db-note (cat
+			"\n\nNOTE: the installer could not determine what your " #amitcp-dir "/db "
+			"files already contain -- 'C:Search' is missing, or it could not read them -- "
+			"so it left them alone rather than risk duplicating a setting. To pick up the "
+			"newest service definitions and settings, compare them with the files in this "
+			"archive's 'db' drawer."))
+	)
 ))
 
 ; ---------------------------------------------------------------------------
@@ -88,24 +332,66 @@
 ;  protocol database from AmiTCP:db/... ; without it an app opening a socket hits
 ;  "AmiTCP:db/netdb device not mounted". We create <amitcp-dir>/db, make the AmiTCP:
 ;  assign point there for this session, and add that assign to the boot startup so it
-;  survives a reboot. An existing database is left untouched.
+;  survives a reboot. Files already there keep any settings the user has made.
 ; ---------------------------------------------------------------------------
 (procedure P_SetupConfig
 (
+	; Can we tell what is already in a file? Everything in P_MergeFile that touches
+	; an existing file depends on this; without it we leave existing files alone.
+	(set #mf-cansearch 0)
+	(if (>= (exists "C:Search" (noreq)) 1) (set #mf-cansearch 1))
+
 	(makedir (tackon #amitcp-dir "db")
 		(prompt "Creating " #amitcp-dir "/db for the network database")
 		(help @makedir-help)
 		(infos)
 	)
-	(if (= (exists (tackon #amitcp-dir "db/netdb") (noreq)) 0)
-		(copyfiles
-			(prompt "Installing the network database into " #amitcp-dir "/db")
-			(help @copyfiles-help)
-			(source #db-source)
-			(dest (tackon #amitcp-dir "db"))
-			(all)
-		)
-	)
+
+	; Each db/ file is handled on its own: copied whole when it is not there, and
+	; otherwise brought up to date a setting at a time (P_MergeFile). This used to
+	; be one all-or-nothing test on db/netdb, which meant ANY previous install --
+	; however old -- kept its entire db/ untouched forever. New service definitions
+	; and new configuration settings shipped in later releases therefore never
+	; reached anyone who already had the stack, only new users.
+	;
+	; Arguments go through #mf-* globals because Installer procedures take no
+	; arguments at all -- they are parameterless named blocks that communicate
+	; only through globals.
+	(set #mf-file "netdb")
+	(set #mf-key  "ng-services-v2")
+	(set #mf-add  #db-newservices)
+	(set #mf-desc "service definitions (SMB, mail over TLS, Amiga Explorer and more)")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "HOSTNAME")
+	(set #mf-add  #db-newhostname)
+	(set #mf-desc "a default host name")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "LOGGING")
+	(set #mf-add  #db-newlogging)
+	(set #mf-desc "the logging master switch")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "LOGLEVEL")
+	(set #mf-add  #db-newloglevel)
+	(set #mf-desc "the logging detail level")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "LOGCONSOLE")
+	(set #mf-add  #db-newlogconsole)
+	(set #mf-desc "the log console switch")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "LOGFILENAME")
+	(set #mf-add  #db-newlogfilename)
+	(set #mf-desc "the log file location")
+	(P_MergeFile)
 
 	; Make AmiTCP: resolve now (before a reboot) so anything run this session finds
 	; the database. (The library also self-assigns AmiTCP: -> SYS:AmiTCP as a fallback
@@ -120,11 +406,11 @@
 ;  started -- firing AddNetInterface at boot hits a not-yet-ready device and fails.
 ;  Bring the interface up yourself once the link is ready (Execute S:Network-Startup,
 ;  or straight from your WiFi-connect script). The loopback interface (lo0) comes up on
-;  its own when the stack first starts. Replaces the tagged @app-name block in place.
+;  its own when the stack first starts. Replaces the tagged #app block in place.
 ; ---------------------------------------------------------------------------
 (procedure P_InstallStartup
 (
-	(startup @app-name
+	(startup #app
 		(prompt "These lines will be added to 'S:User-Startup':\n\n"
 			"  Assign AmiTCP: " #amitcp-dir "\n"
 			"  (and a background touch that brings the loopback interface lo0 up)\n\n"
@@ -238,14 +524,16 @@
 
 	(complete 100)
 
+	(P_DbNote)
 	(message (cat
 		"AmiTCP_NG has replaced your existing bsdsocket.library and network commands.\n"
 		#backup-note
 		"\nYour interface configuration (DEVS:NetInterfaces) is untouched and now drives "
 		"AmiTCP_NG -- with no time limit. Your previous network commands were backed up "
 		"as 'C:<name>.orig' and are restored if you Uninstall.\n\n"
-		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir "\n\n"
-		"Please reboot your Amiga to start using AmiTCP_NG."
+		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir
+		#db-note
+		"\n\nPlease reboot your Amiga to start using AmiTCP_NG."
 	))
 ))
 
@@ -350,9 +638,14 @@
 
 	(complete 100)
 
+	; A full install can still land on an existing db/ drawer: Uninstall deliberately
+	; leaves the AmiTCP drawer behind, so a later "clean" install can find files there.
+	(P_DbNote)
 	(message (cat
 		"AmiTCP_NG is installed, with its full set of network commands.\n\n"
-		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir "\n\n"
+		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir
+		#db-note
+		"\n\n"
 		"The network is NOT brought up automatically at boot -- for WiFi the link "
 		"must associate first, so bringing interfaces up at boot is left to you.\n\n"
 		"To configure an interface:\n\n"
@@ -399,11 +692,13 @@
 	(P_InstallStartup)
 	(P_WriteMarker)
 
+	(P_DbNote)
 	(message (cat
 		"Your existing AmiTCP_NG installation has been updated to version " #ng-version ".\n\n"
-		"The library and network commands were replaced; your configuration (the 'AmiTCP' "
-		"drawer and DEVS:NetInterfaces) is untouched.\n\n"
-		"Please reboot your Amiga to start using the updated AmiTCP_NG."
+		"The library and network commands were replaced; your interface configuration "
+		"(DEVS:NetInterfaces) is untouched."
+		#db-note
+		"\n\nPlease reboot your Amiga to start using the updated AmiTCP_NG."
 	))
 ))
 
@@ -478,7 +773,7 @@
 	; Drop the AmiTCP: assign (this session) and neutralise the S:User-Startup hook by
 	; replacing our tagged block with a harmless comment.
 	(makeassign "AmiTCP" (safe))
-	(startup @app-name
+	(startup #app
 		(prompt "Removing the AmiTCP_NG lines from S:User-Startup")
 		(help @startup-help)
 		(command "; AmiTCP_NG has been uninstalled")
@@ -502,7 +797,9 @@
 			"An AmiTCP_NG UPDATE would be performed (an existing AmiTCP_NG install was found):\n\n"
 			"  * Replace 'LIBS:bsdsocket.library' with this version (" #ng-version ").\n"
 			"  * Replace the AmiTCP_NG network commands in C:.\n"
-			"  * Leave your 'AmiTCP' drawer and DEVS:NetInterfaces configuration untouched.\n"
+			"  * Leave DEVS:NetInterfaces untouched, and leave every setting already in\n"
+		"    your 'AmiTCP' drawer as it is -- adding only settings this release\n"
+		"    introduced that are missing from db/AmiTCP.config and db/netdb.\n"
 			"  * Make no new backups; any original pre-AmiTCP_NG stack backup is preserved\n"
 			"    for Uninstall."
 		))
@@ -596,4 +893,10 @@
 	)
 )
 
-(exit)
+;  Every path above ends with its own (message ...) saying exactly what happened and
+;  where things went. (exit) on its own would then ALSO print the Installer's built-in
+;  completion trailer -- "<app> can be found in your <dest> drawer" -- built from
+;  @app-name and @default-dest. We never set @default-dest, so that line came out as
+;  the Installer's placeholders ("Test App ... Work drawer"): wrong app, wrong place,
+;  after we had just told the user the truth. (quiet) suppresses it.
+(exit (quiet))

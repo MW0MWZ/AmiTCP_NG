@@ -146,6 +146,47 @@ in_pcballoc(so, head)
 	return (0);
 }
 	
+/*
+ * Random step for ephemeral port allocation (RFC 6056).
+ *
+ * xorshift32, seeded once on first use from ng_gather_entropy() -- the same
+ * best-effort boot seed that keys the RFC 6528 ISN hash. It is not a
+ * cryptographic generator and the entropy available on this machine is limited
+ * (no hardware RNG, often no real clock), so the guarantee is "not predictable
+ * by counting", not "unguessable". That is still the difference between an
+ * attacker knowing the next port and having to search 16384 of them.
+ *
+ * Lazy seeding is safe: in_pcbbind is only reachable from a socket call, which
+ * cannot happen before the stack has initialised, and ng_gather_entropy touches
+ * only GetSysTime/FindTask/AvailMem, all live by then.
+ */
+#define NG_PORT_SPAN		(65535 - IPPORT_ANONMIN + 1)	/* 16384, a power of 2 */
+#define NG_PORT_RANDTRIES	32	/* random probes before falling back */
+#define NG_PORT_SCANTRIES	1024	/* bounded linear scan; see the call site */
+
+static u_long ng_port_rand;		/* 0 = not yet seeded */
+
+static u_long
+ng_port_delta()
+{
+	extern void ng_gather_entropy(u_char *buf, int len);
+	u_long d;
+
+	if (ng_port_rand == 0) {
+		ng_gather_entropy((u_char *)&ng_port_rand, sizeof(ng_port_rand));
+		if (ng_port_rand == 0)		/* xorshift is dead at zero */
+			ng_port_rand = 0x9E3779B9UL;
+	}
+	ng_port_rand ^= ng_port_rand << 13;
+	ng_port_rand ^= ng_port_rand >> 17;
+	ng_port_rand ^= ng_port_rand << 5;
+
+	/* Mask, not modulo: NG_PORT_SPAN is a power of two, so this is unbiased.
+	 * A zero step would re-test the port we are already on, so make it 1. */
+	d = ng_port_rand & (NG_PORT_SPAN - 1);
+	return (d == 0) ? 1 : d;
+}
+
 int
 in_pcbbind(inp, nam)
 	register struct inpcb *inp;
@@ -227,40 +268,107 @@ in_pcbbind(inp, nam)
 	}
 	inp->inp_laddr = sin->sin_addr;
 noname:
-	if (lport == 0)
-		do {
-			/*
-			 * Roll the shared auto-allocation cursor through the IANA
-			 * dynamic range [IPPORT_ANONMIN, 65535]. A u_short wrap past
-			 * 65535 lands below IPPORT_ANONMIN and is snapped back up, so
-			 * no explicit upper bound is needed (65535 is the ceiling).
-			 */
+	if (lport == 0) {
+		int tries;
+
+		/*
+		 * RFC 6056 algorithm 3 (random increment). The cursor used to
+		 * advance by exactly 1, which made the next ephemeral port
+		 * trivially predictable -- the property Kaminsky-style DNS cache
+		 * poisoning turns on, and the one several of this project's own
+		 * tools were leaning on for their anti-spoofing.
+		 *
+		 * The step is now a random offset across the whole range, so the
+		 * next port is effectively uniform over every port but the
+		 * current one. The cursor stays PER HEAD (tcb and udb have their
+		 * own), so TCP and UDP keep independent sequences rather than
+		 * drawing consecutive values from one shared stream.
+		 */
+		for (tries = 0; tries < NG_PORT_RANDTRIES; tries++) {
+			u_long cur = head->inp_lport;
+
+			if (cur < IPPORT_ANONMIN)
+				cur = IPPORT_ANONMIN;
+			cur = IPPORT_ANONMIN +
+			      (((cur - IPPORT_ANONMIN) + ng_port_delta()) % NG_PORT_SPAN);
+			head->inp_lport = (u_short)cur;
+			lport = htons(head->inp_lport);
+			if (in_pcblookup(head, zeroin_addr, 0,
+					 inp->inp_laddr, lport, 0) == 0)
+				goto got_port;
+		}
+
+		/*
+		 * Densely populated range: fall back to a linear scan so a nearly
+		 * full table still binds. BOUNDED, unlike the original: this runs
+		 * under splnet(), which on this platform is Forbid() -- a scan of
+		 * all 16384 candidates, each an O(n) walk of the PCB list, would
+		 * freeze the WHOLE MACHINE rather than just networking, and the
+		 * unbounded original would never return at all once the range was
+		 * exhausted.
+		 */
+		for (tries = 0; tries < NG_PORT_SCANTRIES; tries++) {
 			if (++head->inp_lport < IPPORT_ANONMIN)
 				head->inp_lport = IPPORT_ANONMIN;
 			lport = htons(head->inp_lport);
-		} while (in_pcblookup(head,
-			    zeroin_addr, 0, inp->inp_laddr, lport, 0));
+			if (in_pcblookup(head, zeroin_addr, 0,
+					 inp->inp_laddr, lport, 0) == 0)
+				goto got_port;
+		}
+		return (EADDRNOTAVAIL);		/* no free ephemeral port */
+	got_port: ;
+	}
 	inp->inp_lport = lport;
 	return (0);
 }
 
 /*
  * The "primary" local interface address for source selection: the first
- * NON-loopback in_ifaddr. PORT (AmiTCP_NG): our self-start addresses lo0
- * (127.0.0.1) before any real interface, so lo0 heads in_ifaddr -- using the
- * raw list head as "the primary interface" (as stock BSD does) would hand out
- * 127.0.0.1 as a source address. Skip loopback interfaces; fall back to the
- * head only if nothing else exists.
+ * genuinely usable non-loopback address. PORT (AmiTCP_NG): our self-start
+ * addresses lo0 (127.0.0.1) before any real interface, so lo0 heads in_ifaddr --
+ * using the raw list head as "the primary interface" (as stock BSD does) would
+ * hand out 127.0.0.1 as a source address. Require IFF_UP and a real
+ * (non-0.0.0.0) address, so a DOWN interface (e.g. one taken Offline, whose
+ * address is cleared to 0.0.0.0 but which stays linked in in_ifaddr) or an
+ * unnumbered interface is never handed back as the source.
+ *
+ * Broadcast-capable interfaces are PREFERRED but not required: one caller is
+ * picking a source for a limited broadcast (rtalloc cannot route
+ * 255.255.255.255, so it lands here), which wants a broadcast interface if one
+ * exists -- but demanding IFF_BROADCAST outright excluded point-to-point links
+ * entirely and sent a PPP/SLIP-only machine back to the lo0 head. Fall back to
+ * the head only if nothing usable exists at all.
  */
 static struct in_ifaddr *
 in_primary_ifaddr(void)
 {
 	register struct in_ifaddr *ia;
 
-	for (ia = in_ifaddr; ia; ia = ia->ia_next)
-		if ((ia->ia_ifp->if_flags & IFF_LOOPBACK) == 0)
-			return (ia);
-	return (in_ifaddr);
+	register struct in_ifaddr *fallback = (struct in_ifaddr *)0;
+
+	for (ia = in_ifaddr; ia; ia = ia->ia_next) {
+		if ((ia->ia_ifp->if_flags & IFF_UP) == 0 ||
+		    (ia->ia_ifp->if_flags & IFF_LOOPBACK) != 0 ||
+		    ia->ia_addr.sin_addr.s_addr == INADDR_ANY)
+			continue;
+		if (ia->ia_ifp->if_flags & IFF_BROADCAST)
+			return (ia);		/* preferred */
+		/*
+		 * Point-to-point (SLIP/CSLIP/PPP, or anything configured
+		 * a_point2point -- see net/sana2config.c) carries no
+		 * IFF_BROADCAST. Requiring that flag outright made a
+		 * p2p-only machine match nothing and fall through to the raw
+		 * list head, which is lo0, so 127.0.0.1 was handed out as a
+		 * source address -- the very thing this function exists to
+		 * prevent. Usable, just not broadcast-capable: keep it as a
+		 * fallback rather than preferring it over a real broadcast
+		 * interface, since one call site is choosing a source for a
+		 * limited broadcast.
+		 */
+		if (fallback == (struct in_ifaddr *)0)
+			fallback = ia;
+	}
+	return (fallback ? fallback : in_ifaddr);
 }
 
 /*
@@ -364,8 +472,25 @@ in_pcbconnect(inp, nam)
 	    0))
 		return (EADDRINUSE);
 	if (inp->inp_laddr.s_addr == INADDR_ANY) {
-		if (inp->inp_lport == 0)
-			(void)in_pcbbind(inp, (struct mbuf *)0);
+		if (inp->inp_lport == 0) {
+			/*
+			 * The result was discarded here for as long as this
+			 * function existed, and that was safe: the implicit bind
+			 * takes the auto-allocation path, which could only ever
+			 * succeed -- it looped until it found a free port.
+			 *
+			 * Bounding that loop (so an exhausted range returns
+			 * instead of spinning forever under Forbid()) made this
+			 * call able to fail, and a discarded failure would leave
+			 * inp_lport at 0 while we went on to set the foreign
+			 * address and report success: a "connected" PCB that no
+			 * reply can ever match. Propagate it.
+			 */
+			int error = in_pcbbind(inp, (struct mbuf *)0);
+
+			if (error)
+				return (error);
+		}
 		inp->inp_laddr = ifaddr->sin_addr;
 	}
 	inp->inp_faddr = sin->sin_addr;
@@ -457,7 +582,10 @@ in_pcbnotify(head, dst, fport, laddr, lport, cmd, notify)
 	int errno;
 	extern u_char inetctlerrmap[];
 
-	if ((unsigned)cmd > PRC_NCMDS || dst->sa_family != AF_INET)
+	/* PORT (AmiTCP_NG) fix: >= , not > -- inetctlerrmap[cmd] is read below and
+	 * cmd == PRC_NCMDS is one past its end. This is a protocol-agnostic entry
+	 * point, so the guard must not rely on today's callers staying in range. */
+	if ((unsigned)cmd >= PRC_NCMDS || dst->sa_family != AF_INET)
 		return;
 	faddr = ((struct sockaddr_in *)dst)->sin_addr;
 	if (faddr.s_addr == INADDR_ANY)

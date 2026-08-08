@@ -8,3 +8,12 @@
 ; The pattern ~(#?.info) matches every file EXCEPT Workbench .info icons.
 FailAt 30
 AddNetInterface DEVS:NetInterfaces/~(#?.info)
+
+; Set the clock from the network. Many Amigas have no working battery clock and
+; boot with a meaningless date, which quietly breaks file timestamps and anything
+; comparing them. Failure here must never hold up the network, so it is run
+; detached and its output goes to a log rather than the boot screen.
+;
+; Comment this out if you keep time some other way, or change the server -- a
+; local router usually answers NTP and is faster than pool.ntp.org.
+Run >NIL: C:sntp pool.ntp.org >RAM:sntp.log

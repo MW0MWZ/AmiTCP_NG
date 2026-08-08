@@ -96,6 +96,7 @@ RCS_ID_C="$Id: udp_usrreq.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
@@ -127,6 +128,10 @@ RCS_ID_C="$Id: udp_usrreq.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 /* --- start moved from udp_var.h */
 struct	inpcb udb = { 0 };
 struct	udpstat udpstat = { 0 };
+/* Guard the size GetNetworkStatistics reports (NG_STAT_UDP_FULL = 36). Adding a
+ * field here without updating that constant truncates the tail silently. */
+typedef char ng_udpstat_size_matches_NG_STAT_UDP_FULL
+	[(sizeof(struct udpstat) == 36) ? 1 : -1];
 /* --- end moved from udp_var.h */
 
 struct	inpcb *udp_last_inpcb = &udb;
@@ -195,11 +200,36 @@ udp_input(m, iphlen)
 	 * If not enough data to reflect UDP length, drop.
 	 */
 	len = ntohs((u_short)uh->uh_ulen);
+	/*
+	 * PORT (AmiTCP_NG) security fix: reject a uh_ulen SMALLER than the UDP
+	 * header as well as one larger than the datagram.
+	 *
+	 * uh_ulen is a second, independent length claim supplied by the sender and
+	 * is not validated by anything upstream -- ip_input() checks ip_len against
+	 * the real byte count, not this. Only the "too large" half of the test was
+	 * present, so a forged uh_ulen of 0..7 passed, and m_adj() below trimmed the
+	 * UDP header away on the strength of it. The code AFTER this then strips
+	 * "IP + UDP header" again with plain arithmetic -- m->m_len -= iphlen, not
+	 * m_adj(), so nothing clamps it -- driving the signed m_len negative and
+	 * advancing m_data past the received bytes. sbappendaddr()'s sballoc() then
+	 * adds that negative length to the u_long sb_cc, so a burst of such
+	 * datagrams wraps the socket's byte count and every later datagram to that
+	 * socket is dropped as udps_fullsock: a remote denial of service against any
+	 * bound UDP port, needing no handshake and no valid checksum (uh_sum == 0
+	 * skips verification, which is legal per RFC 768).
+	 *
+	 * This is the bound stock BSD has always had; it was lost in this port.
+	 */
+	/* The (int) cast is deliberate: `len` is a signed int and sizeof yields an
+	 * unsigned type, so an uncast comparison would promote len to unsigned. It
+	 * cannot be negative here (ntohs gives 0..65535) so the promotion is benign
+	 * today -- but this codebase has shipped real bugs from exactly that shape,
+	 * and a signed/signed compare is correct regardless of what feeds len. */
+	if (len > ip->ip_len || len < (int)sizeof(struct udphdr)) {
+		udpstat.udps_badlen++;
+		goto bad;
+	}
 	if (ip->ip_len != len) {
-		if (len > ip->ip_len) {
-			udpstat.udps_badlen++;
-			goto bad;
-		}
 		m_adj(m, len - ip->ip_len);
 		/* ip->ip_len = len; */
 	}
@@ -446,7 +476,11 @@ udp_ctlinput(cmd, sa, ip)
 	extern struct in_addr zeroin_addr;
 	extern u_char inetctlerrmap[];
 
-	if ((unsigned)cmd > PRC_NCMDS || inetctlerrmap[cmd] == 0)
+	/* PORT (AmiTCP_NG) fix: valid commands are 0..PRC_NCMDS-1, so the bound
+	 * must be >=, not > -- the classic BSD off-by-one, which lets cmd ==
+	 * PRC_NCMDS read one past the end of inetctlerrmap[]. Mirrors the same
+	 * fix already applied in raw_usrreq.c. */
+	if ((unsigned)cmd >= PRC_NCMDS || inetctlerrmap[cmd] == 0)
 		return;
 	if (ip) {
 		uh = (struct udphdr *)((caddr_t)ip + (ip->ip_hl << 2));
@@ -698,7 +732,7 @@ udp_usrreq(so, req, m, addr, control)
 
 release:
 	if (control) {
-		printf("udp control data unexpectedly retained\n");
+		log(LOG_WARNING, "udp_output: control data unexpectedly retained\n");
 		m_freem(control);
 	}
 	if (m)
