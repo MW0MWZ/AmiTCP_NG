@@ -1,69 +1,164 @@
-# AmiTCP_NG — an open, unlimited TCP/IP stack for 68k AmigaOS
+# AmiTCP_NG — plan and direction
 
-> **This is the original planning document, kept for the record.** For the current
-> state of the project see [README.md](README.md); for how to build and test see
-> [docs/BUILDING.md](docs/BUILDING.md). The build/run/DHCP/Roadshow-compat phases
-> below are **done** — the stack builds and runs on emulated AmigaOS 3.2 (and on
-> real 68k hardware) as a self-starting drop-in `bsdsocket.library`, with a working
-> DHCP client, the Roadshow-compatible extension API, a complete Roadshow-compatible
-> command set, an Amiga Installer, Berkeley Packet Filter (`bpf_*`) packet capture,
-> and real-network validation (DHCP, DNS, `ping`). Beyond the original plan the
-> stack has since been **modernised** (RFC 1323 window scaling + timestamps,
-> RFC 6928 IW10, SACK loss recovery), **hardened** (RFC 6528 randomised ISNs,
-> RFC 5961, a whole-codebase memory-safety review), and gained RFC 3927 ZeroConf,
-> a DNS cache, RAM/link-speed self-tuning, and correct same-segment broadcast +
-> loopback. The IP-filter `ipf_*` firewall
-> vectors remain deliberately deferred (see
-> [docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md)).
+> **What this file is.** [README.md](README.md) describes what the stack does
+> today and how to install and configure it. This file is the other half: why it
+> is built the way it is, what is deliberately not built, and what is next. The
+> project is a rolling release, so this document is kept current rather than
+> preserved as a historical plan.
+>
+> Build and test instructions: [docs/BUILDING.md](docs/BUILDING.md).
+> Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Goal
-A `bsdsocket.library`-compatible TCP/IP stack for stock 68k AmigaOS (2.04+), with **no time limit**, **open source**, that:
-1. runs every existing Amiga network app unchanged (standard socket API), and
-2. is **driven by Roadshow's own config tools** (`AddNetInterface`, `Online`, `ShowNetStatus`, …) by implementing Roadshow's config-management extension API.
 
-Built by **forking AmiTCP 3.0b2** (the original, source-available BSD-derived stack that *defined* the `bsdsocket.library` API) and adding a Roadshow-extensions shim. **No Roadshow binaries are touched or cracked** — we replace the stack with our own; only published SDK *specifications* and *reference tool source* are used.
+A `bsdsocket.library`-compatible TCP/IP stack for stock 68k AmigaOS (2.04+), with
+**no time limit** and **open source**, that:
 
-## Why this is tractable (not "write a stack")
-- **`bsdsocket.library` IS the stack.** Replacing it = shipping our own; Roadshow is simply not present. Clean, legal.
-- AmiTCP 3.0b2 (forked into `src/`) is a **complete working stack** — 34K lines: the library (`api/`), BSD socket+mbuf core (`kern/`), link/route/**SANA-II** glue (`net/`, incl. `if_sana.c`, `sana2arp.c`, `sana2copybuff.c`), and full IPv4/TCP/UDP/ICMP (`netinet/`, incl. a hand-asm IP checksum `in_cksum.asm`). Every hard AmigaOS-integration problem (SANA-II shim, mbuf pools that dodge no-alloc-in-interrupt, stack-as-a-Task, `WaitSelect`→`Wait()`) is **already solved here**.
-- **Compile-ready:** the '94 GNUmakefile already targets `gcc-amigados`; no `ixemul`; only 7 files carry `__asm`/register-arg decls (the LVO entry points). Porting to modern **bebbo m68k-amigaos-gcc** is a gcc-2.x→gcc-6/10 jump, largely mechanical.
+1. runs every existing Amiga network application unchanged (standard socket API), and
+2. is **driven by Roadshow's own configuration tools** — `AddNetInterface`,
+   `Online`, `ShowNetStatus` and friends — by implementing Roadshow's
+   config-management extension API.
 
-## Licensing (the constraints we must honour)
-- **AmiTCP core = GPL v2** (`COPYING`), the Berkeley `net`/`netinet` under **4-clause BSD** (`COPYRIGHTS`; the advertising acknowledgement must appear in docs — Berkeley later rescinded clause 3). => **our derivative stays GPL/open.** That rules out any *closed commercial* stack (which would have meant the lwIP path instead).
-- **Roadshow SDK** (`roadshow-ref/`): SFD + `roadshow.h` + `bsdsocket.doc` are published specs (fair to implement against). The config-tool source README grants *"reuse parts... but not take the code as a whole and claim it as your own"* — we may study/adapt, and they're separate programs from the library anyway.
-- **SANA-II** headers/drivers = Commodore, "freely redistributable with notices."
+Built by forking **AmiTCP 3.0b2** — the original source-available BSD-derived
+stack that defined the `bsdsocket.library` API — and adding a Roadshow-extensions
+shim. **No Roadshow binaries are touched, patched or cracked.** The stack is
+replaced with our own; only published SDK *specifications* and *reference tool
+source* are consulted.
 
-## The work, scoped by the API gap analysis (SFD split at the first `==reserve 10`)
-**48 STANDARD functions** (`socket`…`GetSocketEvents`) — AmiTCP already provides; **apps work today.**
-**83 ROADSHOW EXTENSION functions** = the shim. By effort:
-- **Trivial / wrappers (~30):** `mbuf_*` (11 — thin exports over AmiTCP's existing `m_*` in `uipc_mbuf.c`), `inet_aton`/`inet_ntop`/`inet_pton`, `In_LocalAddr`/`In_CanForward`, the `get{net,proto,serv}ent` iterators, `gethostby*_r` (wrap non-r), default-domain get/set.
-- **Moderate (~12):** `getaddrinfo`/`getnameinfo`/`freeaddrinfo`/`gai_strerror` (RFC 3493), DNS-server list mgmt (`AddDomainNameServer`, `ObtainDomainNameServerList`…).
-- **The real work (~25): config-management shim** — `AddInterfaceTagList`, `ConfigureInterfaceTagList`, `ObtainInterfaceList`, `QueryInterfaceTagList`, `RemoveInterface`, `AddRouteTagList`/`DeleteRouteTagList`/`GetRouteInfo`, `ObtainRoadshowData`/`ChangeRoadshowData`, `GetNetworkStatistics`, `AddNetMonitorHook`. These translate Roadshow's *tag-based* config into AmiTCP's *internal* interface/route ops (AmiTCP already does the ops — via `ifconfig`/`route` ioctls/routing sockets; the shim just wraps them tag-style).
-- **DHCP (~7): the one genuinely new subsystem** — `CreateAddrAllocMessage`/`BeginInterfaceConfig`/`AbortInterfaceConfig`. AmiTCP has only BOOTP; Roadshow's DHCP client is the headline feature to add (a few hundred lines of DHCP state machine over UDP).
-- **DEFER for v1 (~16):** `bpf_*` (packet capture / tcpdump), `ipf_*` (firewall). Stub the vectors, implement later.
+## Why this approach works
 
-**=> v1 shim ≈ 40–50 functions, most trivial/moderate; the meat is the config-mgmt translation + a DHCP client.** No protocol code to write.
+- **`bsdsocket.library` IS the stack.** Replacing that one file replaces the
+  networking, with Roadshow simply not present. Clean, and legal.
+- **AmiTCP 3.0b2 is a complete working stack**, not a skeleton — roughly 34K
+  lines covering the library (`api/`), the BSD socket and mbuf core (`kern/`),
+  link/route/SANA-II glue (`net/`) and full IPv4/TCP/UDP/ICMP (`netinet/`). Every
+  hard AmigaOS integration problem was already solved there: the SANA-II shim,
+  mbuf pools that avoid allocating at interrupt time, the stack as a Task, and
+  `WaitSelect` mapped onto `Wait()`.
+- **It was compile-ready.** The 1994 makefile already targeted a gcc-flavoured
+  toolchain with no `ixemul`, and only seven files carried register-argument
+  declarations. Porting to a modern cross-compiler was largely mechanical; the
+  specifics are in [PORTING.md](PORTING.md).
+
+So the work was never "write a TCP/IP stack". It was: port a good one, add the
+Roadshow-compatible configuration surface, write a DHCP client, and then
+modernise the protocol behaviour.
+
+## Licensing constraints
+
+These bind every change and are not negotiable:
+
+- **AmiTCP core is GPL v2** (`COPYING`); the Berkeley `net`/`netinet` code is
+  under the 4-clause BSD licence (`COPYRIGHTS` — the advertising acknowledgement
+  must appear in documentation; Berkeley later rescinded clause 3). **The
+  derivative stays GPL and open.**
+- **The Roadshow SDK is reference only.** The SFD, `roadshow.h` and
+  `bsdsocket.doc` are published specifications and fair to implement against. The
+  sample tool source may be studied, not lifted wholesale. Our command set is a
+  clean-room reimplementation that matches names, arguments and output.
+- **SANA-II** headers and drivers are Commodore's, freely redistributable with
+  their notices intact.
+- The repository contains **no licensed Amiga assets** — no Kickstart ROMs, no
+  Workbench images. The emulator directories that hold them are ignored by git.
+
+## The extension API surface
+
+The library exposes Roadshow's full vector table at the exact SFD offsets. Of
+that surface:
+
+- The **48 standard functions** (`socket` … `GetSocketEvents`) come from AmiTCP,
+  so ordinary applications work as they always did.
+- The **Roadshow extensions** are the shim. Address conversion, DNS server
+  management, `getaddrinfo`/`getnameinfo`, the reentrant `gethostby*_r` family,
+  the interface and routing configuration families, network statistics,
+  `ObtainRoadshowData`, BPF packet capture and the DHCP client are all
+  implemented and advertised through the `SBTC_HAVE_*` capability tags.
+- Anything not implemented returns `ENOSYS` from a shared stub rather than
+  occupying an empty vector, so a caller gets a clean failure instead of a jump
+  into nothing.
+
+**Deliberately not implemented**, with reasoning, in
+[docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md): the `ipf_*` IP filter
+(7 vectors), the network-monitor hooks (2), the server API (2), and
+`ChangeRouteTagList`, which is private and unimplemented in Roadshow itself.
+
+**Known gap:** IP multicast *receive* is not implemented — there is no
+`IP_ADD_MEMBERSHIP`, no IGMP and no `S2_ADDMULTICASTADDRESS`. Transmit works
+incidentally. This is a tracked gap rather than a deferral.
 
 ## Toolchain
-Native AmigaOS → **m68k-amigaos-gcc** (bebbo) + NDK + `amiga.lib`. See `docker/` scaffold. Provision options: build bebbo `amiga-gcc` in a Docker image (`make all`, ~1h, self-contained), or source a current prebuilt image. The first step was a compile-only smoke test of one `api/` file.
 
-## Test strategy (a stack needs a network)
-Compile-first, then runtime on a **networked emulated AmigaOS**: FS-UAE (Linux) or WinUAE with a Workbench 3.x install + a SANA-II driver bridged to the host (TAP/bridge, or the emulator's virtual net). MAME's Amiga networking is too limited. This harness is its own build-out; keep it *behind* the compile milestone.
+**bebbo's `m68k-amigaos-gcc`, via the prebuilt `amigadev/crosstools` Docker
+image.** Everything builds in a container; nothing is installed on the host.
 
-## Roadmap (all done unless noted)
-- **Toolchain up** — bebbo image; compile one file. **[done]**
-- **It builds** — whole AmiTCP core compiles+links to a `bsdsocket.library` under bebbo (fix gcc-2.x→6/10 issues, register-arg syntax, NDK header diffs). **[done]**
-- **It runs** — loads on emulated WB3.x, opens a SANA-II driver, ARP+ping over UDP/ICMP. **[done — self-starting drop-in library; real-network validated]**
-- **DHCP** — add the DHCP client (replaces AmiTCP's BOOTP). **[done — full DORA lease]**
-- **Roadshow-compat shim** — implement the extension vectors at exact SFD offsets; drive it with Roadshow's `AddNetInterface`/`Online`/`ShowNetStatus`. **[done — plus our own clean-room Roadshow-compatible command set and an Installer]**
-- **Modernize** — `getaddrinfo`, fixes; optional `bpf_*`/`ipf_*`. **[getaddrinfo and `bpf_*` packet capture done. Also: modern TCP (RFC 1323 scaling/timestamps, RFC 6928 IW10, SACK), security hardening (RFC 6528, RFC 5961, memory-safety review), RFC 3927 ZeroConf, DNS cache, RAM/link-speed self-tuning, correct broadcast + loopback. The `ipf_*` firewall deliberately deferred]**
+Do not plan on building the cross-compiler from source: the original
+`bebbo/amiga-gcc` repository no longer resolves and the community Docker images
+that wrapped it have gone. The prebuilt image is the supported route. All build
+entry points live in `docker/` and are documented in
+[docs/BUILDING.md](docs/BUILDING.md).
+
+Three CPU targets ship: portable **68000**, plus **68020** and **68040**.
+
+## Testing
+
+A stack needs a network, so testing is done on an emulated AmigaOS with a real
+SANA-II driver attached.
+
+**Amiberry with its A2065 bridged to SLIRP** is the working harness. Plain FS-UAE
+has no network card at all, so it can only exercise loopback and the library
+vectors; it is still used for the checksum benchmark. Under SLIRP the guest gets
+a genuine DHCP lease, DNS, and ICMP to the gateway, which is enough to validate
+bring-up end to end.
+
+`docker/run-smoke.sh` runs the suite in **tiers**, and the order is the point:
+
+1. **Gate — the 68000 build on an A600**, loopback only: library vectors,
+   first-touch start-up, UDP round trip, configuration checking. Cheap and broad.
+   If this fails, nothing else runs, because a stack that cannot complete a
+   loopback round trip has nothing useful to say about DHCP.
+2. **Then the 68020 and 68040 builds on an A4000**, with DHCP, link-speed
+   auto-tuning, `ping` and interface teardown. RAM is set mid-ladder so the
+   window auto-tune has to clamp against the RAM ceiling rather than one side
+   trivially winning, and the interface declares a 100 Mbit link so the tuning
+   path real hardware takes is the one under test.
+
+**Every CPU target is tested on every run.** This is not thoroughness for its own
+sake: a fault once existed only in the 68040 build while the harness ran the
+68000 one, and it survived for weeks precisely because "the emulator cannot
+reproduce it" was true and misleading at the same time.
+
+Two limits worth knowing. The emulator proxies TCP through host sockets, so the
+guest's own SYN options cannot be observed on the wire — verifying those is a
+real-hardware job. And anything about *having an address* passes trivially on a
+loopback-only machine, because "no address" is also what a stack that never came
+up reports; those tests belong on the networked tier.
+
+## What is next
+
+- **IP multicast receive**, if there is demand for it.
+- **PPP.** Roadshow ships serial and Ethernet PPP devices; whether AmiTCP_NG
+  grows an equivalent is an open decision, not a commitment.
+- **The install / uninstall / reinstall cycle** has been reasoned about carefully
+  and checked mechanically, but never driven end to end by a person on real
+  hardware. It should be.
 
 ## Layout
+
 ```
 AmiTCP_NG/
-  src/              forked AmiTCP 3.0b2 core (api kern net netinet sys protos conf + GNUmakefile)
-  roadshow-ref/     Roadshow SDK specs: bsdsocket_lib.sfd, roadshow.h, sample config-tool source
-  docs/             design notes
-  COPYING COPYRIGHTS  AmiTCP GPL v2 + BSD attribution (kept with the fork)
-  PLAN.md           this file
+  src/            the stack: api/ kern/ net/ netinet/ sys/ lib/ netinclude/
+  src/tools/      the Roadshow-compatible command set (25 commands)
+  src/usergroup/  LIBS:usergroup.library, independent of the stack
+  install/        Amiga Installer script, ReadMe, network database, examples
+  docker/         build and test harness: Dockerfiles, build scripts, smoketest
+  docs/           BUILDING, ARCHITECTURE, COMMENTING, DEFERRED-VECTORS, REVIEW_FINDINGS
+  PLAN.md         this file — direction and rationale
+  PORTING.md      what the 1994 → modern gcc port actually required
+  README.md       what it does, and how to install and configure it
+  COPYING         GPL v2
+  COPYRIGHTS      the retained original AmiTCP/IP and Berkeley notices
 ```
+
+Not in the repository, and ignored by git: `emu/` (emulator system files,
+including licensed ROMs and Workbench images), `ref/` and `roadshow-ref/`
+(vendor SDKs kept locally for reference), `build/` and `tmp/`.

@@ -57,5 +57,9 @@ NG_ARCH="${NG_ARCH:--m68000}"
 # mbuf data, sockaddr_in/sockaddr casts, packet headers overlaid on buffers); -O2's
 # default -fstrict-aliasing would silently miscompile those. This is the standard flag
 # for BSD/kernel C -- NOT a workaround to "clean up" (that rewrite buys ~no speed).
+# Extra defines for a one-off DIAGNOSTIC build, appended last so they cannot be
+# clobbered by the assignments above:  NG_DEF_EXTRA=-DNG_NO_ROADSHOW_DB ./docker/build-lib.sh
+NG_DEF="$NG_DEF ${NG_DEF_EXTRA:-}"
+
 NG_CFLAGS="-noixemul -std=gnu89 -fno-builtin -O2 -fno-strict-aliasing -fomit-frame-pointer -Wall -Werror $NG_ARCH"
 NG_FORCEINC="-include src/conf/rcs.h -include src/conf/amitcp_ng_bases.h"

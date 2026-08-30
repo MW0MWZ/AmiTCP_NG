@@ -47,6 +47,7 @@
 
 #include <conf.h>
 
+#include <ng_hostname.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/socket.h>
@@ -74,6 +75,7 @@ extern int strcmp(const char *, const char *);
 #include <net/route.h>
 #include <net/if_types.h>
 #include <net/if_sana.h>
+#include <net/ng_ifconfig.h>
 #include <net/sana2arp.h>	/* RFC 3927 link-local ARP primitives (ng_ll_*) */
 
 #include <utility/tagitem.h>
@@ -84,6 +86,7 @@ extern int strcmp(const char *, const char *);
 #include <api/amiga_api.h>
 #include <api/amiga_libcallentry.h>
 #include <api/amiga_raf.h>
+#include <api/dns_cache.h>		/* ng_dnscache_flush() on a name-server change */
 
 #include <net/if_protos.h>
 #include <kern/uipc_socket_protos.h>
@@ -96,6 +99,19 @@ extern int strcmp(const char *, const char *);
 extern int inet_aton(const char *cp, struct in_addr *addr);
 extern int in_localaddr(struct in_addr in);
 extern int in_canforward(struct in_addr in);
+
+/*
+ * Interface configuration memory and DNS ownership. The configuring paths record
+ * what they applied; when a SANA-II device reports itself back online,
+ * net/if_sana.c calls ng_reconfigure_interface() to apply it again. Defined
+ * further down, beside the DHCP client they share machinery with.
+ */
+void ng_reconfigure_interface(const char *ifname);
+void ng_iface_reconfig_done(const char *ifname);
+void ng_flush_dynamic_nameservers_for(const char *ifname);
+static int  ng_ifname(char *buf, struct ifnet *ifp);	/* defined further down */
+static void ng_canon_ifname(const char *in, char *out);
+static int  ng_add_owned_nameserver(const char *address, const char *owner);
 
 /* ------------------------------------------------------------------------- *
  *  Shared "not implemented yet" stubs.
@@ -330,6 +346,7 @@ LONG SAVEDS RAF2(_In_LocalAddr,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(0);
   NG_ENSURE_STACK();
   struct in_addr ia;
 
@@ -345,6 +362,7 @@ LONG SAVEDS RAF2(_In_CanForward,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(0);
   NG_ENSURE_STACK();
   struct in_addr ia;
 
@@ -371,6 +389,7 @@ LONG SAVEDS RAF2(_AddDomainNameServer,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   struct in_addr ns_addr;
   struct NameserventNode *nsn;
@@ -385,12 +404,96 @@ LONG SAVEDS RAF2(_AddDomainNameServer,
   }
   nsn->nsn_EntSize = sizeof(nsn->nsn_Ent);
   nsn->nsn_Dynamic = 1;		/* runtime-added (DHCP / a tool) -- cleared on offline */
+  /* Unowned: this vector says nothing about which interface the server belongs
+   * to, so nothing withdraws it automatically. Callers that DO know use the
+   * NGCT_NameServer configuration tag instead. */
+  nsn->nsn_Owner[0] = '\0';
   nsn->nsn_Ent.ns_addr = ns_addr;
 
   LOCK_W_NDB(NDB);
   AddTail((struct List *)&NDB->ndb_NameServers, (struct Node *)nsn);
   UNLOCK_NDB(NDB);
+
+  /* A new server may answer differently from the ones already listed, so what is
+   * cached is no longer necessarily what would be resolved now. Outside the NDB
+   * lock: the flush takes the cache's own lock, and the two are never nested. */
+  ng_dnscache_flush();
   return (0);
+}
+
+
+/*
+ * One canonical spelling of an interface name, so ownership can be compared.
+ *
+ * The same interface is called different things by different callers: a
+ * DEVS:NetInterfaces file (and so the AddressAllocationMessage) says "smoke",
+ * while a name built from the ifnet says "smoke0". ifunit() resolves both to the
+ * same interface, plain string comparison does not -- and that mismatch made the
+ * offline teardown find none of its own name servers, leaving them behind and
+ * then duplicating them on the next lease. An unknown name is copied through
+ * unchanged: it simply matches nothing, which is the safe direction.
+ */
+static void
+ng_canon_ifname(const char *in, char *out)
+{
+  struct ifnet *ifp;
+  int i = 0;
+  spl_t s;
+
+  out[0] = '\0';
+  if (in == NULL)
+    return;
+  s = splimp();
+  if ((ifp = ifunit((char *)in)) != NULL) {
+    ng_ifname(out, ifp);
+    splx(s);
+    return;
+  }
+  splx(s);
+  for (; i < IFNAMSIZ - 1 && in[i]; i++) out[i] = in[i];
+  out[i] = '\0';
+}
+
+/*
+ * Add a dynamic name server OWNED by `owner`.
+ *
+ * The public AddDomainNameServer() vector has no interface argument, so a server
+ * added through it belongs to nobody and is never withdrawn automatically --
+ * which is its documented behaviour. This is the internal form, used by the
+ * NGCT_NameServer configuration tag, so that ownership is established by the same
+ * locked call that configures the interface rather than by a global read back
+ * across separate library calls.
+ */
+static int
+ng_add_owned_nameserver(const char *address, const char *owner)
+{
+  struct in_addr ns_addr;
+  struct NameserventNode *nsn;
+  char canon[IFNAMSIZ];
+  int i;
+
+  if (address == NULL || !inet_aton(address, &ns_addr))
+    return EINVAL;
+  if ((nsn = bsd_malloc(sizeof(*nsn), M_NETDB, M_WAITOK)) == NULL)
+    return ENOBUFS;
+
+  ng_canon_ifname(owner, canon);
+  nsn->nsn_EntSize = sizeof(nsn->nsn_Ent);
+  nsn->nsn_Dynamic = 1;
+  for (i = 0; i < (int)sizeof(nsn->nsn_Owner) - 1 && canon[i]; i++)
+    nsn->nsn_Owner[i] = canon[i];
+  nsn->nsn_Owner[i] = '\0';
+  nsn->nsn_Ent.ns_addr = ns_addr;
+
+  LOCK_W_NDB(NDB);
+  AddTail((struct List *)&NDB->ndb_NameServers, (struct Node *)nsn);
+  UNLOCK_NDB(NDB);
+
+  /* This is the DHCP / interface-configuration route, so it is the one that
+   * matters most: it fires exactly when the machine has just joined a network
+   * whose resolver may answer the same names differently. */
+  ng_dnscache_flush();
+  return 0;
 }
 
 /* RemoveDomainNameServer (LVO -522): remove the first server matching address. */
@@ -400,6 +503,7 @@ LONG SAVEDS RAF2(_RemoveDomainNameServer,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   struct in_addr ns_addr;
   struct NameserventNode *nsn, *next;
@@ -428,6 +532,11 @@ LONG SAVEDS RAF2(_RemoveDomainNameServer,
     writeErrnoValue(libPtr, EINVAL);
     return (-1);
   }
+
+  /* Only when something actually went: a failed removal changed nothing, and
+   * throwing the cache away for it would let a caller repeatedly asking to remove
+   * a server that is not there keep the cache permanently empty. */
+  ng_dnscache_flush();
   return (0);
 }
 
@@ -438,10 +547,25 @@ LONG SAVEDS RAF2(_RemoveDomainNameServer,
  * does not linger past the link it came from. Not a public library vector -- an
  * internal helper -- so it takes no SocketBase and sets no errno.
  */
+
+/* Case-sensitive name compare; interface names are generated, not typed. */
+static int
+ng_name_eq(const char *a, const char *b)
+{
+  int i;
+  if (a == NULL || b == NULL) return 0;
+  for (i = 0; a[i] && b[i]; i++) if (a[i] != b[i]) return 0;
+  return a[i] == b[i];
+}
+
 void
-ng_flush_dynamic_nameservers(void)
+ng_flush_dynamic_nameservers_for(const char *ifname)
 {
   struct NameserventNode *nsn, *next;
+  char want[IFNAMSIZ];			/* the name spelled the one canonical way */
+  int  removed = 0;
+
+  ng_canon_ifname(ifname, want);
 
   if (NDB == NULL)
     return;
@@ -451,12 +575,36 @@ ng_flush_dynamic_nameservers(void)
        nsn->nsn_Node.mln_Succ != NULL;
        nsn = next) {
     next = (struct NameserventNode *)nsn->nsn_Node.mln_Succ;
-    if (nsn->nsn_Dynamic) {
+    /* Only this interface's servers when a name is given. Flushing every dynamic
+     * server on any interface going offline took name resolution away from the
+     * interfaces still up. A NULL name keeps the old whole-list behaviour for the
+     * paths that genuinely mean it (a lease REPLACING its own servers, shutdown). */
+    if (nsn->nsn_Dynamic &&
+	(ifname == NULL || ng_name_eq(nsn->nsn_Owner, want))) {
       Remove((struct Node *)nsn);
       bsd_free(nsn, M_NETDB);
+      removed++;
     }
   }
   UNLOCK_NDB(NDB);
+
+  /*
+   * This is the "last interface came down" case as well as the per-interface one:
+   * answers obtained through servers that have just been withdrawn must not
+   * survive them. Only when something was actually removed -- this is called on
+   * every offline, including for interfaces that never supplied a server, and
+   * flushing on those would empty the cache for the interfaces still up.
+   */
+  if (removed)
+    ng_dnscache_flush();
+}
+
+/* Flush EVERY dynamic server, whoever owns it. For a lease replacing its own set
+ * and for shutdown -- not for one interface going offline. */
+void
+ng_flush_dynamic_nameservers(void)
+{
+  ng_flush_dynamic_nameservers_for(NULL);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -469,7 +617,8 @@ ng_flush_dynamic_nameservers(void)
  *  through this call. We translate each IFC_* tag into the corresponding classic
  *  BSD ifioctl (SIOCSIFADDR, SIOCSIFNETMASK, SIOCSIFFLAGS, ...) issued through a
  *  throwaway privileged UDP socket -- exactly the path an application takes with
- *  IoctlSocket(), and the same one tmp/udptest.c proved end to end. Address tag
+ *  IoctlSocket(), and the same one the UDP round-trip test proves end to end.
+ *  Address tag
  *  data is a dotted-decimal STRPTR (confirmed from Roadshow's config-tool source).
  *
  *  Roadshow's IFC_* interface-config tags, from <libraries/bsdsocket.h>. Defined
@@ -483,6 +632,11 @@ ng_flush_dynamic_nameservers(void)
 #define IFC_Metric		(IFC_BASE + 5)	/* LONG routing metric     */
 #define IFC_MTU			(IFC_BASE + 6)	/* LONG interface MTU (B)  */
 #define IFC_State		(IFC_BASE + 8)	/* LONG, one of SM_*       */
+/* Ownership declarations. Values from the SDK header, not guessed. A caller sets
+ * these to say the interface owns its default route / its name servers, so they
+ * are removed when it goes down or offline (bsdsocket.h: IFC_BASE+12, +13). */
+#define IFC_AssociatedRoute	(IFC_BASE + 12)	/* BOOL */
+#define IFC_AssociatedDNS	(IFC_BASE + 13)	/* BOOL */
 
 /*
  * AmiTCP_NG-private creation tags for AddInterfaceTagList(): the SANA-II receive /
@@ -497,6 +651,16 @@ ng_flush_dynamic_nameservers(void)
 #define NGCT_TcpSendspace	(TAG_USER + 0x004E4703)	/* LONG TCP send buffer  */
 #define NGCT_TcpRecvspace	(TAG_USER + 0x004E4704)	/* LONG TCP recv buffer  */
 #define NGCT_TcpMssdflt		(TAG_USER + 0x004E4705)	/* LONG off-subnet MSS cap */
+#define NGCT_LinkSpeed		(TAG_USER + 0x004E4706)	/* LONG bits/sec, overrides S2_DEVICEQUERY BPS */
+/*
+ * A name server this interface provides, dotted-decimal STRPTR, repeatable.
+ * Exists because AddDomainNameServer() has no interface argument: ownership has
+ * to be established by the call that configures the interface, as ONE locked
+ * operation. Carrying it in a global set by one library call and read by later
+ * ones -- what this replaced -- misattributes servers the moment two interfaces
+ * are configured at once, and leaks the attribution to unrelated callers after.
+ */
+#define NGCT_NameServer		(TAG_USER + 0x004E4707)	/* STRPTR, repeatable */
 
 /* IFC_State values (Roadshow SM_* interface-state machine). */
 #define NG_SM_Offline	0
@@ -662,9 +826,61 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
 	ifp->if_mtu = (short)m;
       break;
     }
+    case NGCT_NameServer:
+      /* Owned by this interface, added inside the same call that configures it,
+       * so the owner never depends on what another task is doing meanwhile. */
+      if (ti->ti_Data)
+	e = ng_add_owned_nameserver((const char *)ti->ti_Data, ifname);
+      break;
+    case IFC_AssociatedRoute:
+    case IFC_AssociatedDNS: {
+      /* Ownership is a property of the interface, so it is recorded on the softc
+       * rather than applied through an ioctl. Only SANA interfaces have one; the
+       * loopback cannot own a default route or a name server. */
+      if (ifp->if_type == IFT_SANA) {
+	struct sana_softc *ssc = (struct sana_softc *)ifp;
+	if (ti->ti_Tag == IFC_AssociatedRoute) {
+	  ssc->ss_assoc_route = ti->ti_Data ? 1 : 0;	/* informational: nothing reads this now --
+					 * offline purges an interface's routes
+					 * unconditionally, because it frees the
+					 * ifaddrs they point at. Kept because the
+					 * Roadshow tag must still be accepted. */
+	} else {
+	  /* Purely a declaration. The servers themselves arrive as NGCT_NameServer
+	   * tags in this same call, so there is no window in which "who owns what"
+	   * depends on ordering between separate library calls. */
+	  ssc->ss_assoc_dns = ti->ti_Data ? 1 : 0;
+	}
+      }
+      break;
+    }
     case IFC_State: {
       struct ifreq ifr;
       short flags = ifp->if_flags;
+      extern int sana_device_online(struct ifnet *ifp, int online);
+
+      /*
+       * SM_Online and SM_Offline are SM_Up and SM_Down plus the device command,
+       * per the SDK -- and the order matters in each direction.
+       *
+       * Going up, the device command comes FIRST and a failure stops everything:
+       * "if the command succeeds, the other necessary configuration operations
+       * will take place. If it fails, then this function will return with an
+       * error code set and no further configuration will have been done." An
+       * interface marked up over a device that refused to come online would just
+       * be a lie.
+       *
+       * Going down, the interface is taken down FIRST and the device offlined
+       * after, so nothing is still trying to transmit through a device on its way
+       * out.
+       *
+       * Driving the device from here is also what makes this path independent of
+       * whether the driver reports anything: we know it worked because we did it.
+       */
+      if (ti->ti_Data == NG_SM_Online && ifp->if_type == IFT_SANA) {
+	if ((e = sana_device_online(ifp, 1)) != 0)
+	  break;				/* refused: change nothing */
+      }
 
       ng_ifr_init(&ifr, ifname);
       if (ti->ti_Data == NG_SM_Up || ti->ti_Data == NG_SM_Online)
@@ -673,6 +889,60 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
 	flags &= ~IFF_UP;			/* take it down */
       ifr.ifr_flags = flags;
       e = ifioctl(so, SIOCSIFFLAGS, (caddr_t)&ifr);
+
+      if (ti->ti_Data == NG_SM_Offline && ifp->if_type == IFT_SANA) {
+	(void)sana_device_online(ifp, 0);	/* down first, then offline */
+
+	/*
+	 * Deconfigure it, exactly as a device that vanished on its own is
+	 * deconfigured.
+	 *
+	 * These two ways of going offline used to leave the interface in
+	 * visibly different states. A device that dropped out had its address
+	 * scrubbed, its associated route and name servers withdrawn, the DNS
+	 * cache emptied and its blocked sockets woken; an operator asking for
+	 * the same thing got none of it -- the interface went down still
+	 * advertising an address it could not use, still offering name servers
+	 * that could not be reached, with applications waiting on it. The
+	 * interface ends up in the same place either way, so it should get there
+	 * the same way.
+	 *
+	 * OFFLINE ONLY, not DOWN, and the SDK's own wording is why. It defines
+	 * the four states as: Offline "not ready to receive and transmit data";
+	 * Down "not ready ... but might still be ONLINE"; Up "ready ... but not
+	 * necessarily online" (libraries/bsdsocket.h). Down/Up are about the
+	 * interface, Offline/Online about the device underneath it -- so tearing
+	 * the configuration down belongs to the device-level pair. It is also the
+	 * only pair that can put it back: SM_Online reconfigures the interface
+	 * from its config file, where SM_Up does not, so scrubbing on Down would
+	 * leave a Down/Up cycle unable to restore itself. (What the SDK does NOT say anywhere is when
+	 * an IFC_AssociatedRoute / IFC_AssociatedDNS claim is redeemed; the tags
+	 * are documented only as "that interface is associated with a route/DNS".
+	 * Doing it here is our reading, not a citation.)
+	 *
+	 * Done through ss_offcleanup, the same flag the involuntary path sets,
+	 * rather than by calling the teardown here: it must run in the network
+	 * task, because it touches the routing table and address lists and then
+	 * blocks on the NetDataBase semaphore to withdraw the name servers.
+	 * Sharing the flag also means the two paths cannot drift apart again.
+	 *
+	 * Only when the interface actually went down (e == 0). Deconfiguring an
+	 * interface that is still up would be the worse half of the old bug.
+	 * ss_wantback is deliberately NOT set: that flag means "the device left
+	 * against our wishes, watch for its return", and this is the opposite.
+	 * Coming back is SM_Online's job, and it reconfigures from the config file.
+	 */
+	if (e == 0) {
+	  spl_t sp = splimp();
+	  ((struct sana_softc *)ifp)->ss_offcleanup = 1;
+	  splx(sp);
+	}
+      }
+
+      /* Coming up through this path, put the configuration back ourselves rather
+       * than waiting for an event the driver may never send. */
+      if (e == 0 && ti->ti_Data == NG_SM_Online && ifp->if_type == IFT_SANA)
+	((struct sana_softc *)ifp)->ss_reconfig = 1;
       break;
     }
     default:
@@ -687,6 +957,7 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
     if (e != 0 && error == 0)
       error = e;			/* remember the first failure, keep going */
   }
+
 
   soclose(so);
   return error;
@@ -730,7 +1001,7 @@ LONG SAVEDS RAF3(_ConfigureInterfaceTagList,
  * could not be opened).
  */
 extern struct ifnet *sana_add_interface(char *ifname, char *devname, long devunit,
-					long ipreq, long wreq);
+					long ipreq, long wreq, long bps);
 
 /*
  * ng_speed_window -- the TCP window we WANT for a link of the given speed, in bytes.
@@ -813,6 +1084,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
   int error;
   long ipreq, wreq, sndsp, rcvsp;	/* sndsp/rcvsp needed again for the auto-tune below */
   long mssd;				/* tcp.mssdflt= off-subnet MSS cap (0 = keep global) */
+  long lspeed;				/* bps= link-speed override (0 = keep the driver's) */
 
   CHECK_TASK();
 
@@ -834,13 +1106,14 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
    * RAM-tiered default. ng_apply_iface_config() below ignores these private tags.
    */
   { struct TagItem *ti, *tstate = tags;
-    ipreq = wreq = sndsp = rcvsp = mssd = 0;
+    ipreq = wreq = sndsp = rcvsp = mssd = lspeed = 0;
     while ((ti = ng_nexttag(&tstate)) != NULL) {
-      if (ti->ti_Tag == NGCT_IPRequests)         ipreq = (long)ti->ti_Data;
-      else if (ti->ti_Tag == NGCT_WriteRequests) wreq  = (long)ti->ti_Data;
-      else if (ti->ti_Tag == NGCT_TcpSendspace)  sndsp = (long)ti->ti_Data;
-      else if (ti->ti_Tag == NGCT_TcpRecvspace)  rcvsp = (long)ti->ti_Data;
-      else if (ti->ti_Tag == NGCT_TcpMssdflt)    mssd  = (long)ti->ti_Data;
+      if (ti->ti_Tag == NGCT_IPRequests)         ipreq  = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_WriteRequests) wreq   = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpSendspace)  sndsp  = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpRecvspace)  rcvsp  = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_TcpMssdflt)    mssd   = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_LinkSpeed)     lspeed = (long)ti->ti_Data;
     }
     /*
      * Honour an explicit tcp.sendspace= / tcp.recvspace= from the interface config by
@@ -892,7 +1165,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
   }
   {
     struct ifnet *newif = sana_add_interface((char *)interface_name, (char *)device_name,
-					     (long)unit, ipreq, wreq);
+					     (long)unit, ipreq, wreq, lspeed);
     if (newif == NULL) {
       ReleaseSyscallSemaphore(libPtr);
       writeErrnoValue(libPtr, ENXIO);		/* could not open the device */
@@ -1106,6 +1379,18 @@ LONG SAVEDS RAF2(_AddRouteTagList,
   error = ng_route_op(RTM_ADD, tags);
   ReleaseSyscallSemaphore(libPtr);
   if (error != 0) { writeErrnoValue(libPtr, error); return (-1); }
+  /* If that was a default route, remember its gateway against the interface it
+   * exits through, so a static configuration can be restored complete after the
+   * device goes offline and returns. Roadshow calls this the interface's
+   * associated route (IFC_AssociatedRoute). */
+  { struct TagItem *tstate = tags, *ti;
+    while ((ti = ng_nexttag(&tstate)) != NULL)
+      if (ti->ti_Tag == RTA_DefaultGateway && ti->ti_Data) {
+	struct in_addr g;
+	if (inet_aton((char *)ti->ti_Data, &g))
+	break;
+      }
+  }
   return (0);
 }
 
@@ -1785,6 +2070,10 @@ VOID SAVEDS RAF2(_freeaddrinfo,
 #if 0
 {
 #endif
+  /* Deliberately NOT gated on a dead base: this frees memory the CALLER
+   * owns and touches no stack state. Returning early here would leak that
+   * buffer on every call through an abandoned base -- a fault that does not
+   * exist today. Do the work regardless of what happened to the stack. */
   NG_ENSURE_STACK();
   (void)libPtr;
   ng_freeaddrinfo(ai);
@@ -2234,6 +2523,7 @@ BOOL SAVEDS RAF3(_GetDefaultDomainName,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(FALSE);
   NG_ENSURE_STACK();
   struct DomainentNode *dn;
   int found = 0;
@@ -2303,43 +2593,16 @@ ng_set_default_domain(const char *name)
   UNLOCK_NDB(NDB);
 }
 
-/* Install `name` as the search domain ONLY if none is set yet. Used by the
- * background DHCP upgrade (link-local -> a lease won later) so it fills an
- * unconfigured search domain without clobbering an explicit domain= the caller
- * already set: at that point a non-empty list can only be that explicit domain
- * (a background upgrade means initial DHCP failed, so there is no initial-DHCP
- * domain to preserve). The check-and-add is atomic under the write lock, and it
- * only AddTail()s (never Remove()s/frees), so it is safe against a concurrent
- * unlocked res_search() walk -- the added node's link is a single atomic write. */
-void
-ng_set_default_domain_if_empty(const char *name)
-{
-  struct DomainentNode *dn;
-  int nodesize;
-
-  if (name == NULL || *name == '\0')
-    return;
-
-  /* Bound the name before it reaches the 16-bit dn_EntSize -- see
-   * ng_set_default_domain() above. */
-  nodesize = sizeof(*dn) + strlen(name) + 1;
-  if (nodesize - (int)sizeof(struct GenentNode) > 32767) {
-    log(LOG_ERR, "netdb: refusing oversized domain name (%ld bytes).",
-	(long)nodesize);
-    return;
-  }
-
-  LOCK_W_NDB(NDB);
-  if (((struct DomainentNode *)NDB->ndb_Domains.mlh_Head)->dn_Node.mln_Succ == NULL) {
-    if ((dn = bsd_malloc(nodesize, M_NETDB, M_WAITOK)) != NULL) {
-      dn->dn_EntSize = nodesize - sizeof(struct GenentNode);
-      dn->dn_Ent.d_name = (char *)(dn + 1);
-      strcpy((char *)(dn + 1), name);
-      AddTail((struct List *)&NDB->ndb_Domains, (struct Node *)dn);
-    }
-  }
-  UNLOCK_NDB(NDB);
-}
+/*
+ * (ng_set_default_domain_if_empty() lived here. It installed a search domain only
+ * when none was set, so a lease won late by the background retry would not
+ * displace an explicit domain=. That was correct while domain= outranked DHCP.
+ * It is not correct now the lease outranks domain=, and keeping it meant the rule
+ * held only for servers that answered promptly -- one config resolving two ways
+ * depending on how long the server took. Its single caller now uses
+ * ng_set_default_domain(), and a helper whose only purpose was the old precedence
+ * is worse than absent: it is an invitation to reintroduce it.)
+ */
 
 /* SetDefaultDomainName (LVO -708): make `buffer` the sole default domain. */
 VOID SAVEDS RAF2(_SetDefaultDomainName,
@@ -2348,6 +2611,7 @@ VOID SAVEDS RAF2(_SetDefaultDomainName,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD();
   NG_ENSURE_STACK();
   (void)libPtr;
   ng_set_default_domain((const char *)buffer);
@@ -2637,6 +2901,10 @@ VOID SAVEDS RAF2(_FreeRouteInfo,
 #if 0
 {
 #endif
+  /* Deliberately NOT gated on a dead base: this frees memory the CALLER
+   * owns and touches no stack state. Returning early here would leak that
+   * buffer on every call through an abandoned base -- a fault that does not
+   * exist today. Do the work regardless of what happened to the stack. */
   NG_ENSURE_STACK();
   (void)libPtr;
   if (buf != NULL)
@@ -2662,6 +2930,7 @@ BOOL SAVEDS RAF3(_RemoveInterface,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(FALSE);
   NG_ENSURE_STACK();
   struct ifnet *ifp;
   int error;
@@ -2765,6 +3034,7 @@ LONG SAVEDS RAF6(_CreateAddrAllocMessageA,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(ENETDOWN);
   NG_ENSURE_STACK();
   struct TagItem *tstate, *ti;
   struct ng_aam *aam;
@@ -2878,6 +3148,10 @@ VOID SAVEDS RAF2(_DeleteAddrAllocMessage,
 #if 0
 {
 #endif
+  /* Deliberately NOT gated on a dead base: this frees memory the CALLER
+   * owns and touches no stack state. Returning early here would leak that
+   * buffer on every call through an abandoned base -- a fault that does not
+   * exist today. Do the work regardless of what happened to the stack. */
   NG_ENSURE_STACK();
   (void)libPtr;
   if (aam != NULL)
@@ -2908,6 +3182,18 @@ VOID SAVEDS RAF2(_DeleteAddrAllocMessage,
 #define ORD_WriteAccess_NG	1
 #define RDNT_Integer_NG		0
 #define RDNF_ReadOnly_NG	(1 << 0)
+/*
+ * OUR OWN marker for "this one is auto-tuned", kept OUT of rdn_Flags.
+ *
+ * These were once published as RDNF_ReadOnly, and that broke every script that
+ * sets them: PiStorm/Emu68 pushes buffer sizes from SYS:PiStorm/RoadshowParameters
+ * with `roadshowcontrol SET`, got EPERM, and gave up before bringing the network
+ * up at all. Refusing was the wrong answer -- the stack sizes these from this
+ * machine's RAM and link speed, so the RIGHT answer is to take the request, keep
+ * the tuned value, and SAY SO, which leaves the caller informed and the script
+ * running. See _ChangeRoadshowData().
+ */
+#define NG_RSD_AUTOTUNED	(1 << 8)
 
 struct RoadshowDataNode {
   struct MinNode rdn_MinNode;
@@ -2919,24 +3205,80 @@ struct RoadshowDataNode {
 };
 
 /* Live stack tunables (defined across the BSD core). */
+extern int icmp_process_echo, icmp_process_tstamp;	/* netinet/ip_icmp.c */
 extern int    ipforwarding, ipsendredirects, subnetsarelocal, tcp_mssdflt, tcp_iw, udpcksum;
 extern int    tcp_do_sack, tcp_do_rfc3042;
+extern int    ip_defttl, icmpmaskrepl, tcp_do_rfc1323, tcp_do_rfc1323_tstmp;
+extern int    ng_netctl_grace_secs;			/* kern/amiga_netctl.c */
 extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 
+/*
+ * PORT (AmiTCP_NG): READ-ONLY means "the stack works this out for itself".
+ *
+ * The socket buffer sizes come from ng_ram_tier() (installed RAM) and are then
+ * re-derived per interface from the link speed; timestamps come from
+ * ng_cpu_tune() (on for 68020+, off for a bare 68000, because the per-segment
+ * cost is not worth it there). Those are not opinions a user should have to
+ * hold: a value carried over from another stack's sizing model, or picked to
+ * suit a different machine, is usually worse than what we compute here.
+ *
+ * They stay VISIBLE -- reading back what the stack actually chose is genuinely
+ * useful, and is how you check the tiering did what you expected -- but
+ * ChangeRoadshowData() refuses to write them (EPERM). AmiTCP.config keeps
+ * TCP_SENDSPACE=/TCP_RECVSPACE= as a documented expert override for anyone who
+ * really does know better; the point of the read-only flag is that the ordinary
+ * discoverable surface steers away from breaking a good default by accident.
+ *
+ * Options Roadshow documents but this stack has no variable for (tcp.rttdflt,
+ * tcp.random, if.*, bpf.bufsize, ...) are simply ABSENT rather than faked:
+ * ChangeRoadshowData() then reports ENOENT, which is the honest answer.
+ * tcp.do_rfc1323 is likewise absent -- we have no single master flag, only the
+ * two independent halves below, and inventing an alias that silently wrote both
+ * would misrepresent what the stack does.
+ */
 struct ng_rsd_opt { const char *name; UWORD flags; void *data; };
 static const struct ng_rsd_opt ng_rsd_opts[] = {
+  /*
+   * Names Roadshow publishes that we can honestly back. Roadshow lists 21 options
+   * and a script may ask for any of them by name; one it cannot find is another way
+   * for it to give up. Only options with a real variable behind them are added --
+   * publishing a knob that controls nothing would be worse than not having it.
+   *
+   * Still absent, for want of anything to point at: tcp.rttdflt, tcp.random,
+   * tcp.use_mssdflt_for_remote, bpf.bufsize, task.controller.priority.
+   */
+  /*
+   * OURS, not one of Roadshow's names -- how many seconds applications get to close
+   * their sockets after NetShutdown breaks them, before the stack goes down anyway.
+   * Publishing an extra name costs a script nothing (it asks for the ones it knows)
+   * and this is the only way to lengthen the grace: the shutdown protocol has no
+   * field for the caller's patience, so the stack cannot be told. See
+   * kern/amiga_netctl.c for why the DEFAULT must stay at 4 -- raising it past a
+   * caller's timeout makes that caller cancel a shutdown that was about to work.
+   */
+  { "net.shutdown_grace", 0, &ng_netctl_grace_secs },
+  { "icmp.maskrepl",      0, &icmpmaskrepl        },
+  { "icmp.processecho",   0, &icmp_process_echo   },
+  { "icmp.procesststamp", 0, &icmp_process_tstamp },
+  /* Roadshow exposes the RFC 1323 master switch as well as the window-scale name
+   * below; both drive the same setting here. */
+  { "tcp.do_rfc1323",     0, &tcp_do_rfc1323      },
+  { "ip.defttl",          0, &ip_defttl       },
   { "ip.forwarding",      0, &ipforwarding    },
   { "ip.sendredirects",   0, &ipsendredirects },
   { "ip.subnetsarelocal", 0, &subnetsarelocal },
-  { "tcp.mssdflt",        0, &tcp_mssdflt     },
+  { "tcp.do_win_scale",   0, &tcp_do_rfc1323  },
   { "tcp.iw",             0, &tcp_iw          },
-  { "tcp.sack",           0, &tcp_do_sack     },
+  { "tcp.mssdflt",        0, &tcp_mssdflt     },
   { "tcp.rfc3042",        0, &tcp_do_rfc3042  },
-  { "tcp.recvspace",      0, &tcp_recvspace   },
-  { "tcp.sendspace",      0, &tcp_sendspace   },
+  { "tcp.sack",           0, &tcp_do_sack     },
   { "udp.cksum",          0, &udpcksum        },
-  { "udp.recvspace",      0, &udp_recvspace   },
-  { "udp.sendspace",      0, &udp_sendspace   },
+  /* Auto-tuned -- readable, not writable. See the note above. */
+  { "tcp.do_timestamps",  NG_RSD_AUTOTUNED, &tcp_do_rfc1323_tstmp },
+  { "tcp.recvspace",      NG_RSD_AUTOTUNED, &tcp_recvspace        },
+  { "tcp.sendspace",      NG_RSD_AUTOTUNED, &tcp_sendspace        },
+  { "udp.recvspace",      NG_RSD_AUTOTUNED, &udp_recvspace        },
+  { "udp.sendspace",      NG_RSD_AUTOTUNED, &udp_sendspace        },
 };
 #define NG_RSD_COUNT (sizeof(ng_rsd_opts) / sizeof(ng_rsd_opts[0]))
 
@@ -2967,6 +3309,7 @@ struct List * SAVEDS RAF2(_ObtainRoadshowData,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   struct ng_rsd_handle *h;
   struct List *l;
@@ -2991,7 +3334,9 @@ struct List * SAVEDS RAF2(_ObtainRoadshowData,
     struct RoadshowDataNode *n = &h->rh_Nodes[i];
     struct Node *nd = (struct Node *)&n->rdn_MinNode;
     n->rdn_Name   = (STRPTR)ng_rsd_opts[i].name;
-    n->rdn_Flags  = ng_rsd_opts[i].flags;
+    /* Publish only real Roadshow flags; NG_RSD_AUTOTUNED is ours and private,
+     * so no caller is told the option cannot be set. */
+    n->rdn_Flags  = (UWORD)(ng_rsd_opts[i].flags & ~NG_RSD_AUTOTUNED);
     n->rdn_Type   = RDNT_Integer_NG;
     n->rdn_Length = 4;
     n->rdn_Data   = ng_rsd_opts[i].data;
@@ -3010,6 +3355,10 @@ VOID SAVEDS RAF2(_ReleaseRoadshowData,
 #if 0
 {
 #endif
+  /* Deliberately NOT gated on a dead base: this frees memory the CALLER
+   * owns and touches no stack state. Returning early here would leak that
+   * buffer on every call through an abandoned base -- a fault that does not
+   * exist today. Do the work regardless of what happened to the stack. */
   NG_ENSURE_STACK();
   (void)libPtr;
   if (list != NULL)
@@ -3026,6 +3375,7 @@ BOOL SAVEDS RAF5(_ChangeRoadshowData,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(FALSE);
   NG_ENSURE_STACK();
   struct ng_rsd_handle *h = (struct ng_rsd_handle *)list;
   struct RoadshowDataNode *n = NULL;
@@ -3049,9 +3399,21 @@ BOOL SAVEDS RAF5(_ChangeRoadshowData,
     writeErrnoValue(libPtr, ENOENT);		/* no such option */
     return (FALSE);
   }
-  if (n->rdn_Flags & RDNF_ReadOnly_NG) {
-    writeErrnoValue(libPtr, EPERM);
-    return (FALSE);
+  /*
+   * Auto-tuned option: ACCEPT the request, do NOT apply it, and say so.
+   *
+   * Returning an error here is what stopped PiStorm/Emu68's Network.rexx dead --
+   * it sets the socket buffer sizes from RoadshowParameters and bails out on a
+   * failure, so the machine never came online at all. Nor do we want the value:
+   * it is sized from this machine's RAM and link speed, and a number carried over
+   * from another machine is worse. So the caller gets success and carries on, and
+   * the user is told plainly why the number they asked for is not the one in use.
+   */
+  if (ng_rsd_opts[i].flags & NG_RSD_AUTOTUNED) {
+    log(LOG_NOTICE, "%s is tuned automatically from this machine's RAM and link "
+	"speed; the requested value was not applied (currently %ld).\n",
+	(char *)n->rdn_Name, (long)*(LONG *)n->rdn_Data);
+    return (TRUE);
   }
   if (length != n->rdn_Length) {
     writeErrnoValue(libPtr, ENOSPC);		/* wrong size for this option */
@@ -3108,6 +3470,7 @@ struct mbuf * SAVEDS RAF1(_mbuf_get,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   return (m_get(NG_M_DONTWAIT, NG_MT_DATA));
@@ -3119,6 +3482,7 @@ struct mbuf * SAVEDS RAF1(_mbuf_gethdr,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   return (m_gethdr(NG_M_DONTWAIT, NG_MT_DATA));
@@ -3131,6 +3495,7 @@ struct mbuf * SAVEDS RAF2(_mbuf_free,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   /*
@@ -3161,6 +3526,7 @@ VOID SAVEDS RAF2(_mbuf_freem,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD();
   NG_ENSURE_STACK();
   (void)libPtr;
   if (m_valid(m))		/* see mbuf_free above */
@@ -3175,6 +3541,7 @@ struct mbuf * SAVEDS RAF3(_mbuf_prepend,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above for m_valid(). len is bounded inside m_prepend(): an
@@ -3192,6 +3559,7 @@ struct mbuf * SAVEDS RAF3(_mbuf_pullup,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above. A negative len is not rejected here: m_pullup()'s own
@@ -3211,6 +3579,7 @@ struct mbuf * SAVEDS RAF4(_mbuf_copym,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(NULL);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above. m_copym() rejects a negative off/len itself. */
@@ -3227,6 +3596,7 @@ LONG SAVEDS RAF3(_mbuf_adj,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above. An over-large len can no longer drive pkthdr.len
@@ -3245,6 +3615,7 @@ LONG SAVEDS RAF3(_mbuf_cat,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above -- BOTH chains are caller-supplied, and m_cat() frees
@@ -3266,6 +3637,7 @@ LONG SAVEDS RAF5(_mbuf_copyback,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above. m_copyback() rejects a negative off/len itself. */
@@ -3285,6 +3657,7 @@ LONG SAVEDS RAF5(_mbuf_copydata,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD(-1);
   NG_ENSURE_STACK();
   (void)libPtr;
   /* see mbuf_free above. m_copydata() rejects a negative off/len itself. */
@@ -3316,6 +3689,114 @@ LONG SAVEDS RAF5(_mbuf_copydata,
 #include <dos/dostags.h>
 #include <dos/dosextens.h>
 #include <proto/dos.h>	/* CreateNewProcTags(), Delay() -- see amiga_main.c/amiga_log.c */
+
+/*
+ * PORT (AmiTCP_NG): apply saved tunables from ENV: at startup.
+ *
+ * AmiTCPControl SAVE writes ENVARC:AmiTCP_NG/<group>/<name> (dots become
+ * slashes), mirroring how Roadshow persists its own; a booted system copies
+ * ENVARC: into ENV:, which is what we read here.
+ *
+ * PRECEDENCE. This runs AFTER ng_ram_tier()/ng_cpu_tune() and BEFORE
+ * readconfig(), which puts it exactly where it belongs:
+ *
+ *   built-in default  <  RAM/CPU auto-tune  <  ENV:  <  AmiTCP.config  <  live SET
+ *
+ * so a saved setting beats the computed default, and an explicit line in
+ * AmiTCP.config still beats the saved setting. The config file is the thing a
+ * user can read, so it wins over invisible state.
+ *
+ * Read-only (auto-tuned) options are skipped here for the same reason
+ * AmiTCPControl refuses to set them: a socket buffer size saved on another
+ * machine, or under another stack's sizing model, is worse than what this
+ * machine works out for itself. Being settable through the back door would
+ * defeat the point of marking them read-only at the front.
+ *
+ * Nothing is logged from here -- log_init() has not run yet. What was applied
+ * is recorded and reported later; see ng_env_report().
+ */
+static TEXT  ng_env_applied[160];
+static ULONG ng_env_count;
+
+void
+ng_apply_env_tunables(void)
+{
+  ULONG i;
+
+  ng_env_applied[0] = '\0';
+  ng_env_count = 0;
+
+  for (i = 0; i < NG_RSD_COUNT; i++) {
+    TEXT name[96], val[32];
+    LONG v = 0;
+    int  j, k, neg = 0, digits = 0;
+
+    if (ng_rsd_opts[i].flags & NG_RSD_AUTOTUNED)
+      continue;				/* auto-tuned: never taken from ENV */
+
+    /* "AmiTCP_NG/" + option name with '.' -> '/' */
+    for (j = 0; "AmiTCP_NG/"[j] != '\0'; j++)
+      name[j] = "AmiTCP_NG/"[j];
+    for (k = 0; ng_rsd_opts[i].name[k] != '\0' && j < (int)sizeof(name) - 1; k++, j++)
+      name[j] = (ng_rsd_opts[i].name[k] == '.') ? '/' : ng_rsd_opts[i].name[k];
+    name[j] = '\0';
+
+    if (GetVar((STRPTR)name, (STRPTR)val, sizeof(val) - 1, GVF_GLOBAL_ONLY) <= 0)
+      continue;				/* not set -- leave the default alone */
+
+    k = 0;
+    while (val[k] == ' ' || val[k] == '\t') k++;
+    if (val[k] == '-') { neg = 1; k++; }
+    while (val[k] >= '0' && val[k] <= '9') {
+      LONG digit = val[k++] - '0';
+      /* Bounded: a hand-edited or corrupted ENVARC: file with a long digit
+       * string would otherwise wrap silently and apply a value nobody chose. */
+      if (v > (2147483647L - digit) / 10) { digits = 0; break; }
+      v = v * 10 + digit;
+      digits++;
+    }
+    if (!digits)
+      continue;				/* not a number -- ignore, do not guess */
+    if (neg) v = -v;
+
+    *(LONG *)ng_rsd_opts[i].data = v;
+
+    /* Remember the name for the startup report (bounded, oldest wins). */
+    {
+      ULONG l = 0;
+      int   namelen = 0;
+
+      while (ng_env_applied[l] != '\0') l++;
+      while (ng_rsd_opts[i].name[namelen] != '\0') namelen++;
+      /*
+       * Measure the NAME we are about to append. This used to test the
+       * leftover digit-parsing cursor `k`, which had nothing to do with the
+       * name's length -- harmless, because the copy loop below has its own
+       * correct bound, but it meant the "is there room?" question was being
+       * asked about the wrong string.
+       */
+      if (l + 2 + (ULONG)namelen < sizeof(ng_env_applied) - 1) {
+	int c;
+	if (l) { ng_env_applied[l++] = ','; ng_env_applied[l++] = ' '; }
+	for (c = 0; ng_rsd_opts[i].name[c] != '\0' &&
+		    l < sizeof(ng_env_applied) - 1; c++)
+	  ng_env_applied[l++] = ng_rsd_opts[i].name[c];
+	ng_env_applied[l] = '\0';
+      }
+    }
+    ng_env_count++;
+  }
+}
+
+/* Called once logging is up (see amiga_main.c). Silent when nothing was set. */
+void
+ng_env_report(void)
+{
+  if (ng_env_count > 0)
+    log(LOG_NOTICE, "config: %lu setting%s applied from ENV: -- %s",
+	ng_env_count, (ng_env_count == 1) ? "" : "s", ng_env_applied);
+}
+
 
 /* AddressAllocationMessage result codes / protocols (libraries/bsdsocket.h). */
 #define AAMR_Success		0
@@ -3376,6 +3857,14 @@ struct ng_dhcp_ctx {
   struct ng_aam *		dc_aam;
   struct Task *			dc_parent;	/* signalled when helper has ctx */
   volatile LONG			dc_abort;
+  /*
+   * Set when the stack started this exchange itself, rather than an application
+   * calling BeginInterfaceConfig. There is no caller waiting on a reply port, so
+   * the helper must dispose of the message instead of replying to it -- see the
+   * reply: label in ng_dhcp_task(). Used when a device comes back online and its
+   * interface has to acquire a lease again.
+   */
+  UBYTE				dc_internal;
 };
 
 /* Socket-level constants the helper needs (public bsdsocket.library values). */
@@ -3390,21 +3879,49 @@ struct ng_dhcp_ctx {
 static long d_socket(struct Library *sb, long d, long t, long p) {
   register long _d0 __asm("d0")=d; register long _d1 __asm("d1")=t;
   register long _d2 __asm("d2")=p; register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-30)":"=r"(_d0):"r"(_d0),"r"(_d1),"r"(_d2),"r"(_a6):"a0","a1","memory");
+  __asm__ __volatile__("jsr a6@(-30)"
+      :"+r"(_d0),"+r"(_d1)
+      :"r"(_d2),"r"(_a6):"a0","a1","memory");
   return _d0;
 }
 static long d_bind(struct Library *sb, long s, void *n, long l) {
   register long _d0 __asm("d0")=s; register void *_a0 __asm("a0")=n;
   register long _d1 __asm("d1")=l; register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-36)":"=r"(_d0):"r"(_d0),"r"(_a0),"r"(_d1),"r"(_a6):"a1","memory");
+  __asm__ __volatile__("jsr a6@(-36)"
+      :"+r"(_d0),"+r"(_a0),"+r"(_d1)
+      :"r"(_a6):"a1","memory");
   return _d0;
 }
+/*
+ * PORT (AmiTCP_NG): d0/d1/a0/a1 are IN-OUT ("+r"), not inputs.
+ *
+ * Those four registers are unconditionally scratch across an AmigaOS library
+ * call. Declaring one input-only tells gcc it survives the `jsr`, so the register
+ * allocator is free to park an unrelated live value there across the call -- and
+ * get back whatever the callee left. It is not a theoretical risk: `d_sendto` and
+ * `d_recvfrom` were the only two stubs in this file with NO register clobber at
+ * all, and they are the two called inside ng_dhcp_exchange()'s poll loop. At
+ * -m68040 -O2 the allocator took that freedom and the exchange stopped completing
+ * -- DISCOVER goes out, the OFFER comes back, and the reply is tested against a
+ * register the library has since overwritten, so nothing ever matches and the
+ * client falls back to a 169.254 link-local address.
+ *
+ * That is why every traced build "fixed" it: a trace call between the jsr and the
+ * comparison forces the value to be reloaded. A bug that disappears when you add
+ * logging is a codegen/register-allocation signature, not a race.
+ *
+ * d2/d3/a2 stay plain inputs deliberately -- those ARE callee-saved on this ABI,
+ * and marking them in-out would only cost a needless reload. a6 likewise: the
+ * library base is preserved by contract.
+ */
 static long d_sendto(struct Library *sb, long s, void *b, long l, long f, void *to, long tl) {
   register long _d0 __asm("d0")=s; register void *_a0 __asm("a0")=b;
   register long _d1 __asm("d1")=l; register long _d2 __asm("d2")=f;
   register void *_a1 __asm("a1")=to; register long _d3 __asm("d3")=tl;
   register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-60)":"=r"(_d0):"r"(_d0),"r"(_a0),"r"(_d1),"r"(_d2),"r"(_a1),"r"(_d3),"r"(_a6):"memory");
+  __asm__ __volatile__("jsr a6@(-60)"
+      :"+r"(_d0),"+r"(_a0),"+r"(_d1),"+r"(_a1)
+      :"r"(_d2),"r"(_d3),"r"(_a6):"memory");
   return _d0;
 }
 static long d_recvfrom(struct Library *sb, long s, void *b, long l, long f, void *a, void *al) {
@@ -3412,20 +3929,26 @@ static long d_recvfrom(struct Library *sb, long s, void *b, long l, long f, void
   register long _d1 __asm("d1")=l; register long _d2 __asm("d2")=f;
   register void *_a1 __asm("a1")=a; register void *_a2 __asm("a2")=al;
   register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-72)":"=r"(_d0):"r"(_d0),"r"(_a0),"r"(_d1),"r"(_d2),"r"(_a1),"r"(_a2),"r"(_a6):"memory");
+  __asm__ __volatile__("jsr a6@(-72)"
+      :"+r"(_d0),"+r"(_a0),"+r"(_d1),"+r"(_a1)
+      :"r"(_d2),"r"(_a2),"r"(_a6):"memory");
   return _d0;
 }
 static long d_setsockopt(struct Library *sb, long s, long lv, long on, void *v, long vl) {
   register long _d0 __asm("d0")=s; register long _d1 __asm("d1")=lv;
   register long _d2 __asm("d2")=on; register void *_a0 __asm("a0")=v;
   register long _d3 __asm("d3")=vl; register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-90)":"=r"(_d0):"r"(_d0),"r"(_d1),"r"(_d2),"r"(_a0),"r"(_d3),"r"(_a6):"a1","memory");
+  __asm__ __volatile__("jsr a6@(-90)"
+      :"+r"(_d0),"+r"(_d1),"+r"(_a0)
+      :"r"(_d2),"r"(_d3),"r"(_a6):"a1","memory");
   return _d0;
 }
 static long d_ioctl(struct Library *sb, long s, unsigned long r, void *a) {
   register long _d0 __asm("d0")=s; register unsigned long _d1 __asm("d1")=r;
   register void *_a0 __asm("a0")=a; register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-114)":"=r"(_d0):"r"(_d0),"r"(_d1),"r"(_a0),"r"(_a6):"a1","memory");
+  __asm__ __volatile__("jsr a6@(-114)"
+      :"+r"(_d0),"+r"(_d1),"+r"(_a0)
+      :"r"(_a6):"a1","memory");
   return _d0;
 }
 static void d_closesocket(struct Library *sb, long s) {
@@ -3437,6 +3960,10 @@ static long d_configiface(struct Library *sb, void *name, void *tags) {  /* Conf
   register void *_a1 __asm("a1")=tags; register struct Library *_a6 __asm("a6")=sb;
   __asm__ __volatile__("jsr a6@(-450)":"=r"(_d0),"+r"(_a0),"+r"(_a1):"r"(_a6):"d1","memory");
   return _d0;
+}
+static void d_setdomain(struct Library *sb, void *name) {  /* SetDefaultDomainName -708 */
+  register void *_a0 __asm("a0")=name; register struct Library *_a6 __asm("a6")=sb;
+  __asm__ __volatile__("jsr a6@(-708)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
 }
 static long d_addroute(struct Library *sb, void *tags) {  /* AddRouteTagList -414 */
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=tags;
@@ -3471,12 +3998,6 @@ static void ng_del_discover_route(struct Library *sb) {
   rtags[1].ti_Tag = RTA_Gateway;         rtags[1].ti_Data = (ULONG)"0.0.0.0";
   rtags[2].ti_Tag = 0;
   (void)d_delroute(sb, rtags);
-}
-static long d_adddns(struct Library *sb, void *addrstr) {  /* AddDomainNameServer -516 */
-  register long _d0 __asm("d0"); register void *_a0 __asm("a0")=addrstr;
-  register struct Library *_a6 __asm("a6")=sb;
-  __asm__ __volatile__("jsr a6@(-516)":"=r"(_d0),"+r"(_a0):"r"(_a6):"d1","a1","memory");
-  return _d0;
 }
 static long d_queryiface(struct Library *sb, void *name, void *tags) {  /* QueryInterfaceTagList -468 */
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=name;
@@ -3563,37 +4084,6 @@ static void ng_ip2str(ULONG a, char *buf)
   }
 }
 
-#ifdef NG_DHCP_DEBUG
-/* TEMP DIAGNOSTIC (build with -DNG_DHCP_DEBUG): append "<label> <decimal>\n" to
- * SYS:dhcp.log so the DORA exchange can be traced on real hardware. The helper is a
- * Process (it uses Delay(), so DOS is available) -- direct file I/O is safe here. */
-static void d_dbg(const char *label, long v)
-{
-  BPTR f = Open((STRPTR)"SYS:dhcp.log", MODE_READWRITE);
-  if (f) {
-    char b[16]; int n = 0; unsigned long u; int neg = 0;
-    long len = 0; while (label[len]) len++;
-    Seek(f, 0, OFFSET_END);
-    Write(f, (APTR)label, len);
-    Write(f, (APTR)" ", 1);
-    if (v < 0) { neg = 1; u = (unsigned long)(-v); } else u = (unsigned long)v;
-    { char t[12]; int k = 0;
-      if (u == 0) t[k++] = '0';
-      while (u) { t[k++] = '0' + (int)(u % 10); u /= 10; }
-      if (neg) b[n++] = '-';
-      while (k) b[n++] = t[--k]; }
-    b[n++] = '\n';
-    Write(f, (APTR)b, n);
-    Close(f);
-  }
-}
-#define D_LOG(label, v) d_dbg((label), (long)(v))
-#else
-/* ((void)0), not empty: an empty expansion turns `if (x) D_LOG(...)` into
- * `if (x);` -- which compiles, warns under -Wextra, and is the classic shape of
- * a real bug hiding in plain sight. */
-#define D_LOG(label, v)	((void)0)
-#endif
 
 /* --- RFC 3927 IPv4 link-local (ZeroConf) acquisition --- */
 #define LL_NET_BASE      0xA9FE0000UL	/* 169.254.0.0, network == host order on 68k */
@@ -3705,7 +4195,7 @@ ng_linklocal_acquire(struct Library *sb, const char *ifname,
 
 /* What a won lease carries (all network byte order, 0 = absent). */
 #define NG_DHCP_MAXDNS 3	/* DNS servers captured from a DHCP DHO_DNS option */
-struct ng_lease { ULONG addr, serverid, mask, router, dns[NG_DHCP_MAXDNS], lease; char domain[128]; };
+struct ng_lease { ULONG addr, serverid, mask, router, dns[NG_DHCP_MAXDNS], lease; char domain[128]; char hostname[128]; };
 
 /*
  * Run one DISCOVER/OFFER/REQUEST/ACK exchange on the already-bound socket s,
@@ -3721,13 +4211,14 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
 		 long deadline, struct ng_dhcp_ctx *ctx, struct ng_lease *L)
 {
   struct ng_sain to;
-  long i, r, sent, msgtype;
+  long i, r, msgtype;
 
   ng_sain_set(&to, 0xFFFFFFFFUL, DHCP_SERVER_PORT);
   L->addr = L->serverid = L->mask = L->router = L->lease = 0;
   L->domain[0] = 0;
+  L->hostname[0] = 0;
   bzero((caddr_t)L->dns, sizeof(L->dns));
-  sent = 0; msgtype = DHCPDISCOVER;
+  msgtype = DHCPDISCOVER;
   for (i = 0; i < deadline; i++) {
     if (ctx->dc_abort) return NG_DHCP_ABORT;
     if ((i % 20) == 0) {			/* (re)transmit every ~4s */
@@ -3747,12 +4238,11 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
         o = dhcp_put(o, DHO_REQUESTED_ADDR, 4, &L->addr);
         o = dhcp_put(o, DHO_SERVER_ID, 4, &L->serverid);
       }
-      { UBYTE prl[4]; prl[0]=DHO_SUBNET_MASK; prl[1]=DHO_ROUTERS; prl[2]=DHO_DNS; prl[3]=DHO_DOMAIN;
-        o = dhcp_put(o, DHO_PARAM_REQ, 4, prl); }
+      { UBYTE prl[5]; prl[0]=DHO_SUBNET_MASK; prl[1]=DHO_ROUTERS; prl[2]=DHO_DNS; prl[3]=DHO_DOMAIN;
+        prl[4]=DHO_HOSTNAME;
+        o = dhcp_put(o, DHO_PARAM_REQ, 5, prl); }
       *o++ = DHO_END;
       r = d_sendto(sb, s, tx, sizeof(*tx), 0, &to, sizeof(to));
-      D_LOG((msgtype == DHCPDISCOVER) ? "tx_discover_r" : "tx_request_r", r);
-      sent++;
     }
     /* Clear rx before every receive: it is reused across the whole DORA
      * exchange and every background retry, so anything a previous (possibly
@@ -3765,7 +4255,6 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
      * validation and is what this client uses -- do not "fix" this to a
      * source-address check. */
     r = d_recvfrom(sb, s, rx, sizeof(*rx), 0, (void*)0, (void*)0);
-    if (r >= 0) D_LOG("rx_r", r);
     if (r >= 240 && rx->xid == xid && rx->op == BOOTREPLY) {
       UBYTE *mt = dhcp_find(rx, (int)r, DHO_MSG_TYPE, (int*)0);
       int t = mt ? *mt : 0;
@@ -3800,13 +4289,49 @@ ng_dhcp_exchange(struct Library *sb, long s, struct dhcp_pkt *tx,
           bcopy((caddr_t)op, (caddr_t)L->domain, k);
           L->domain[k] = 0;
         }
+        /* DHO_HOSTNAME (option 12): the name the server has for us. Bounded the
+         * same way as the domain above -- dhcp_find has already clamped `ol` to
+         * the packet, and we clamp again to the field.
+         *
+         * KEPT WHOLE. This used to chop the name at the first dot, on the reasoning
+         * that a host name store holds a host name and the search domain arrives
+         * separately in DHO_DOMAIN. The effect was that a server handing out
+         * "a3000.intra.sm41.de" left gethostname() answering "a3000", where other
+         * stacks -- AmiTCP 4.6's DHCP client among them -- report the fully
+         * qualified name. Throwing away information the server sent us is not this
+         * layer's decision to make; a caller that wants only the first label can
+         * still take it, and one that wants the whole name now can have it. */
+        if ((op = dhcp_find(rx, (int)r, DHO_HOSTNAME, &ol)) && ol > 0) {
+          int k = (ol < (int)sizeof(L->hostname) - 1) ? ol : (int)sizeof(L->hostname) - 1;
+          bcopy((caddr_t)op, (caddr_t)L->hostname, k);
+          L->hostname[k] = 0;
+        }
+        /*
+         * Say what the server actually sent. Until this existed, "the domain is
+         * wrong" could not be told apart from "the server never sent one" from
+         * anywhere on the machine -- no tool reported the stack's domain, so an
+         * empty answer was read as absence when it only meant nobody was asking.
+         *
+         * Two lines, not one. Each of these fields can be 127 characters on its
+         * own, so a single combined line could reach ~290 -- past the smallest
+         * log buffer the stack ever runs with (log_cnf.log_buf_len is RAM-tiered
+         * in kern/amiga_main.c: 256 bytes on the leanest tier, 512 above it).
+         * Split, each line is at most ~158 and always fits. Losing the tail of a
+         * diagnostic is how a diagnostic starts lying.
+         *
+         * NB the old flat 127-character cut is long fixed -- do not "restore" that
+         * number here; it describes behaviour this stack no longer has.
+         */
+        log(LOG_NOTICE, "dhcp: host-name (option 12) %s",
+            L->hostname[0] ? L->hostname : (char *)"not sent by the server");
+        log(LOG_NOTICE, "dhcp: domain-name (option 15) %s",
+            L->domain[0] ? L->domain : (char *)"not sent by the server");
         return NG_DHCP_GOT;
       }
       if (msgtype == DHCPREQUEST && t == DHCPNAK) { msgtype = DHCPDISCOVER; L->addr = 0; i = -1; continue; }
     }
     Delay(10);					/* ~0.2s */
   }
-  D_LOG("timeout_sent", sent);
   return NG_DHCP_TIMEOUT;
 }
 
@@ -3844,12 +4369,64 @@ ng_apply_lease(struct Library *sb, const char *ifname, const struct ng_lease *L)
    * server every time (and however many the server hands out). Statically
    * configured servers (from the config file, nsn_Dynamic == 0) are preserved.
    */
-  ng_flush_dynamic_nameservers();
+  /* This lease REPLACES the servers this interface previously provided -- not
+   * everybody's. Then attribute the new ones to it, so that taking this interface
+   * offline later withdraws exactly these and leaves other interfaces' alone. */
+  ng_flush_dynamic_nameservers_for(ifname);
+  /* Install this lease's servers OWNED BY THIS INTERFACE, one configure call per
+   * server. Going through the interface-configuration path rather than the bare
+   * AddDomainNameServer vector is what records the owner. */
   { int di;
+    struct TagItem dt[2];
+    char dbuf[16];
     for (di = 0; di < NG_DHCP_MAXDNS; di++)
-      if (L->dns[di]) { ng_ip2str(L->dns[di], dnsstr); (void)d_adddns(sb, dnsstr); } }
+      if (L->dns[di]) {
+	ng_ip2str(L->dns[di], dbuf);
+	dt[0].ti_Tag = NGCT_NameServer; dt[0].ti_Data = (ULONG)dbuf;
+	dt[1].ti_Tag = 0;              dt[1].ti_Data = 0;
+	(void)d_configiface(sb, (void *)ifname, dt);
+      } }
+  (void)dnsstr;				/* no longer used for adding */
+  /* A DHCP interface owns the default route and the name servers its lease gave
+   * it, so both are withdrawn when the device goes offline. Declared here rather
+   * than left to the caller: the lease is what created them. */
+  { struct ifnet *ifp; spl_t sp = splimp();
+    if ((ifp = ifunit((char *)ifname)) != NULL && ifp->if_type == IFT_SANA) {
+      ((struct sana_softc *)ifp)->ss_assoc_route = 1;
+      ((struct sana_softc *)ifp)->ss_assoc_dns   = 1;
+    }
+    splx(sp); }
+  /*
+   * Remember that this interface is DHCP-configured, so that when its device goes
+   * offline and comes back the stack acquires a lease again instead of returning
+   * an unnumbered, routeless interface. Recorded LAST: applying the lease above
+   * goes through ConfigureInterfaceTagList, which records the static values, and
+   * for a DHCP interface this flag is the one that matters.
+   */
   return 0;
 }
+
+
+/*
+ * A stack-initiated reconfigure has finished for this interface, so another one
+ * may start. Cleared at the very END of the helper, not when it replies: after a
+ * link-local fallback the helper keeps running, retrying DHCP in the background,
+ * and starting a second client alongside it is exactly what this prevents.
+ */
+void
+ng_iface_reconfig_done(const char *ifname)
+{
+  struct ifnet *ifp;
+  spl_t s;
+
+  if (ifname == NULL)
+    return;
+  s = splimp();
+  if ((ifp = ifunit((char *)ifname)) != NULL && ifp->if_type == IFT_SANA)
+    ((struct sana_softc *)ifp)->ss_reconfiguring = 0;
+  splx(s);
+}
+
 
 /* TRUE only if the interface is still Up AND still carries `addr` (network
  * order). Used to detect the operator reconfiguring the interface out from
@@ -3929,11 +4506,22 @@ ng_dhcp_background(struct Library *sb, long s, struct dhcp_pkt *tx,
 				(long)LL_RETRY_DORA * 5, ctx, &L);
       ng_del_discover_route(sb);	/* DISCOVER window closed: unpin the limited broadcast */
       if (rc == NG_DHCP_GOT) {
-	D_LOG("bg_dhcp_ok", L.addr & 0xffff);
 	(void)ng_apply_lease(sb, ifname, &L);	/* upgraded to a real lease -- done */
-	/* Fill the search domain from this late lease IFF none is set (so we never
-	 * clobber an explicit domain=). See ng_set_default_domain_if_empty. */
-	if (L.domain[0]) ng_set_default_domain_if_empty(L.domain);
+	/*
+	 * The lease's search domain WINS, exactly as it does for an on-time lease.
+	 *
+	 * This used to fill it in only if nothing was set, so as not to clobber an
+	 * explicit domain=. That was right when domain= outranked DHCP; it is wrong
+	 * now that the lease does, and it made the rule true only for servers that
+	 * answered promptly -- the same config resolving differently depending on
+	 * how long the DHCP server took to appear.
+	 *
+	 * This is not a renewal re-pointing a running machine's resolver, which
+	 * would be a different question: it is the FIRST real configuration this
+	 * interface has had, arriving late after a spell on link-local. Nothing
+	 * else in the renewal path touches the domain at all.
+	 */
+	if (L.domain[0]) ng_set_default_domain(L.domain);
 	return;
       }
     }
@@ -3963,6 +4551,28 @@ ng_dhcp_background(struct Library *sb, long s, struct dhcp_pkt *tx,
  * build this ships with, where SAVEDS expands to nothing -- removed so it does
  * not become a live bug if the SASC path is ever revived. log_task() in
  * kern/amiga_log.c, spawned the same way, already omits it. */
+/*
+ * Detach an AddressAllocationMessage from AbortInterfaceConfig and dispose of it.
+ *
+ * ONE routine because there are TWO exits that finish an exchange -- the normal
+ * reply: label and the RFC 3927 link-local fallback, which replies early and then
+ * keeps running in the background -- and they must not disagree. They did: the
+ * link-local path replied unconditionally, so a stack-initiated exchange (no
+ * caller, mn_ReplyPort NULL) that fell back to link-local did ReplyMsg() through a
+ * NULL port and leaked the message. With no MMU that is a write through address 0.
+ */
+static void
+ng_dhcp_finish_aam(struct ng_dhcp_ctx *ctx, struct ng_aam *aam)
+{
+  Forbid();
+  aam->aam_Reserved = 0;		/* detach: Abort can no longer reach us */
+  if (ctx->dc_internal)
+    FreeVec(aam);			/* nobody is waiting; FreeVec does not block */
+  else
+    ReplyMsg((struct Message *)aam);
+  Permit();
+}
+
 static void ng_dhcp_task(void)
 {
   struct Process *me = (struct Process *)FindTask(NULL);
@@ -3977,15 +4587,37 @@ static void ng_dhcp_task(void)
   struct ng_sain from;
   struct TagItem qtags[3], ctags[4], rtags[3];
 
-  Signal(ctx->dc_parent, SIGBREAKF_CTRL_F);	/* parent may release the spawn lock */
+  /* Tell the caller we have the context, so it can release the spawn lock. NOT on
+   * the internal path: there the "parent" is the network task, which must never be
+   * signalled or blocked by us -- it is the task that moves the packets this
+   * exchange depends on, and CTRL_F means other things elsewhere in the stack. */
+  if (!ctx->dc_internal)
+    Signal(ctx->dc_parent, SIGBREAKF_CTRL_F);
   aam = ctx->dc_aam;
+
+  /*
+   * THE NAME FIRST, before anything that can fail.
+   *
+   * cleanup: releases the reconfigure interlock with ng_iface_reconfig_done(ifname)
+   * on the internal path, and every `goto reply` below lands there. Copying the
+   * name after the OpenLibrary() check meant a failed open -- entirely possible on
+   * a memory-tight machine -- reached that call with ifname still holding whatever
+   * was on the stack. Its only guard is `ifname == NULL`, which a stack address
+   * always passes, so it would call ifunit() on garbage: the interface that needed
+   * the flag cleared never gets it (locked out of reconfiguring until reboot,
+   * silently), and if those bytes happened to spell a live interface's name --
+   * quite possible in reused Process stack memory -- it clears the WRONG one.
+   *
+   * It only depends on aam, which is valid here, so there is no reason for it to
+   * be anywhere else.
+   */
+  for (i = 0; i < 15 && aam->aam_InterfaceName[i]; i++) ifname[i] = aam->aam_InterfaceName[i];
+  ifname[i] = 0;
 
   sb = OpenLibrary((STRPTR)"bsdsocket.library", 3L);
   if (sb == NULL) { aam->aam_Result = AAMR_NoMemory; goto reply; }
 
   if (aam->aam_Version < 1 || aam->aam_Version > 2) { aam->aam_Result = AAMR_VersionUnknown; goto reply; }
-  for (i = 0; i < 15 && aam->aam_InterfaceName[i]; i++) ifname[i] = aam->aam_InterfaceName[i];
-  ifname[i] = 0;
 
   tx = AllocVec(sizeof(*tx), MEMF_PUBLIC | MEMF_CLEAR);
   rx = AllocVec(sizeof(*rx), MEMF_PUBLIC | MEMF_CLEAR);
@@ -3997,26 +4629,31 @@ static void ng_dhcp_task(void)
   qtags[1].ti_Tag = 0;
   if (d_queryiface(sb, ifname, qtags) != 0) { aam->aam_Result = AAMR_InterfaceNotKnown; goto reply; }
   for (i = 0; i < 6; i++) mac[i] = macbuf[i];
-  D_LOG("start_mac", ((long)mac[0]<<8)|mac[5]);   /* first+last MAC byte, non-zero => got a MAC */
 
   /* Bring the interface up, unnumbered (0.0.0.0), so we can broadcast. */
   ctags[0].ti_Tag = IFC_Address; ctags[0].ti_Data = (ULONG)"0.0.0.0";
   ctags[1].ti_Tag = IFC_State;   ctags[1].ti_Data = IFC_State_Up;
   ctags[2].ti_Tag = 0;
-  (void)d_configiface(sb, ifname, ctags);	/* best effort; may already be up */
+  /* Best effort: the interface may already be up, and a failure here is not fatal --
+   * the DISCOVER below is what actually decides whether this works. */
+  (void)d_configiface(sb, ifname, ctags);
 
   s = d_socket(sb, NG_AF_INET, NG_SOCK_DGRAM, 0);
   if (s < 0) { aam->aam_Result = AAMR_NoMemory; goto reply; }
-  d_setsockopt(sb, s, NG_SOL_SOCKET, NG_SO_BROADCAST, &one, sizeof(one));
+  { long br = d_setsockopt(sb, s, NG_SOL_SOCKET, NG_SO_BROADCAST, &one, sizeof(one));
+    (void)br; }
   ng_sain_set(&from, 0, DHCP_CLIENT_PORT);
-  if (d_bind(sb, s, &from, sizeof(from)) < 0) { aam->aam_Result = AAMR_AddrChangeFailed; goto reply; }
-  d_ioctl(sb, s, NG_FIONBIO, &one);		/* non-blocking AFTER bind (as udptest) */
+  if (d_bind(sb, s, &from, sizeof(from)) < 0) {
+    aam->aam_Result = AAMR_AddrChangeFailed; goto reply;
+  }
+  d_ioctl(sb, s, NG_FIONBIO, &one);
   /* Route the limited broadcast (255.255.255.255) out this interface. Gateway
    * 0.0.0.0 == the unnumbered interface itself, i.e. a link route. */
   rtags[0].ti_Tag = RTA_DestinationHost; rtags[0].ti_Data = (ULONG)"255.255.255.255";
   rtags[1].ti_Tag = RTA_Gateway;         rtags[1].ti_Data = (ULONG)"0.0.0.0";
   rtags[2].ti_Tag = 0;
-  (void)d_addroute(sb, rtags);
+  { long rr = d_addroute(sb, rtags);
+    (void)rr; }
 
   xid = (ULONG)ctx ^ 0x414d4954UL;		/* 'AMIT' ^ ctx -- unique enough */
   deadline = (long)aam->aam_Timeout; if (deadline < 10) deadline = 10;
@@ -4027,15 +4664,134 @@ static void ng_dhcp_task(void)
     struct ng_lease L;
     int rc = ng_dhcp_exchange(sb, s, tx, rx, mac, xid, deadline, ctx, &L);
     ng_del_discover_route(sb);	/* DISCOVER window closed: unpin the limited broadcast */
+    /* The initial exchange is over either way, so the timing-critical window has
+     * passed -- get what we have onto disk before anything else can wedge. */
     if (rc == NG_DHCP_ABORT) { aam->aam_Result = AAMR_Aborted; goto reply; }
     if (rc == NG_DHCP_GOT) {
       if (ng_apply_lease(sb, ifname, &L) != 0) { aam->aam_Result = AAMR_AddrChangeFailed; goto reply; }
-      /* Install the DHCP search domain -- INITIAL config only, so a later
-       * background renewal/upgrade (ng_dhcp_background) never re-sets it and
-       * clobbers an explicit domain=. This runs before we ReplyMsg, so the tool
-       * applies any explicit domain= AFTER us: priority explicit > DHCP >
-       * hostname-derived (the last being res_search's fallback). */
+      /*
+       * Install the DHCP search domain. THE LEASE WINS: a server handing out a
+       * domain is authoritative for the network just joined, the same rule the
+       * host name below has always followed. An explicit domain= is the FALLBACK
+       * and is applied BEFORE the exchange (by the tool, and by the reconfigure
+       * helper), so it stands only when the server offers nothing.
+       *
+       * Priority: DHCP > explicit domain= > hostname-derived (res_search's own).
+       *
+       * INITIAL configuration only, like the host name: a background renewal must
+       * not silently re-point a running machine's resolver.
+       */
       if (L.domain[0]) ng_set_default_domain(L.domain);
+      /*
+       * PORT (AmiTCP_NG): a host name from DHCP SUPERSEDES HOSTNAME= in
+       * AmiTCP.config. The config value is the fallback -- what a statically
+       * addressed machine uses, and what we keep when the server offers nothing.
+       * A server that hands out names is authoritative for this network, and
+       * leaving the machine calling itself whatever the config file happened to
+       * say defeats the point of asking. Validated with the same rule the config
+       * path uses, so a malformed option is ignored rather than stored.
+       *
+       * Applied on the INITIAL configuration only, like the search domain above:
+       * a background renewal must not silently rename a running machine.
+       */
+      {
+        extern int ng_hostname_valid(const char *s, int len);
+        extern int sethostname(const char *name, size_t namelen);
+        extern char host_name[];
+        extern size_t host_namelen;
+        /* Sized from the host-name limit, not from literals. If `fq` cannot hold a
+         * full-length joined name the join fails ng_hostname_valid() and degrades
+         * to the bare name -- which looks exactly like the join never happening,
+         * the very symptom this code was written to cure. `base` sources from
+         * host_name, so it must be able to hold all of it. */
+        char base[NG_MAXHOSTNAME + 1];
+        char fq[NG_MAXHOSTNAME + 1];
+        int  hl = 0, dotted = 0, i2, from_dhcp;
+
+        /*
+         * PICK THE BASE NAME FIRST, THEN QUALIFY IT. There are two independent
+         * inputs and either may be absent:
+         *
+         *   option 12 (host-name)   -> L.hostname, authoritative, supersedes HOSTNAME=
+         *   option 15 (domain-name) -> L.domain,   already installed just above
+         *
+         * This whole block used to sit inside `if (L.hostname[0])`, so a server
+         * that sends a domain but NO host name -- a common, entirely normal
+         * configuration -- left the machine calling itself the bare HOSTNAME= from
+         * the config for ever, with a perfectly good domain sitting unused right
+         * beside it. The domain was set, the name was never qualified, and the two
+         * facts were impossible to tell apart from outside.
+         */
+        from_dhcp = (L.hostname[0] != 0);
+        if (from_dhcp) {
+          while (L.hostname[hl] && hl < (int)sizeof(base) - 1) { base[hl] = L.hostname[hl]; hl++; }
+        } else {
+          /*
+           * No option 12: fall back to the name we already hold, which is
+           * HOSTNAME= from AmiTCP.config. Copied under Forbid() because host_name
+           * is process-global and a concurrent sethostname() from another task
+           * would otherwise let us read it half-rewritten.
+           *
+           * BOUND BY host_namelen, NOT by sizeof(base). This is deliberate even
+           * though the two buffers are now the SAME size (both NG_MAXHOSTNAME+1):
+           * the right bound for a copy is how many bytes the source actually
+           * holds, never how many the destination could take. Sizing them alike
+           * is a coincidence of today's constants, not a guarantee -- and with no
+           * MMU, a bound that is only correct by coincidence is one edit away from
+           * reading off the end of a global. Taking the authoritative length under
+           * the same Forbid() -- as _gethostname() also does -- removes the
+           * question instead of answering it.
+           * (sizeof(host_name) is not available here: it is an extern of
+           * incomplete type, so sizeof on it will not compile.)
+           *
+           * The host_name[hl] test is belt and braces only: every sethostname()
+           * caller passes strlen(name), so host_namelen always IS the length.
+           */
+          Forbid();
+          {
+            int cl = (int)host_namelen;
+            if (cl > (int)sizeof(base) - 1)
+              cl = (int)sizeof(base) - 1;
+            while (hl < cl && host_name[hl]) { base[hl] = host_name[hl]; hl++; }
+          }
+          Permit();
+        }
+        base[hl] = 0;
+        for (i2 = 0; i2 < hl; i2++)
+          if (base[i2] == '.') { dotted = 1; break; }
+
+        /*
+         * Report a fully qualified name where we can, which is what other stacks do
+         * and what programs asking gethostname() for "who am I on this network"
+         * expect. In order:
+         *
+         *   1. no name at all anywhere    -> leave whatever is there
+         *   2. already qualified          -> use it as it stands
+         *   3. bare name AND a domain     -> join them (whichever the name came from)
+         *   4. bare name and no domain    -> nothing to qualify it with
+         *
+         * If the joined name will not validate -- too long for MAXHOSTNAMELEN, or a
+         * malformed domain -- fall back to the bare name rather than setting nothing.
+         * A short name beats no name.
+         */
+        if (hl == 0) {
+          /* nothing to name ourselves with */
+        } else if (!dotted && L.domain[0]) {
+          int k2 = 0;
+          for (i2 = 0; base[i2] && k2 < (int)sizeof(fq) - 2; i2++)      fq[k2++] = base[i2];
+          fq[k2++] = '.';
+          for (i2 = 0; L.domain[i2] && k2 < (int)sizeof(fq) - 1; i2++)  fq[k2++] = L.domain[i2];
+          fq[k2] = 0;
+          if (ng_hostname_valid(fq, k2))
+            sethostname(fq, (size_t)k2);
+          else if (from_dhcp && ng_hostname_valid(base, hl))
+            sethostname(base, (size_t)hl);
+        } else if (from_dhcp && ng_hostname_valid(base, hl)) {
+          /* Only worth storing when it came from the server -- if it came from the
+           * config it is already the name we hold, and re-setting it is a no-op. */
+          sethostname(base, (size_t)hl);
+        }
+      }
       aam->aam_Address = L.addr;
       aam->aam_ServerAddress = L.serverid;
       aam->aam_SubnetMask = L.mask;
@@ -4068,7 +4824,6 @@ static void ng_dhcp_task(void)
   {
     ULONG llad = 0;
     if (ng_linklocal_acquire(sb, ifname, mac, ctx, &llad)) {
-      D_LOG("linklocal_ok", llad & 0xffff);
       aam->aam_Address = llad;
       aam->aam_ServerAddress = 0;		/* self-assigned, no server */
       aam->aam_SubnetMask = 0xFFFF0000UL;	/* 255.255.0.0 */
@@ -4082,10 +4837,7 @@ static void ng_dhcp_task(void)
       /* The interface is up on link-local; tell the caller now, then keep
        * running to retry DHCP in the background and upgrade if a server
        * appears. Detach first so AbortInterfaceConfig can no longer reach us. */
-      Forbid();
-      aam->aam_Reserved = 0;
-      ReplyMsg((struct Message *)aam);
-      Permit();
+      ng_dhcp_finish_aam(ctx, aam);
       ng_dhcp_background(sb, s, tx, rx, ifname, mac, llad, ctx);
       goto cleanup;
     }
@@ -4093,16 +4845,319 @@ static void ng_dhcp_task(void)
   aam->aam_Result = ctx->dc_abort ? AAMR_Aborted : AAMR_Timeout;
 
 reply:
-  Forbid();
-  aam->aam_Reserved = 0;			/* detach: Abort can no longer reach us */
-  ReplyMsg((struct Message *)aam);
-  Permit();
+  ng_dhcp_finish_aam(ctx, aam);
 cleanup:
+  if (ctx->dc_internal)
+    ng_iface_reconfig_done(ifname);	/* another reconfigure may start now */
   if (s >= 0) d_closesocket(sb, s);
   if (tx) FreeVec(tx);
   if (rx) FreeVec(rx);
   if (sb) CloseLibrary(sb);
   FreeVec(ctx);
+}
+
+/* Context handed to the reconfigure helper. The helper frees it. */
+struct ng_reconf_ctx {
+  char rc_ifname[IFNAMSIZ + 8];
+};
+
+static void ng_reconfig_task(void);
+static int  ng_reconfig_start_dhcp(const char *ifname);
+
+/*
+ * PORT (AmiTCP_NG): configure an interface again after its device came back online.
+ *
+ * Called by sana_poll() (net/if_sana.c) in the network task, once per interface
+ * whose driver reported S2EVENT_ONLINE. Going offline scrubbed the address, the
+ * routes and the dynamic name servers, so "online" alone leaves an interface that
+ * is running but unnumbered; the Roadshow SDK describes SM_Online as performing
+ * "the other necessary configuration operations", and this is them.
+ *
+ * THIS IS THE ONLY WAY AN INTERFACE COMES BACK. Online/Offline talk to the driver
+ * with S2_ONLINE/S2_OFFLINE and never open bsdsocket.library, so an operator
+ * cycling a link arrives here exactly as a replugged cable does. It is the normal
+ * recovery path, not a rare corner case.
+ *
+ * It used to restore from a small snapshot the stack kept of what it had last been
+ * told -- address, mask, default gateway -- which answered the wrong question. A
+ * config file may also name extra routes, static name servers and a search domain,
+ * and none of those were remembered, so an interface came back QUIETLY HALF
+ * CONFIGURED: most visibly, with its name servers gone. A snapshot is also a "keep
+ * it warm just in case" that has to be maintained in step with everything that can
+ * ever change an interface.
+ *
+ * So the stack reads the file, exactly as the tool does at boot, and an interface
+ * is either fully up or fully down. There is nothing left to keep in step.
+ *
+ * The read must NOT happen here. This is the network task; DOS blocks; and the
+ * network task is what moves the packets the configuration itself depends on. All
+ * this does is confirm the interface is real, mark it reconfiguring, and hand the
+ * work to a helper Process -- the shape BeginInterfaceConfig() has always used.
+ */
+void
+ng_reconfigure_interface(const char *ifname)
+{
+  struct ifnet *ifp;
+  struct ng_reconf_ctx *ctx;
+  struct Process *proc;
+  spl_t s;
+  int i;
+
+  if (ifname == NULL || ifname[0] == '\0')
+    return;
+
+  /* Does it still exist? It may be removed the instant we drop splimp(), which is
+   * why everything below works from the NAME and never from the softc. */
+  s = splimp();
+  if ((ifp = ifunit((char *)ifname)) == NULL || ifp->if_type != IFT_SANA) {
+    splx(s);
+    return;
+  }
+  ((struct sana_softc *)ifp)->ss_reconfiguring = 1;
+  splx(s);
+
+  ctx = AllocVec(sizeof(*ctx), MEMF_PUBLIC | MEMF_CLEAR);
+  if (ctx == NULL) {
+    log(LOG_ERR, "%s: back online but there was no memory to reconfigure it", ifname);
+    ng_iface_reconfig_done(ifname);	/* or nothing will ever try again */
+    return;
+  }
+  for (i = 0; i < (int)sizeof(ctx->rc_ifname) - 1 && ifname[i]; i++)
+    ctx->rc_ifname[i] = ifname[i];
+  ctx->rc_ifname[i] = '\0';
+
+  /*
+   * Under Forbid(), exactly as BeginInterfaceConfig() does it: the helper reads its
+   * context out of tc_UserData as its first act, so it must not be allowed to run
+   * until that field is set. Omitting this made a helper dereference whatever
+   * tc_UserData happened to hold -- with no MMU, that wedged the machine the moment
+   * a device came back online.
+   */
+  Forbid();
+  proc = CreateNewProcTags(NP_Entry, (LONG)&ng_reconfig_task,
+			   NP_Name, (LONG)"AmiTCP_NG reconfig",
+			   NP_Priority, 0,
+			   NP_StackSize, 8192,
+			   TAG_DONE, 0);
+  if (proc != NULL)
+    proc->pr_Task.tc_UserData = (APTR)ctx;	/* safe: child is blocked by Forbid */
+  Permit();
+
+  if (proc == NULL) {
+    FreeVec(ctx);
+    log(LOG_ERR, "%s: back online but the reconfigure helper could not be started",
+	ifname);
+    ng_iface_reconfig_done(ifname);
+    return;
+  }
+
+  /* No handshake, no Wait(): this is the network task. The helper owns ctx outright
+   * from the moment it runs, and nothing here touches it again. */
+}
+
+/*
+ * Start a DHCP exchange for an interface that has just come back, using the same
+ * internal helper a device-initiated online has always used.
+ *
+ * Deliberately NOT through CreateAddrAllocMessage()/BeginInterfaceConfig(): those
+ * spawn a helper of their own and expect a caller blocked on a reply port, so
+ * going that way would nest a second Process and park this one on a port for the
+ * whole lease timeout, to reach code we can call directly.
+ *
+ * Returns 1 if the helper was started (it then owns the reconfigure interlock and
+ * clears it in its own cleanup), 0 if it could not be.
+ */
+static int
+ng_reconfig_start_dhcp(const char *ifname)
+{
+  struct ng_aam      *aam;
+  struct ng_dhcp_ctx *ctx;
+  struct Process     *proc;
+  int i;
+
+  /* A message of our own. Every optional table stays NULL: the helper only writes
+   * through those pointers when they are non-NULL, and there is no application
+   * caller here to report a lease back to. */
+  aam = AllocVec(sizeof(*aam), MEMF_PUBLIC | MEMF_CLEAR);
+  if (aam == NULL)
+    return 0;
+  ctx = AllocVec(sizeof(*ctx), MEMF_PUBLIC | MEMF_CLEAR);
+  if (ctx == NULL) { FreeVec(aam); return 0; }
+
+  aam->aam_Message.mn_Node.ln_Type = NT_MESSAGE;
+  aam->aam_Message.mn_Length       = sizeof(*aam);
+  aam->aam_Message.mn_ReplyPort    = NULL;	/* nobody is waiting; see dc_internal */
+  aam->aam_Version                 = AAM_VERSION_NG;
+  aam->aam_Protocol                = AAMP_DHCP;
+  for (i = 0; i < 15 && ifname[i]; i++)
+    aam->aam_InterfaceName[i] = ifname[i];
+  aam->aam_InterfaceName[i] = '\0';
+  aam->aam_Timeout                 = 30;	/* seconds; the helper floors this */
+
+  ctx->dc_aam      = aam;
+  ctx->dc_parent   = FindTask(NULL);
+  ctx->dc_internal = 1;				/* clears ss_reconfiguring on cleanup */
+
+  Forbid();
+  proc = CreateNewProcTags(NP_Entry, (LONG)&ng_dhcp_task,
+			   NP_Name, (LONG)"AmiTCP_NG DHCP",
+			   NP_Priority, 0,
+			   NP_StackSize, 8192,
+			   TAG_DONE, 0);
+  if (proc != NULL)
+    proc->pr_Task.tc_UserData = (APTR)ctx;	/* safe: child is blocked by Forbid */
+  Permit();
+
+  if (proc == NULL) {
+    FreeVec(ctx);
+    FreeVec(aam);
+    log(LOG_ERR, "%s: back online but the DHCP helper could not be started", ifname);
+    return 0;
+  }
+  log(LOG_NOTICE, "%s: device back online, requesting an address", ifname);
+  return 1;
+}
+
+/*
+ * The reconfigure helper Process: read this interface's config file and put the
+ * interface back the way that file says it should be.
+ *
+ * EVERY EXIT MUST RELEASE THE INTERLOCK. sana_reconfig_poll() will not start
+ * another reconfigure while ss_reconfiguring is set -- which is what stops a
+ * flapping device stacking helpers -- so any path that returns without clearing it
+ * leaves the interface unable to respond to a later online event, or to the
+ * operator's Online, until the machine is rebooted. Silently. The single exception
+ * is the DHCP hand-off, where ng_dhcp_task takes the flag over and clears it in its
+ * own cleanup; that is why the hand-off is the last thing this function does.
+ */
+static void
+ng_reconfig_task(void)
+{
+  struct Process *me = (struct Process *)FindTask(NULL);
+  struct ng_reconf_ctx *rc = (struct ng_reconf_ctx *)me->pr_Task.tc_UserData;
+  struct ng_ifcfg cfg;
+  struct Library *sb;
+  char ifname[IFNAMSIZ + 8];
+  int  i;
+
+  if (rc == NULL)
+    return;
+  for (i = 0; i < (int)sizeof(ifname) - 1 && rc->rc_ifname[i]; i++)
+    ifname[i] = rc->rc_ifname[i];
+  ifname[i] = '\0';
+  FreeVec(rc);
+
+  if (!ng_ifcfg_find(ifname, &cfg)) {
+    /*
+     * Nothing to bring it up from. Leave it exactly as offline left it --
+     * registered, unnumbered, routeless -- rather than half configure it from
+     * memory. Fully up or fully down, and this is down. Fixing the file and
+     * cycling the link arrives back here.
+     */
+    log(LOG_ERR, "%s: back online, but no configuration was found in "
+	"DEVS:NetInterfaces or SYS:Storage/NetInterfaces -- leaving it down", ifname);
+    ng_iface_reconfig_done(ifname);
+    return;
+  }
+
+  /*
+   * Open our own library base and drive the PUBLIC vectors from here on.
+   *
+   * The internal appliers (ng_apply_iface_config, ng_route_op) document that the
+   * caller holds the syscall semaphore, and this helper is a separate Process that
+   * holds nothing. The old code called them straight because it ran ON the network
+   * task, inside the stack, where opening a library would have re-entered the
+   * lazy-start path; that reasoning does not survive the move into a Process. Going
+   * through the vectors takes the semaphore properly and makes this branch match
+   * the DHCP one, which has always opened its own base.
+   */
+  sb = OpenLibrary((STRPTR)"bsdsocket.library", 3L);
+  if (sb == NULL) {
+    log(LOG_ERR, "%s: back online but bsdsocket.library could not be opened to "
+	"reconfigure it", ifname);
+    ng_iface_reconfig_done(ifname);
+    return;
+  }
+
+  /*
+   * The search domain first, and on BOTH paths -- as the FALLBACK.
+   *
+   * Applied before the DHCP exchange precisely so a lease can supersede it: a
+   * server handing out a domain is authoritative for the network just rejoined,
+   * the same rule the host name follows. If the server offers none, this is what
+   * the machine keeps. Priority: DHCP > explicit domain= > hostname-derived.
+   *
+   * This is also the only place domain= is read on this path at all -- the lease
+   * applier cannot see the config file.
+   */
+  if (cfg.domain[0])
+    d_setdomain(sb, cfg.domain);
+
+  if (cfg.dhcp) {
+    /*
+     * A NEW lease, never the old address. The device may have been offline for a
+     * minute or for months and the stack cannot tell, so the old address says
+     * nothing about the network being rejoined -- it may be a different network
+     * entirely.
+     */
+    CloseLibrary(sb);			/* the DHCP helper opens its own */
+    if (!ng_reconfig_start_dhcp(ifname))
+      ng_iface_reconfig_done(ifname);	/* spawn failed: release the interlock */
+    return;				/* on success the helper owns the flag */
+  }
+
+  /* --- static --------------------------------------------------------------- */
+  if (cfg.have_address && cfg.address[0]) {
+    struct TagItem ctags[5];
+    int n = 0;
+
+    /* Mask BEFORE address: in_ifinit() keys the connected route with whatever mask
+     * is in force when the address lands, and a later mask change does not re-key
+     * it -- leaving a route that teardown cannot find by its own key. */
+    if (cfg.netmask[0]) {
+      ctags[n].ti_Tag = IFC_NetMask; ctags[n].ti_Data = (ULONG)cfg.netmask; n++;
+    }
+    ctags[n].ti_Tag = IFC_Address;   ctags[n].ti_Data = (ULONG)cfg.address; n++;
+    if (cfg.mtu > 0) {
+      ctags[n].ti_Tag = IFC_MTU;     ctags[n].ti_Data = (ULONG)cfg.mtu; n++;
+    }
+    ctags[n].ti_Tag = IFC_State;     ctags[n].ti_Data = IFC_State_Up; n++;
+    ctags[n].ti_Tag = 0;             ctags[n].ti_Data = 0;
+
+    if (d_configiface(sb, ifname, ctags) != 0) {
+      log(LOG_ERR, "%s: back online but its address could not be restored", ifname);
+      CloseLibrary(sb);
+      ng_iface_reconfig_done(ifname);
+      return;
+    }
+  }
+
+  if (cfg.gateway[0]) {
+    struct TagItem rt[2];
+    rt[0].ti_Tag = RTA_DefaultGateway; rt[0].ti_Data = (ULONG)cfg.gateway;
+    rt[1].ti_Tag = 0;                  rt[1].ti_Data = 0;
+    if (d_addroute(sb, rt) != 0)
+      log(LOG_NOTICE, "%s: its default route could not be restored", ifname);
+  }
+
+  /*
+   * Name servers, ATTRIBUTED to this interface. Through the configuration path
+   * rather than the bare AddDomainNameServer vector, which deliberately records no
+   * owner: a server added that way is never withdrawn when this interface goes
+   * away again. Going through here is what makes the withdrawal on the next
+   * offline match what was installed on this online.
+   */
+  for (i = 0; i < cfg.nns; i++) {
+    struct TagItem dt[2];
+    dt[0].ti_Tag = NGCT_NameServer; dt[0].ti_Data = (ULONG)cfg.ns[i];
+    dt[1].ti_Tag = 0;               dt[1].ti_Data = 0;
+    if (d_configiface(sb, ifname, dt) != 0)
+      log(LOG_NOTICE, "%s: name server %s could not be restored", ifname, cfg.ns[i]);
+  }
+
+  log(LOG_NOTICE, "%s: device back online, reconfigured from its config file", ifname);
+  CloseLibrary(sb);
+  ng_iface_reconfig_done(ifname);
 }
 
 /* BeginInterfaceConfig (LVO -486): kick off the async exchange. */
@@ -4112,11 +5167,31 @@ VOID SAVEDS RAF2(_BeginInterfaceConfig,
 #if 0
 {
 #endif
+  /*
+   * DEAD BASE FIRST, before NG_ENSURE_STACK(), exactly as the other gated vectors
+   * do it -- a call through a base the operator killed must not lazily start a
+   * brand new stack. NG_ENSURE_STACK() carries its own sbDead guard too, so the
+   * order is not load-bearing today; it is written this way so this function does
+   * not quietly depend on that second guard still being there.
+   *
+   * It cannot use the plain macro. The caller is BLOCKED on this message's reply
+   * port -- that is the whole protocol -- so returning without replying wedges it
+   * for ever, a worse failure than the one being prevented. Reply as the
+   * out-of-memory path below does, and do it before the helper is spawned: that
+   * helper opens a FRESH base, whose sbDead is naturally FALSE, and would start a
+   * whole new stack one call removed from the base just refused.
+   */
+  if (libPtr != NULL && libPtr->sbDead && aam != NULL) {
+    writeErrnoValue(libPtr, ENETDOWN);
+    aam->aam_Result = AAMR_InterfaceNotKnown;   /* no AAMR_* means "stack is gone" */
+    ReplyMsg((struct Message *)aam);
+    return;
+  }
+
   NG_ENSURE_STACK();
   struct ng_dhcp_ctx *ctx;
   struct Process *proc;
 
-  (void)libPtr;
   if (aam == NULL)
     return;
 
@@ -4160,6 +5235,7 @@ VOID SAVEDS RAF2(_AbortInterfaceConfig,
 #if 0
 {
 #endif
+  NG_CHECK_DEAD();
   NG_ENSURE_STACK();
   (void)libPtr;
   if (aam == NULL)

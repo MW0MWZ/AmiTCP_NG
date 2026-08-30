@@ -600,7 +600,9 @@ static UBYTE err_hostname[] = "invalid host name\n";
  * name -- what gethostname() hands to applications -- well-formed rather than
  * whatever text happened to follow HOSTNAME= in the config file.
  */
-static int
+/* Not static: the DHCP client applies a server-supplied host name and must
+ * screen it with exactly this rule, so the two paths cannot drift apart. */
+int
 ng_hostname_valid(const char *s, int len)
 {
   int i, label;

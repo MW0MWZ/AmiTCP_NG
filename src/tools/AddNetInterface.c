@@ -45,6 +45,8 @@
 #include <dos/dos.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
+#include "ng_waitaam.h"
+#include <net/ng_ifconfig.h>
 
 struct Library *SocketBase;
 
@@ -54,6 +56,12 @@ struct Library *SocketBase;
 #define IFC_NetMask             (TU + 1802)
 #define IFC_MTU                 (TU + 1806)
 #define IFC_State               (TU + 1808)
+/* Declare that this interface owns its default route / its name servers, so they
+ * are withdrawn when its device goes offline. Values from the Roadshow SDK
+ * header. Without these the stack leaves them alone -- which is right for routes
+ * somebody else configured, and wrong for the ones we are about to add below. */
+#define IFC_AssociatedRoute     (TU + 1812)
+#define IFC_AssociatedDNS       (TU + 1813)
 /* AmiTCP_NG-private creation tags for the SANA-II read/write request-pool sizes
  * (iprequests=/writerequests=) and the TCP socket-buffer overrides
  * (tcp.sendspace=/tcp.recvspace=). MUST match the defs in src/api/amiga_roadshow_compat.c. */
@@ -62,6 +70,7 @@ struct Library *SocketBase;
 #define NGCT_TcpSendspace       (TU + 0x004E4703UL)
 #define NGCT_TcpRecvspace       (TU + 0x004E4704UL)
 #define NGCT_TcpMssdflt         (TU + 0x004E4705UL)
+#define NGCT_LinkSpeed          (TU + 0x004E4706UL)
 #define SM_Up                   3
 #define RTA_DefaultGateway      (TU + 1603)
 #define CAAMTA_RouterTableSize  (TU + 2006)
@@ -97,6 +106,12 @@ static long v_addroute(void *tags) {                                       /* Ad
   __asm__ __volatile__("jsr a6@(-414)":"=r"(_d0),"+r"(_a0):"r"(_a6):"d1","a1","memory");
   return _d0;
 }
+static long v_configiface(void *nm, void *tags) {                          /* ConfigureInterfaceTagList -450 */
+  register long _d0 __asm("d0"); register void *_a0 __asm("a0")=nm;
+  register void *_a1 __asm("a1")=tags; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-450)":"=r"(_d0),"+r"(_a0),"+r"(_a1):"r"(_a6):"d1","memory");
+  return _d0;
+}
 static long v_adddns(void *addr) {                                         /* AddDomainNameServer -516 */
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=addr;
   register struct Library *_a6 __asm("a6")=SocketBase;
@@ -113,6 +128,14 @@ static long v_createaam(long ver, long proto, const char *ifn, void **res, void 
   register void *_a2 __asm("a2")=tags; register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-474)":"+r"(_d0),"+r"(_d1),"+r"(_a0),"+r"(_a1):"r"(_a2),"r"(_a6):"memory");
   return _d0;
+}
+/* The counterpart to v_createaam(), and it must be called: the library makes ONE
+ * AllocVec covering the message and all its result buffers and never frees it
+ * itself, and AllocVec memory is not reclaimed when a process exits -- so a
+ * missed delete is lost until reboot, once per DHCP bring-up. */
+static void v_deleteaam(void *aam) {                                       /* DeleteAddrAllocMessage -480 */
+  register void *_a0 __asm("a0")=aam; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-480)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
 }
 static void v_begincfg(void *aam) {                                        /* BeginInterfaceConfig -486 */
   register void *_a0 __asm("a0")=aam; register struct Library *_a6 __asm("a6")=SocketBase;
@@ -137,119 +160,26 @@ struct AAMX {
 };
 
 /* ---- tiny helpers (avoid dragging in stdio) -------------------------------- */
-#define MAXNS 6
-#define VALLEN 64
 #define LINELEN 256
 
-static int  ci_eq(const char *a, const char *b) {           /* ASCII case-insensitive equal */
-  for (; *a && *b; a++, b++) {
-    int ca = *a, cb = *b;
-    if (ca >= 'A' && ca <= 'Z') ca += 32;
-    if (cb >= 'A' && cb <= 'Z') cb += 32;
-    if (ca != cb) return 0;
-  }
-  return *a == *b;
-}
 static void s_copy(char *d, const char *s, int max) {        /* bounded strcpy */
   int i = 0;
   while (s[i] && i < max - 1) { d[i] = s[i]; i++; }
   d[i] = '\0';
 }
 
-/* Parsed interface configuration. */
-struct ifcfg {
-  char device[VALLEN];
-  long unit;
-  int  dhcp;                 /* configure=dhcp */
-  int  have_address;
-  char address[VALLEN];
-  char netmask[VALLEN];
-  char gateway[VALLEN];
-  char domain[VALLEN];
-  char ns[MAXNS][VALLEN];
-  int  nns;
-  int  initdelay;
-  long ipreq;                /* iprequests=    (0 = use the stack's RAM-tiered default) */
-  long wreq;                 /* writerequests= (0 = use the stack's RAM-tiered default) */
-  long mtu;                  /* mtu=           (0 = use the device's reported MTU)      */
-  long sendspace;            /* tcp.sendspace= (0 = use the stack's RAM-tiered default) */
-  long recvspace;            /* tcp.recvspace= (0 = use the stack's RAM-tiered default) */
-  long mssdflt;              /* tcp.mssdflt=   (0 = auto: interface MTU - 40)           */
-};
+/*
+ * The interface-config parser now lives in net/ng_ifconfig.c and is LINKED INTO
+ * BOTH this tool and the library. It used to be here, private to the tool, which
+ * was fine while the tool was the only thing that read the file -- the stack now
+ * reads it too, on a device-initiated online, and one format with two parsers is
+ * one format with two behaviours waiting to happen.
+ */
+#define ifcfg  ng_ifcfg
+#define MAXNS  NG_IFCFG_MAXNS
+#define VALLEN NG_IFCFG_VALLEN
+#define read_cfg(path, cfg) ng_ifcfg_read_path((path), (cfg))
 
-/* Parse a non-negative decimal from val, stopping at the first non-digit. */
-static long ng_atol(const char *val)
-{
-  long v = 0; int n;
-  for (n = 0; val[n] >= '0' && val[n] <= '9'; n++) v = v * 10 + (val[n] - '0');
-  return v;
-}
-
-/* Parse one keyword=value (or "keyword value") line into cfg. */
-static void parse_line(char *line, struct ifcfg *cfg)
-{
-  char *p = line, *kw, *val;
-  int   n;
-
-  while (*p == ' ' || *p == '\t') p++;
-  if (*p == '#' || *p == ';' || *p == '\0' || *p == '\n' || *p == '\r')
-    return;                                  /* blank / comment */
-
-  kw = p;
-  while (*p && *p != '=' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
-    p++;
-  if (*p) { *p = '\0'; p++; }
-  while (*p == '=' || *p == ' ' || *p == '\t') p++;      /* skip separator(s) */
-
-  val = p;
-  while (*p && *p != '#' && *p != ';' && *p != '\n' && *p != '\r') p++;
-  while (p > val && (p[-1] == ' ' || p[-1] == '\t')) p--; /* rstrip */
-  *p = '\0';
-
-  if      (ci_eq(kw, "device"))    s_copy(cfg->device, val, VALLEN);
-  else if (ci_eq(kw, "unit"))      { cfg->unit = 0; for (n=0; val[n] >= '0' && val[n] <= '9'; n++) cfg->unit = cfg->unit*10 + (val[n]-'0'); }
-  else if (ci_eq(kw, "configure")) cfg->dhcp = ci_eq(val, "dhcp");
-  else if (ci_eq(kw, "address"))   { s_copy(cfg->address, val, VALLEN); cfg->have_address = 1; }
-  else if (ci_eq(kw, "netmask"))   s_copy(cfg->netmask, val, VALLEN);
-  else if (ci_eq(kw, "gateway"))   s_copy(cfg->gateway, val, VALLEN);
-  else if (ci_eq(kw, "domain"))    s_copy(cfg->domain, val, VALLEN);
-  else if (ci_eq(kw, "nameserver")){ if (cfg->nns < MAXNS) s_copy(cfg->ns[cfg->nns++], val, VALLEN); }
-  else if (ci_eq(kw, "requiresinitdelay")) cfg->initdelay = ci_eq(val, "yes");
-  /* Clamp to 65535: the stack stores these in a UWORD ring field, so an oversized
-   * value would otherwise silently wrap (e.g. 100000 -> 34464) with no diagnostic. */
-  else if (ci_eq(kw, "iprequests"))    { cfg->ipreq = 0; for (n=0; val[n] >= '0' && val[n] <= '9'; n++) cfg->ipreq = cfg->ipreq*10 + (val[n]-'0'); if (cfg->ipreq > 65535) cfg->ipreq = 65535; }
-  else if (ci_eq(kw, "writerequests")) { cfg->wreq  = 0; for (n=0; val[n] >= '0' && val[n] <= '9'; n++) cfg->wreq  = cfg->wreq*10 + (val[n]-'0'); if (cfg->wreq  > 65535) cfg->wreq  = 65535; }
-  /* mtu= (bytes): the stack stores if_mtu in a short and clamps to the device MTU, so
-   * cap at 32767 here to keep the value non-negative in the tag. */
-  else if (ci_eq(kw, "mtu"))           { cfg->mtu = ng_atol(val); if (cfg->mtu > 32767) cfg->mtu = 32767; }
-  /* tcp.sendspace= / tcp.recvspace= (bytes): override the RAM-tiered socket buffers.
-   * Cap at 1 MB -- far above any sensible 68k window and enough headroom to raise
-   * sb_max in the stack without risking an absurd allocation. */
-  else if (ci_eq(kw, "tcp.sendspace")) { cfg->sendspace = ng_atol(val); if (cfg->sendspace > 1048576) cfg->sendspace = 1048576; }
-  else if (ci_eq(kw, "tcp.recvspace")) { cfg->recvspace = ng_atol(val); if (cfg->recvspace > 1048576) cfg->recvspace = 1048576; }
-  /* tcp.mssdflt= (bytes): off-subnet MSS cap; 0 = auto (interface MTU - 40). Cap at
-   * 65535 -- t_maxseg is a u_short in the stack, so a larger value would truncate. */
-  else if (ci_eq(kw, "tcp.mssdflt"))   { cfg->mssdflt = ng_atol(val); if (cfg->mssdflt > 65535) cfg->mssdflt = 65535; }
-  /* unknown keywords are ignored (forward-compatible, like Roadshow) */
-}
-
-/* Read + parse a whole interface config file. Returns 1 on success. */
-static int read_cfg(const char *path, struct ifcfg *cfg)
-{
-  char  line[LINELEN];
-  BPTR  fh;
-
-  cfg->unit = 0; cfg->dhcp = 0; cfg->have_address = 0; cfg->nns = 0; cfg->initdelay = 0;
-  cfg->ipreq = 0; cfg->wreq = 0; cfg->mtu = 0; cfg->sendspace = 0; cfg->recvspace = 0; cfg->mssdflt = 0;
-  cfg->device[0] = cfg->address[0] = cfg->netmask[0] = cfg->gateway[0] = cfg->domain[0] = '\0';
-
-  fh = Open((STRPTR)path, MODE_OLDFILE);
-  if (!fh) return 0;
-  while (FGets(fh, (STRPTR)line, LINELEN))
-    parse_line(line, cfg);
-  Close(fh);
-  return cfg->device[0] != '\0';
-}
 
 /* Return a pointer to the file-name part of a path (after the last / or :). */
 static const char *file_part(const char *path)
@@ -291,7 +221,12 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
 {
   char  devpath[VALLEN];
   long  r, i;
-  struct TagItem ct[12];	/* creation tags: NGCT counts + MTU/buffers (+ static IFC_*) */
+  /* Creation tags. Worst case is the static path with every keyword present:
+   * 7 shared (iprequests, writerequests, tcp.sendspace, tcp.recvspace, tcp.mssdflt,
+   * mtu, bps) + 3 static (IFC_Address, IFC_NetMask, IFC_State) + TAG_END = 11.
+   * Sized with headroom because nothing here bounds-checks nc -- adding a keyword
+   * without growing this array would write past the end of a stack array. */
+  struct TagItem ct[16];
   int   nc = 0;
 
   /* Pass the driver name to the stack exactly as the config gives it. The stack
@@ -314,6 +249,7 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
   if (cfg->recvspace > 0) { ct[nc].ti_Tag = NGCT_TcpRecvspace; ct[nc].ti_Data = (ULONG)cfg->recvspace; nc++; }
   if (cfg->mssdflt   > 0) { ct[nc].ti_Tag = NGCT_TcpMssdflt;   ct[nc].ti_Data = (ULONG)cfg->mssdflt;   nc++; }
   if (cfg->mtu       > 0) { ct[nc].ti_Tag = IFC_MTU;           ct[nc].ti_Data = (ULONG)cfg->mtu;       nc++; }
+  if (cfg->bps       > 0) { ct[nc].ti_Tag = NGCT_LinkSpeed;    ct[nc].ti_Data = (ULONG)cfg->bps;       nc++; }
 
   if (cfg->dhcp) {
     /* --- DHCP: add the interface unaddressed, then let the stack lease one. --- */
@@ -338,9 +274,25 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
                           DeleteMsgPort(port); return r ? r : 20; }
     aam->aam_Timeout = (timeout > 0) ? timeout : 30;
 
+    /* The fallback, applied BEFORE the exchange so a DHCP-supplied domain can
+     * replace it. If the server offers none, this is what the machine keeps. */
+    if (cfg->domain[0]) v_setdomain(cfg->domain);
+
     if (!quiet) Printf((STRPTR)"%s: requesting an address via DHCP...\n", (LONG)ifname);
     v_begincfg(aam);
-    WaitPort(port);
+    /* Bounded. aam_Timeout is what the DHCP helper honours; this is the backstop for
+     * the helper never answering at all. Allow it a margin beyond its own deadline so
+     * a merely-slow lease is never cut short. */
+    if (!ng_wait_reply(port, (aam->aam_Timeout > 0 ? aam->aam_Timeout : 30) + 15)) {
+      if (!quiet)
+	Printf((STRPTR)"%s: the stack never answered the address request -- giving up.\n",
+	       (LONG)ifname);
+      /* The stack still owns aam, and may still reply to port. Neither may be freed:
+       * see ng_waitaam.h. Leaked deliberately -- but the port is neutralised first,
+       * because this process is about to exit and its Task will be recycled. */
+      ng_orphan_port(port);
+      return 20;
+    }
     (void)GetMsg(port);
 
     if (aam->aam_Result == 0 && aam->aam_Address != 0) {
@@ -349,15 +301,25 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
         Printf((STRPTR)"%s: up, address %ld.%ld.%ld.%ld (DHCP)\n", (LONG)ifname,
                (a>>24)&0xFF, (a>>16)&0xFF, (a>>8)&0xFF, a&0xFF);
       }
-      /* An explicit domain= in the config overrides the DHCP-supplied search
-       * domain (the library already applied that during BeginInterfaceConfig).
-       * Priority: explicit domain= > DHCP > hostname-derived. */
-      if (cfg->domain[0]) v_setdomain(cfg->domain);
+      /*
+       * The DHCP-supplied search domain WINS, so nothing is applied here.
+       *
+       * A server handing out a domain is authoritative for the network this
+       * machine has just joined, exactly as it is for the host name -- which has
+       * always superseded the config value. domain= used to override it, which
+       * made the two options disagree with each other for no reason a user could
+       * see. domain= is now the FALLBACK: it is applied before the exchange (see
+       * below), so it stands when the server offers nothing and is replaced when
+       * it does.
+       *
+       * Priority: DHCP > explicit domain= > hostname-derived (res_search's own).
+       */
       r = 0;
     } else {
       if (!quiet) Printf((STRPTR)"%s: DHCP failed (result %ld)\n", (LONG)ifname, aam->aam_Result);
       r = 20;
     }
+    v_deleteaam(aam);		/* see the stub -- not freeing this loses it until reboot */
     DeleteMsgPort(port);
     return r;
   } else {
@@ -374,6 +336,15 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
     r = add_iface(ifname, devpath, cfg->unit, (void *)ct, quiet);
     if (r != 0) { if (!quiet) Printf((STRPTR)"%s: AddInterface failed, errno %ld\n", (LONG)ifname, v_errno()); return r; }
     if (cfg->initdelay) Delay(150);
+
+    /* Claim what we are about to install, so an Offline later withdraws exactly
+     * these. Done before adding them: claiming the servers is also what attributes
+     * them to this interface. */
+    { struct TagItem ow[3]; int n = 0;
+      if (cfg->gateway[0]) { ow[n].ti_Tag = IFC_AssociatedRoute; ow[n].ti_Data = 1; n++; }
+      if (cfg->nns > 0)    { ow[n].ti_Tag = IFC_AssociatedDNS;   ow[n].ti_Data = 1; n++; }
+      if (n) { ow[n].ti_Tag = TAG_END; ow[n].ti_Data = 0;
+	       (void)v_configiface((void *)ifname, (void *)ow); } }
 
     if (cfg->gateway[0]) {
       struct TagItem rt[2];

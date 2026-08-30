@@ -1184,3 +1184,40 @@ ng_bpf_tap_ether(ifp, dst, src, ethertype, m)
 	hdr->m_next = NULL;			/* hand it back untouched */
 	(void)m_free(hdr);
 }
+
+/*
+ * Loopback tap. lo0 has no hardware and therefore no link-layer header, which is
+ * exactly what DLT_NULL means -- but DLT_NULL is not "no header at all": a
+ * reader still expects four bytes naming the address family the packet belongs
+ * to, and bpf_dlt_of() already reports DLT_NULL for IFT_LOOP. So we synthesise
+ * those four bytes here the same way ng_bpf_tap_ether() synthesises the fourteen
+ * Ethernet ones: build them in a borrowed temporary mbuf, chain the caller's
+ * payload behind it, tap, unchain, free only the header.
+ *
+ * `af` is written in host byte order. That is not an oversight -- DLT_NULL is
+ * defined as the capturing host's native order, and the reader works it out from
+ * the pcap file's magic number, so a big-endian Amiga writing a big-endian file
+ * is self-consistent and decodes correctly.
+ */
+void
+ng_bpf_tap_af(ifp, af, m)
+	struct ifnet *ifp;
+	u_long af;
+	struct mbuf *m;
+{
+	struct mbuf *hdr;
+
+	if (bpf_nlisteners == 0 || m == NULL)
+		return;
+
+	hdr = m_get(M_DONTWAIT, MT_DATA);
+	if (hdr == NULL)
+		return;
+	*mtod(hdr, u_long *) = af;
+	hdr->m_len = sizeof(u_long);
+
+	hdr->m_next = m;			/* borrow the caller's payload chain */
+	ng_bpf_tap(ifp, hdr);
+	hdr->m_next = NULL;			/* hand it back untouched */
+	(void)m_free(hdr);
+}

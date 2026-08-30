@@ -90,6 +90,41 @@ struct ip {
 	struct	in_addr ip_src,ip_dst;	/* source and dest address */
 };
 
+/*
+ * IP_SET_VHL() -- set ip_v and ip_hl in ONE byte store.
+ *
+ * They are two 4-bit fields sharing a byte, and assigning them separately makes
+ * the compiler treat each as a bitfield insert. At -m68020 and above that is a
+ * literal BFINS instruction per field; the 68000 build cannot encode BFINS and
+ * gets a plain byte store instead. Bitfield instructions with a memory operand
+ * are microcoded and slow on 68020/030 -- so the "tuned" builds were paying more
+ * than the plain one on the per-packet transmit path, which is the opposite of
+ * the intent. Measured in the shipped 4.1.6-beta: three BFINS in ip_output(),
+ * plus more in tcp_output()/tcp_input()/arpresolve().
+ *
+ * NOT gated on the CPU target, deliberately. One byte store beats a read-modify-
+ * write on EVERY 68k including the 68000, so there is nothing to choose between
+ * targets and no reason to grow another build variant. Gating belongs to things
+ * that are genuinely better on one CPU and worse on another (see ng_bcopy()'s
+ * MOVE16); this is just a better way to write the same store everywhere.
+ *
+ * Written in C rather than assembly on purpose: the win here is NOT emitting a
+ * slow instruction, not reaching for a clever one, and C says that portably while
+ * the compiler keeps checking us.
+ *
+ * `hl` is the header length in BYTES; it is converted to words here so callers
+ * read the way the RFC does.
+ */
+#if BYTE_ORDER == BIG_ENDIAN
+#define	IP_SET_VHL(ip, v, hl) \
+	(*(u_char *)(ip) = (u_char)(((v) << 4) | (((hl) >> 2) & 0x0f)))
+#else
+/* Little-endian keeps the field order swapped; fall back to the plain
+ * assignments rather than hard-code a layout this stack never builds for. */
+#define	IP_SET_VHL(ip, v, hl) \
+	do { (ip)->ip_v = (v); (ip)->ip_hl = (u_char)((hl) >> 2); } while (0)
+#endif
+
 #define	IP_MAXPACKET	65535		/* maximum packet size */
 
 /*

@@ -271,6 +271,17 @@ struct Sana2DeviceStats
 #define S2EVENT_BUFF            (1L<<5) /* buff mgt function error      */
 #define S2EVENT_HARDWARE        (1L<<6) /* hardware error catch all     */
 #define S2EVENT_SOFTWARE        (1L<<7) /* software error catch all     */
+/*
+ * PORT (AmiTCP_NG): the later SANA-II events. This header came from AmiTCP
+ * 3.0b2 and stops at SOFTWARE, but drivers written since report rather more --
+ * a WiFi driver announces re-association as CONNECT, not ONLINE, so a stack
+ * that only ever asks for ONLINE never learns its device came back. Values
+ * cross-checked against two independent copies that agree exactly: the OS 3.2
+ * NDK and the Roadshow SDK.
+ */
+#define S2EVENT_CONFIGCHANGED   (1L<<8) /* driver configuration changed */
+#define S2EVENT_CONNECT         (1L<<9) /* driver has opened session    */
+#define S2EVENT_DISCONNECT      (1L<<10)/* driver has closed session    */
 
 
 #endif  /* SANA2_SANA2DEVICE_H */

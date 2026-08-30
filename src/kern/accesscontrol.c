@@ -39,7 +39,20 @@ int controlaccess(struct in_addr shost, unsigned short dport)
 {
   int i;
 
-  LOCK_R_NDB(NDB);		
+  /*
+   * Guard NDB, as every other consumer of it does. This one is reached from
+   * tcp_input() on an inbound SYN -- the network input path, not a config
+   * command -- so it is the one that would be running if the window ever
+   * opened. The startup order says it cannot today (the service loop does not
+   * run until init_netdb() has returned), but that is an invariant somebody
+   * has to keep re-proving as the startup path changes, and this costs one
+   * compare. Allow, rather than deny: no table means no restrictions, which is
+   * what an empty table would have said anyway.
+   */
+  if (NDB == NULL || NDB->ndb_AccessTable == NULL)
+    return ACF_ALLOW;
+
+  LOCK_R_NDB(NDB);
   for (i = 0; NDB->ndb_AccessTable[i].ai_flags; i++) 
 #define AT NDB->ndb_AccessTable[i]
 #define host (*(ULONG *)&shost)				/* XXX */

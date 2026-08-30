@@ -28,6 +28,7 @@
 #include <proto/dos.h>
 
 #include "ng_lvo.h"
+#include "ng_waitaam.h"
 
 struct Library *SocketBase = 0;
 
@@ -83,7 +84,16 @@ static long do_dhcp(const char *ifname, long timeout, int quiet)
 
   if (!quiet) Printf((STRPTR)"%s: requesting an address via DHCP...\n", (LONG)ifname);
   ng_begincfg(aam);
-  WaitPort(port);
+  /* Bounded -- see ng_waitaam.h. On timeout aam and port stay allocated: the stack
+   * still owns the message and may reply at any later moment. The port is neutralised
+   * so that late reply cannot Signal() this process's recycled Task. */
+  if (!ng_wait_reply(port, (aam->aam_Timeout > 0 ? aam->aam_Timeout : 30) + 15)) {
+    if (!quiet)
+      Printf((STRPTR)"%s: the stack never answered the address request -- giving up.\n",
+	     (LONG)ifname);
+    ng_orphan_port(port);
+    return 20;
+  }
   (void)GetMsg(port);
 
   if (aam->aam_Result == 0 && aam->aam_Address != 0) {
@@ -97,6 +107,11 @@ static long do_dhcp(const char *ifname, long timeout, int quiet)
     if (!quiet) Printf((STRPTR)"%s: DHCP failed (result %ld)\n", (LONG)ifname, aam->aam_Result);
     r = RETURN_ERROR;
   }
+  /* The message and every result buffer are one allocation the library made for
+   * us and will not free. Nothing reclaims it when this process exits either --
+   * that is not how AllocVec works -- so skipping this loses the memory until
+   * the machine is rebooted, once per DHCP bring-up. */
+  ng_deleteaam(aam);
   DeleteMsgPort(port);
   return r;
 }

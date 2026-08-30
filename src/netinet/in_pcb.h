@@ -94,6 +94,18 @@ struct raw_inpcb {
 	struct	mbuf *rinp_options;	/* IP options */
 	int	rinp_flags;		/* flags, e.g. raw sockopts */
 #define	RINPF_HDRINCL	0x1		/* user supplies entire IP header */
+	/*
+	 * PORT (AmiTCP_NG): per-socket IP TTL, settable with setsockopt(IPPROTO_IP,
+	 * IP_TTL). 0 means "not set" -- rip_output() then uses the global ip_defttl
+	 * as it always did, so a socket that never sets this behaves exactly as
+	 * before. Zero is safe as the sentinel because a TTL of 0 may never be
+	 * transmitted anyway, and rip_ctloutput() rejects it.
+	 *
+	 * This is what traceroute needs: it walks the path by sending probes with a
+	 * deliberately small TTL, and without a per-socket value every raw socket on
+	 * the machine would have to share one.
+	 */
+	u_char	rinp_ttl;		/* IP_TTL, 0 = use ip_defttl */
 	struct	sockaddr_in rinp_faddr;	/* foreign address */
 	struct	sockaddr_in rinp_laddr;	/* local address */
 	struct	route rinp_route;	/* placeholder for routing entry */

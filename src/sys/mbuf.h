@@ -1,4 +1,11 @@
 /*
+ * AmiTCP_NG -- a modernised, open fork of AmiTCP/IP 3.0b2.
+ * Modifications for AmiTCP_NG Copyright (C) 2026 Andy Taylor (MW0MWZ).
+ * Licensed under the GNU General Public License, version 2 (see COPYING).
+ * The original AmiTCP/IP and BSD copyright notices are retained below.
+ */
+
+/*
  * $Id: mbuf.h,v 1.11 1993/12/18 15:28:09 jraja Exp $
  *
  * HISTORY
@@ -149,6 +156,8 @@ extern struct mbuf *mfree;
 #define	MINCLSIZE	(MHLEN + MLEN) /* smallest amount to put in cluster */
 #define	M_MAXCOMPRESS	(MHLEN / 2)    /* max amount to copy for compression */
 
+/* MHLEN's two required properties are asserted after the structs it measures. */
+
 /*
  * Mbuf cluster structure. The first word is used as a reference count when the
  * cluster is in use and as a next pointer if on the free list.
@@ -184,7 +193,50 @@ struct m_hdr {
 struct	pkthdr {
 	int	len;		/* total packet length */
 	struct	ifnet *rcvif;	/* rcv interface */
+	/*
+	 * PORT (AmiTCP_NG): transport-only Internet checksum accumulated by the SANA
+	 * receive copy, valid ONLY when M_CSUM_DONE is set in m_flags. Unfolded and
+	 * uncomplemented; the consumer adds the pseudo-header, folds once and
+	 * complements, exactly as in_cksum()'s tail does. Deliberately 32 bits: a
+	 * folded 16-bit intermediate would drag in one's complement's two
+	 * representations of zero for no benefit, since the space is affordable.
+	 *
+	 * ⚠️ "Add the pseudo-header" is the TCP/UDP consumption model, not a universal
+	 * one. The producer does not filter on ip_p, so this sum is published for any
+	 * non-fragmented IPv4 datagram -- including ICMP, whose checksum has NO
+	 * pseudo-header, and for which this raw transport-only sum is already the
+	 * complete input. A consumer that adds a pseudo-header unconditionally to
+	 * anything carrying M_CSUM_DONE will get ICMP wrong. Check the protocol.
+	 *
+	 * Growing this struct shrinks MHLEN -- see the asserts below before touching it.
+	 */
+	u_long	csum;
 };
+
+/*
+ * PORT (AmiTCP_NG): MHLEN is a LEFTOVER, not a chosen number -- whatever a 128-byte
+ * mbuf has spare after m_hdr (20) and pkthdr. Growing pkthdr shrinks it, so these two
+ * properties must be asserted rather than assumed. Placed HERE, after both structs are
+ * complete, because MLEN/MHLEN are sizeof() expressions.
+ *
+ * 1. tcp_output.c panics on `max_linkhdr + hdrlen > MHLEN` (strictly greater, so
+ *    equality passes) and DIAGNOSTIC ships, so that panic is live on real machines.
+ *    The floor is 0 + 40 + 40 = 80:
+ *      max_linkhdr is ZERO here, not 16 -- uipc_domain.c takes the `#ifdef AMITCP`
+ *      branch (AMITCP is in NG_DEF for every build) whose comment reads "No space
+ *      needed for the link header with SanaII drivers". SANA-II CMD_READ delivers data
+ *      only; hardware addresses and packet type are separate IOSana2Req fields. The
+ *      `#else` branch that forces 16 is DEAD here -- do not re-derive the floor from
+ *      it, as two planning passes mistakenly did.
+ *      hdrlen is sizeof(struct tcpiphdr) (40) + optlen, and optlen is bounded at 40 by
+ *      tcp_output.c's own optbuf[40], which the SACK path genuinely fills.
+ * 2. The SANA receive copy splits its first destination chunk at exactly MHLEN. Keeping
+ *    that a multiple of 4 keeps the payload chunk's source pointer in the same
+ *    congruence class as the header chunk's, which is what lets a fused copy+checksum
+ *    run its aligned fast path on the payload -- the part that carries the bytes.
+ */
+typedef char ng_mhlen_fits_worst_tcp_header[(MHLEN >= 80) ? 1 : -1];
+typedef char ng_mhlen_keeps_the_rx_split_aligned[((MHLEN & 3) == 0) ? 1 : -1];
 
 /* description of external storage mapped into mbuf, valid if M_EXT set */
 struct m_ext {
@@ -233,6 +285,31 @@ struct mbuf {
 /* mbuf pkthdr flags, also in m_flags */
 #define	M_BCAST		0x0100	/* send/received as link-level broadcast */
 #define	M_MCAST		0x0200	/* send/received as link-level multicast */
+/*
+ * PORT (AmiTCP_NG): m_pkthdr.csum holds a valid transport-only checksum, accumulated
+ * during the SANA receive copy over exactly [ip_hl*4, ip_len) -- header and any
+ * trailing link padding excluded.
+ *
+ * DELIBERATELY NOT IN M_COPYFLAGS. Three separate things keep it honest, and the third
+ * is the one that is easy to get wrong:
+ *
+ *   1. Content-preserving mutators may keep it. m_pullup()'s reuse-in-place branch and
+ *      ip_stripoptions() relocate bytes without changing them, and the summed region's
+ *      start parity is unaffected because ip_hl counts 32-bit words.
+ *   2. Region-excluded mutators may keep it. m_adj() only ever trims bytes outside
+ *      [hlen, ip_len) in this path.
+ *   3. ANY mutator reached through M_COPY_PKTHDR drops it UNCONDITIONALLY -- content,
+ *      offset and length are all irrelevant, because m_flags is masked to M_COPYFLAGS.
+ *      This, and NOT rule 1, is what makes m_copym() safe: ip_forward()'s ICMP quote
+ *      copies from offset 0 and is byte-identical for what it takes, so it looks
+ *      content-preserving -- but it is TRUNCATED to 64 bytes and must never inherit a
+ *      whole-datagram checksum.
+ *
+ * So do not "tidy" this into M_COPYFLAGS. A mutator that changes summed-region CONTENT
+ * without allocating a new head would never touch M_COPYFLAGS and would corrupt in
+ * silence.
+ */
+#define	M_CSUM_DONE	0x0400	/* m_pkthdr.csum is valid (see above) */
 
 /* flags copied when copying m_pkthdr */
 #ifdef USE_M_EOR
@@ -274,11 +351,32 @@ struct mbuf {
  * allocates an mbuf and initializes it to contain a packet header
  * and internal data.
  */
+/*
+ * PORT (AmiTCP_NG): free-list integrity checking, MBUFCHECK= in AmiTCP.config.
+ * Implementation and rationale in kern/uipc_mbuf.c. The checks are OUT OF LINE
+ * on purpose: MGET/MFREE expand at around a hundred call sites, so inlining
+ * even the poison loop would cost real 68k code size in the whole stack. When
+ * ng_mbufcheck_active is 0 the cost is one test per allocation and per free.
+ */
+extern LONG  ng_mbufcheck;		/* the MBUFCHECK= config setting        */
+extern LONG  ng_mbufcheck_active;	/* what is actually IN FORCE -- latched  \
+					 * from ng_mbufcheck by mbinit(). The    \
+					 * macros below test THIS, so changing   \
+					 * the config variable after the pool    \
+					 * exists cannot half-enable checking on \
+					 * a list whose entries were freed while \
+					 * it was off (which would report a      \
+					 * corruption that never happened).      */
+int  ng_mbuf_bad_free(struct mbuf *m);
+void ng_mbuf_poison(struct mbuf *m);
+void ng_mbuf_alloc_check(struct mbuf *m);
+
 #define	MGET(m, canwait, type) { \
 	spl_t ms = splimp(); \
         (m) = mfree; \
 	if (m) { \
 		mfree = (m)->m_next; \
+		if (ng_mbufcheck_active) ng_mbuf_alloc_check(m); \
 		(m)->m_type = (type); \
 		mbstat.m_mtypes[type]++; \
 		(m)->m_next = NULL; \
@@ -346,6 +444,13 @@ struct mbuf {
  */
 #define	MFREE(m, n) \
 	{ spl_t ms = splimp(); \
+	  if (ng_mbufcheck_active && ng_mbuf_bad_free(m)) { \
+		/* Already on the free list. Relinking is precisely what \
+		 * corrupts the pool, so refuse: leave the list untouched and \
+		 * report no continuation, because (m)->m_next is now the \
+		 * free-list link, not this chain's next mbuf. */ \
+		(n) = NULL; \
+	  } else { \
 	  mbstat.m_mtypes[(m)->m_type]--; \
 	  if ((m)->m_flags & M_EXT) { \
 /*		if ((m)->m_ext.ext_free) */ \
@@ -355,7 +460,9 @@ struct mbuf {
 			MCLFREE((m)->m_ext.ext_buf); \
 	  } \
 	  (n) = (m)->m_next; \
+	  if (ng_mbufcheck_active) ng_mbuf_poison(m); \
 	  (m)->m_next = mfree; mfree = (m); \
+	  } \
 	  splx(ms); \
 	}
 

@@ -39,6 +39,22 @@
 (set #app      "AmiTCP_NG")
 
 (set #lib-source    "data/Libs/bsdsocket.library")
+; usergroup.library -- the user/group/account library Roadshow also ships. It is a
+; separate library from the stack (nothing in it is networking), but it travels with
+; us for the same reason the commands do: installing over Roadshow otherwise TAKES IT
+; AWAY from whatever was using it. Backed up and restored exactly like the stack
+; library, because it is the same kind of object from the user's point of view.
+(set #ug-source     "data/Libs/usergroup.library")
+
+; Accumulates "we backed X up as X.orig" lines for the closing message. Defined here
+; rather than only in P_Upgrade because P_InstallUserGroup appends to it and is called
+; from all three install paths -- two of which never set it.
+(set #backup-note "")
+; How many of the user's own commands were moved aside -- a COUNT, not a list. The
+; requester shows about 13 lines and cannot scroll, and a Roadshow machine can
+; displace twenty-odd commands: listing them pushed everything after off the
+; bottom, including where the AmiTCP drawer went.
+(set #backup-count 0)
 (set #nstart-source "data/S/Network-Startup")
 (set #db-source     "data/db")
 (set #tools-source  "data/C")
@@ -49,6 +65,34 @@
 ; here" (vs a foreign stack such as Roadshow); its content records the installed
 ; version. build-release.sh injects the real version into #ng-version.
 (set #ng-version "0.0.0")
+
+; Which CPU build THIS archive carries. build-release.sh stamps it, exactly as it
+; does #ng-version above. 0 = the plain 68000 build, which runs on every Amiga.
+;
+; SINCE 4.1.6 THIS IS ALWAYS 0 and the gate below never fires: we ship ONE
+; archive, built for 68000, and the stack chooses its CPU-dependent code paths at
+; run time from AttnFlags instead. The -68020 and -68040 variants were dropped
+; because compiling for those processors was tested and did not make the stack
+; faster, so the variants only ever added a way to install the wrong one.
+;
+; The check is KEPT, inert, on purpose. It costs nothing, and what it guards
+; against is not recoverable by the user: the installer writes a command into
+; S:User-Startup, so a build the CPU cannot run does not fail politely the first
+; time you use the network -- it Gurus on the NEXT BOOT, before you can reach
+; Uninstall, and the machine needs rescue media. If a CPU-specific archive is
+; ever reintroduced, stamping this is all that has to be remembered.
+(set #ng-cpu 0)
+
+; Is this a PRE-RELEASE (beta) archive? build-release.sh stamps this to 1 for any
+; version carrying a -beta suffix, exactly as it stamps #ng-version and #ng-cpu, so
+; it cannot be left on for a real release or forgotten for a test build.
+;
+; When it is set the installer says so, in terms, and requires the user to accept
+; it before anything is touched. The default answer is NO -- which also means a
+; Novice run, where the Installer takes every default itself, stops here rather
+; than quietly putting a test build on somebody's working machine.
+(set #ng-prerelease 0)
+
 (set #ng-marker  "LIBS:AmiTCP_NG.version")
 
 ; A sentinel that ONLY a full install writes (and uninstall removes). Uninstall uses it
@@ -57,8 +101,85 @@
 ; our install. The name is unmistakably ours, so it cannot pre-exist from another source.
 (set #fullinstall-marker "SYS:Storage/AmiTCP_NG-fullinstall")
 
+; A drawer holding one empty file per command WE put into C:. Written by every
+; install path, read by Uninstall.
+;
+; This exists because the Installer cannot read a list back out of a text file,
+; but it CAN foreach over a drawer. Without it, Uninstall had to enumerate the
+; CURRENT archive's data/C -- which is only the right list if you uninstall with
+; exactly the archive you installed with. Uninstall with a different version and
+; commands we installed are left behind, and worse, the user's own <name>.orig
+; is never renamed back: their original is stranded permanently, and the backup
+; guard then stops any future install from ever backing that name up again.
+;
+; It also tells P_UpgradeOurs which names are NEW in this release -- the ones
+; not yet in here -- so it can back those up without filing our own binaries
+; from the previous release as if they were the user's.
+(set #manifest "SYS:Storage/AmiTCP_NG-installed")
+
+; The same record, for the releases that shipped before the manifest existed: one
+; empty file per command name that AmiTCP_NG v4.1.5 and earlier put into C:.
+;
+; Without this the manifest is useless on the only machines that matter for an
+; upgrade -- the ones already running AmiTCP_NG. They have our marker and no
+; manifest, so "is this name one of ours?" has no answer, and both available
+; answers are wrong: assume yes and we overwrite the user's own file under any of
+; the EIGHT names this release adds (AmiTCPControl, arp, traceroute, PacketCapture,
+; SampleNetSpeed, NetLogViewer, CheckAmiTCPNGConfig, ManageNetInterfaces -- three
+; of which Roadshow itself ships, so they are genuinely likely to be occupied);
+; assume no and we file our own previously-installed binaries as the user's
+; originals and later "restore" them over the new ones.
+;
+; Shipped as a drawer rather than written into this script because Preview must
+; reach the same conclusion WITHOUT changing anything, and a drawer both can read
+; is the only way to answer it in one place. Keep it frozen: it describes what old
+; releases did, which cannot change. New names belong in the manifest.
+;
+; It carries rxprofile, which only ever shipped in beta archives, for the same
+; reason it carries the other sixteen: a 4.1.5 beta put one in C:, and a name we
+; installed and do not list here is a name we hand back to the user as their own.
+(set #legacy "data/Legacy")
+
+; The release at which the manifest started being written. A marker naming this
+; version (or a beta of it) means the machine already has the CURRENT command set
+; and usergroup.library, even though it has no manifest -- which is exactly what a
+; 4.1.6 beta archive installed. Without this test such a machine is
+; indistinguishable from a v4.1.5 one, and gets treated as though the eight names
+; new in this release were the user's: our own binaries renamed to <name>.orig,
+; reported as "your existing AmiTCPControl", and restored over the new ones by a
+; later Uninstall. Betas went to real hardware, so this is not hypothetical.
+;
+; From 4.1.6 on every install writes a manifest, so the set of machines that can
+; ever lack one is closed: the releases before 4.1.6, and 4.1.6's own betas. Each
+; gets a FROZEN list -- #legacy and #legacy416 -- and neither may be replaced by
+; this archive's own payload, however tempting: a later release adding one command
+; would then have Uninstall delete a file of that name on a beta machine that
+; never received it. Freeze them, and a future release changes nothing here.
+(set #legacy-cutover "4.1.6")
+(set #legacy416      "data/Legacy416")
+
+; The version string alone is NOT proof that a machine has the complete 4.1.6
+; payload, and believing it was would have been the worst kind of wrong.
+; "4.1.6-beta" was stamped into the version header on 2026-08-08, while the
+; command set and usergroup.library only arrived over the days after -- so an
+; archive built in that window writes a 4.1.6 marker over a v4.1.5-shaped install.
+; Trusting the string there skips the usergroup backup (destroying a Roadshow one)
+; and skips the backup of eight commands the machine never had.
+;
+; So the version must be corroborated by something only a complete build puts on
+; the machine. These two names are ours alone -- no other stack ships them, so
+; finding them means we put them there, and a partial beta did not.
+(set #proof-a "C:PacketCapture")
+(set #proof-b "C:CheckAmiTCPNGConfig")
+
 ; Filled in by the destination question (P_AskDest); the AmiTCP drawer path.
 (set #amitcp-dir "SYS:AmiTCP")
+
+; Set in Main: is there already a configuration drawer on this machine, reachable
+; through the AmiTCP: assign? Used by P_AskDest (to warn) and P_SetupConfig (to
+; carry it over). Set by P_SetupConfig: whether it actually had to carry it over.
+(set #have-cfg  0)
+(set #cfg-moved 0)
 
 ; Set by P_MergeFile: whether it added anything to an existing db/ file, and
 ; whether it had to leave existing files alone because C:Search was missing.
@@ -80,17 +201,47 @@
 		(set #dest-default "SYS:Programs")
 		(set #dest-default "SYS:")
 	)
+
+	; Say so when there is already a configuration on this machine.
+	;
+	; The default offered above is right for a first install and wrong for every
+	; re-run by someone who originally chose somewhere else -- and the obvious
+	; thing to do with a suggested answer is accept it. Before, that quietly
+	; created a SECOND, empty AmiTCP drawer and pointed AmiTCP: at it, leaving the
+	; settings and host database the machine had been using behind in a drawer
+	; nothing referred to any more.
+	;
+	; Worded to match the condition P_SetupConfig actually applies, which is
+	; narrower than "you picked somewhere else": if the place you pick ALREADY has
+	; an AmiTCP configuration of its own, that one is left alone and nothing is
+	; copied over it. Saying "your settings come with you" flatly would be a promise
+	; broken on the one machine that has two AmiTCP drawers -- and Uninstall
+	; deliberately leaves drawers behind, so that machine is not hypothetical.
+	(if (= #have-cfg 1)
+		(set #dest-note (cat
+			"\n\nAn AmiTCP configuration already exists on this machine. Pick a "
+			"place that has no AmiTCP configuration of its own and yours is COPIED "
+			"into it, so nothing is left behind; pick one that already has its own "
+			"and that one is kept, untouched. Either way nothing is deleted."))
+		(set #dest-note "")
+	)
+
 	(set #dest-parent
 		(askdir
 			(prompt "Where should the 'AmiTCP' drawer be created?\n\n"
 				"Its configuration and host database live inside it. "
 				"The suggested location is fine, but you may keep it on any "
-				"volume or drawer.")
+				"volume or drawer."
+				#dest-note)
 			(help "The installer creates a drawer called 'AmiTCP' inside the "
 				"location you pick here, and sets up an 'AmiTCP:' assign that "
 				"points to it so the stack can find its configuration.\n\n"
 				"The default is 'SYS:Programs' (the standard programs drawer) when "
 				"it exists, otherwise the boot disk 'SYS:'.\n\n"
+				"If this machine already has an AmiTCP configuration, and the place "
+				"you choose does not have one of its own, yours is copied there -- "
+				"so answering this differently from last time moves your settings "
+				"with you rather than abandoning them.\n\n"
 				@askdir-help)
 			(default #dest-default)
 		)
@@ -190,6 +341,27 @@
 	"#LOGLEVEL=7\n"
 ))
 
+(set #db-newusemove16 (cat
+	"\n"
+	"# --- MOVE16 burst copy (68040/68060 only) --------------------------------------\n"
+	"#\n"
+	"# The 68040 and 68060 have MOVE16, an instruction that moves a whole 16-byte cache\n"
+	"# line at once. In principle that makes bulk copying of packet payload faster on\n"
+	"# those processors, and nothing else.\n"
+	"#\n"
+	"# It is OFF, and the honest reason is that it has never been shown to help. The\n"
+	"# gain was measured once in a copy benchmark, not in the packet path, and real\n"
+	"# testing since has NOT shown faster transfers with it on. Every processor below\n"
+	"# an 040 ignores this setting completely -- the instruction does not exist there,\n"
+	"# and the stack never reaches it.\n"
+	"#\n"
+	"# So this is here to be experimented with, not because it is recommended. If you\n"
+	"# have an 040 or 060 and want to try it, turn it on, move a large file, and\n"
+	"# compare against the same transfer with it off. If it makes no difference, that\n"
+	"# is the expected result and worth saying so.\n"
+	"#USEMOVE16=YES\n"
+))
+
 (set #db-newlogconsole (cat
 	"\n"
 	"# Also throw log messages at a console window, as well as the file. Default OFF,\n"
@@ -212,6 +384,25 @@
 	"#LOGFILENAME=RAM:AmiTCP.log\n"
 ))
 
+(set #db-newmbufcheck (cat
+	"\n"
+	"# --- Diagnostics ---------------------------------------------------------------\n"
+	"\n"
+	"# Check the packet-buffer (mbuf) pool for corruption. Default OFF.\n"
+	"#\n"
+	"# Turn this ON only when asked to, or when chasing a fault where the network\n"
+	"# gets gradually slower and then stops with nothing in the log. It makes the\n"
+	"# stack mark every buffer as it is released and check it when it is handed out\n"
+	"# again, which catches a buffer released twice, or written to after it was\n"
+	"# released -- faults that otherwise do their damage silently and only show up\n"
+	"# later as corrupted traffic or a stack that has stopped sending.\n"
+	"#\n"
+	"# It costs speed on every packet, which is why it is off by default. Findings\n"
+	"# are written to the log, so keep LOGGING on and LOGFILENAME pointed at a disk.\n"
+	"# This one is read only at startup: change it, then restart the stack.\n"
+	"#MBUFCHECK=ON\n"
+))
+
 
 
 ; ---------------------------------------------------------------------------
@@ -222,6 +413,88 @@
 ;  cannot tell what the user already has, and appending blind could override a
 ;  setting of theirs -- so in that case we change nothing and say so at the end.
 ; ---------------------------------------------------------------------------
+
+;-----------------------------------------------------------------------------
+; P_ImportOne / P_ImportRoadshow -- carry a user's saved Roadshow tunables over.
+;
+; Roadshow persists what RoadshowControl SAVEd as one file per option under
+; ENVARC:Roadshow/<group>/<name>. We use the same layout under
+; ENVARC:AmiTCP_NG/, and AmiTCPControl reads and writes it, so a migration is
+; a file copy -- no parsing, no translation.
+;
+; ONLY the options on the list below are carried over, and it is an ALLOW-list
+; rather than a deny-list on purpose: an option we have never heard of must be
+; skipped, not imported blindly.
+;
+; What is deliberately NOT imported: the socket buffer sizes, the default MSS,
+; the initial window and the timestamp switch. AmiTCP_NG works those out from
+; this machine's installed RAM, the interface's link speed and the CPU, and a
+; value chosen under another stack's sizing model -- or for a different machine
+; -- is usually worse than the one we compute. Those options are read-only in
+; AmiTCPControl for the same reason; importing them would be a back door into
+; settings we deliberately do not let the user set.
+;-----------------------------------------------------------------------------
+(procedure P_ImportOne
+(
+	(set #imp-src (cat "ENVARC:Roadshow/" #imp-path))
+	(if (exists #imp-src (noreq))
+	  (
+		(set #imp-dst (cat "ENVARC:AmiTCP_NG/" #imp-group))
+		(makedir #imp-dst)
+		(copyfiles
+			(source #imp-src)
+			(dest   #imp-dst)
+		)
+		(set #imp-count (+ #imp-count 1))
+		(set #imp-names (cat #imp-names "  " #imp-shown "\n"))
+	  )
+	)
+))
+
+(procedure P_ImportRoadshow
+(
+	(set #imp-count 0)
+	(set #imp-names "")
+
+	(if (exists "ENVARC:Roadshow" (noreq))
+	  (if (askbool
+		(prompt "Settings saved from Roadshow were found on this machine.\n\n"
+			"AmiTCP_NG can carry over the ones that describe how you want "
+			"the network to behave: IP forwarding, ICMP redirects, whether "
+			"subnets count as local, the default packet time-to-live, ICMP "
+			"address-mask replies and UDP checksums.\n\n"
+			"Speed-related settings (socket buffer sizes, segment size, "
+			"window) are NOT carried over. AmiTCP_NG sizes those from this "
+			"machine's memory, processor and network speed, which suits it "
+			"better than a value copied from elsewhere.\n\n"
+			"Carry the settings over?")
+		(help "Reads ENVARC:Roadshow and copies the listed settings into "
+			"ENVARC:AmiTCP_NG. Nothing in your Roadshow configuration is "
+			"changed or removed. Answering No simply starts with AmiTCP_NG's "
+			"own defaults; you can always set them later with AmiTCPControl.")
+		(default 1))
+	    (
+		(makedir "ENVARC:AmiTCP_NG")
+		(set #imp-group "ip"   #imp-path "ip/forwarding"      #imp-shown "ip.forwarding")      (P_ImportOne)
+		(set #imp-group "ip"   #imp-path "ip/sendredirects"   #imp-shown "ip.sendredirects")   (P_ImportOne)
+		(set #imp-group "ip"   #imp-path "ip/subnetsarelocal" #imp-shown "ip.subnetsarelocal") (P_ImportOne)
+		(set #imp-group "ip"   #imp-path "ip/defttl"          #imp-shown "ip.defttl")          (P_ImportOne)
+		(set #imp-group "udp"  #imp-path "udp/cksum"          #imp-shown "udp.cksum")          (P_ImportOne)
+		(set #imp-group "icmp" #imp-path "icmp/maskrepl"      #imp-shown "icmp.maskrepl")      (P_ImportOne)
+
+		(if (> #imp-count 0)
+			(message "Carried over " #imp-count " setting(s) from Roadshow:\n\n"
+				 #imp-names
+				 "\nThey take effect the next time the stack starts. "
+				 "Use AmiTCPControl to see or change them.")
+			(message "No settings were carried over -- the Roadshow settings "
+				 "found were all ones AmiTCP_NG works out for itself.")
+		)
+	    )
+	  )
+	)
+))
+
 (procedure P_MergeFile
 (
 	(set #mf-path (tackon #amitcp-dir (cat "db/" #mf-file)))
@@ -308,22 +581,40 @@
 ;  completion message. Deliberately does NOT name which settings were added --
 ;  #db-merged is one flag covering three independently-triggerable blocks, so
 ;  naming them could describe something that did not happen.
+;
+;  Every branch APPENDS. They used to each assign, which reads fine while only one
+;  can fire and is wrong the moment two can: #db-merged and #db-nomerge are set per
+;  FILE, so one db/ file merging while another is unreadable sets both -- and the
+;  last branch to run simply erased the earlier one's message.
 ; ---------------------------------------------------------------------------
+; ---------------------------------------------------------------------------
+;  One line saying what was moved aside, for the closing message. A line, not a
+;  list: see #backup-count.
+; ---------------------------------------------------------------------------
+(procedure P_BackupNote
+(
+	(if (> #backup-count 0)
+		(set #moved-note (cat "\n" #backup-count " file(s) of yours moved aside as 'C:<name>.orig'."))
+		(set #moved-note "")
+	)
+))
+
 (procedure P_DbNote
 (
 	(set #db-note "")
+	; Carried-over configuration first: it is the one that explains a drawer the
+	; user did not expect to see, and the one they will want to delete by hand.
+	(if (= #cfg-moved 1)
+		(set #db-note (cat #db-note
+			"\nYour existing configuration was copied here; the old drawer is kept."))
+	)
 	(if (= #db-merged 1)
-		(set #db-note (cat
-			"\n\nSettings added by this release were appended to the existing files in "
-			#amitcp-dir "/db. Anything you had already set was left exactly as it was."))
+		(set #db-note (cat #db-note
+			"\nNew settings were added to your db files; your own were kept."))
 	)
 	(if (= #db-nomerge 1)
-		(set #db-note (cat
-			"\n\nNOTE: the installer could not determine what your " #amitcp-dir "/db "
-			"files already contain -- 'C:Search' is missing, or it could not read them -- "
-			"so it left them alone rather than risk duplicating a setting. To pick up the "
-			"newest service definitions and settings, compare them with the files in this "
-			"archive's 'db' drawer."))
+		(set #db-note (cat #db-note
+			"\nNOTE: db files left alone (no C:Search) -- compare them with this archive's."))
 	)
 ))
 
@@ -338,14 +629,49 @@
 (
 	; Can we tell what is already in a file? Everything in P_MergeFile that touches
 	; an existing file depends on this; without it we leave existing files alone.
-	(set #mf-cansearch 0)
-	(if (>= (exists "C:Search" (noreq)) 1) (set #mf-cansearch 1))
+	; Taken from the one worked out in Main, rather than tested again here -- the
+	; version test needs the same answer and runs before any of this.
+	(set #mf-cansearch #cansearch)
 
 	(makedir (tackon #amitcp-dir "db")
 		(prompt "Creating " #amitcp-dir "/db for the network database")
 		(help @makedir-help)
 		(infos)
 	)
+
+	; If a configuration drawer already exists somewhere else, bring it with us.
+	;
+	; Copying rather than asking "is this the same place as last time?" is
+	; deliberate, and it is the only thing that actually works here: we cannot find
+	; out where the old drawer IS. The AmiTCP: assign reaches it, but the Installer
+	; offers no way to turn an assign back into a path, so there is no honest
+	; default to suggest and no way to compare an answer against the truth. The fix
+	; is therefore to make the answer stop mattering -- wherever it was, its
+	; contents come along. The originals are left exactly as they are, so choosing
+	; wrongly here costs a duplicate drawer and nothing else.
+	;
+	; The guard is AmiTCP.config: it is written by every install path, so it is
+	; present in any drawer worth carrying over. Testing it in BOTH places also
+	; settles the same-drawer case for free -- if AmiTCP: already resolves to the
+	; drawer just chosen, the file is on both sides of the test and we do nothing,
+	; rather than copying a drawer onto itself. Merging then updates the copied
+	; files exactly as it would have updated them in place.
+	(set #cfg-moved 0)
+	(if (and (= #have-cfg 1)
+		 (= (exists (tackon #amitcp-dir "db/AmiTCP.config") (noreq)) 0))
+	(
+		(copyfiles
+			(prompt "Copying your existing AmiTCP configuration into " #amitcp-dir "/db")
+			(help "Your settings and host database are copied out of the drawer "
+				"the 'AmiTCP:' assign points at now, so that choosing a new "
+				"location does not leave them behind. The old drawer is not "
+				"changed or deleted.")
+			(source "AmiTCP:db")
+			(dest (tackon #amitcp-dir "db"))
+			(all)
+		)
+		(set #cfg-moved 1)
+	))
 
 	; Each db/ file is handled on its own: copied whole when it is not there, and
 	; otherwise brought up to date a setting at a time (P_MergeFile). This used to
@@ -393,6 +719,18 @@
 	(set #mf-desc "the log file location")
 	(P_MergeFile)
 
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "USEMOVE16")
+	(set #mf-add  #db-newusemove16)
+	(set #mf-desc "the 68040/68060 MOVE16 burst copy switch")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "MBUFCHECK")
+	(set #mf-add  #db-newmbufcheck)
+	(set #mf-desc "the buffer-pool check switch")
+	(P_MergeFile)
+
 	; Make AmiTCP: resolve now (before a reboot) so anything run this session finds
 	; the database. (The library also self-assigns AmiTCP: -> SYS:AmiTCP as a fallback
 	; when nothing has set it, but our chosen location must win.)
@@ -408,6 +746,110 @@
 ;  or straight from your WiFi-connect script). The loopback interface (lo0) comes up on
 ;  its own when the stack first starts. Replaces the tagged #app block in place.
 ; ---------------------------------------------------------------------------
+; ===========================================================================
+;  Install usergroup.library, backing up whatever was there first.
+;
+;  One procedure called from all three install paths. The alternative -- pasting the
+;  same nine lines three times -- is how the paths drift: this file already carries a
+;  comment about a backup block that had to exist in two places for different reasons,
+;  and that is exactly the sort of thing that gets fixed in one copy only.
+;
+;  The backup is taken ONCE (never clobber an earlier .orig) and only if there is
+;  actually a library to back up -- copyfiles on a missing source aborts the whole
+;  install, and a machine with no usergroup.library at all is the normal case.
+; ===========================================================================
+(procedure P_InstallUserGroup
+(
+	; #ours guards this, and it is the whole correctness of the procedure.
+	;
+	; On the update path (P_UpgradeOurs) the usergroup.library already on disk is
+	; OURS, from the previous install. Backing it up would file our own binary as
+	; "the user's original", and Uninstall would then dutifully restore it -- leaving
+	; an AmiTCP_NG library on a machine that never had one, described to the user as
+	; "Restoring your previous usergroup.library". Worse, that Uninstall consumes the
+	; markers, so no later run can see or undo it: usergroup.library is not one of the
+	; signals that make a machine look like it has a stack.
+	;
+	; This is exactly the invariant P_UpgradeOurs already states for bsdsocket.library
+	; ("No NEW .orig backups are made -- this is our own stack"), which it gets by
+	; simply not having any backup logic on that path. This procedure is shared by all
+	; three paths, so it has to ask.
+	;
+	; But "#ours" alone is not the question, because usergroup.library is NEW in this
+	; revision -- v4.1.5 and earlier never installed one. On a machine running a
+	; released AmiTCP_NG the marker says "ours" while any usergroup.library present
+	; belongs to somebody else (Roadshow's, or AmiTCP 3.0b2's). Trusting the marker
+	; there overwrote it with no backup, and Uninstall then deleted ours, found no
+	; .orig, and left the machine with no usergroup.library at all -- while promising
+	; the previous stack was back "exactly as it was".
+	;
+	; #ug-ours is that finer question, answered in Main alongside #ours-list: ours
+	; only on a machine of the current generation. Answered THERE, before any
+	; install path runs, so it cannot depend on where in a path this procedure is
+	; called -- an earlier version read the manifest's existence directly, which
+	; quietly required every path to call this before P_WriteManifest.
+	(if (and (= #ug-ours 0)
+		 (and (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+		      (= (exists "LIBS:usergroup.library.orig" (noreq)) 0)))
+	(
+		(copyfiles
+			(prompt "Backing up your existing usergroup.library")
+			(help @copyfiles-help)
+			(source "LIBS:usergroup.library")
+			(dest "LIBS:")
+			(newname "usergroup.library.orig")
+		)
+		(set #backup-note (cat #backup-note
+			"\nYour usergroup.library saved as 'usergroup.library.orig'."))
+	))
+
+	(copyfiles
+		(prompt "Installing the AmiTCP_NG usergroup.library")
+		(help @copyfiles-help)
+		(source #ug-source)
+		(dest "LIBS:")
+		(newname "usergroup.library")
+		(confirm "expert")
+	)
+))
+
+; Record exactly which commands this install put into C:, one empty file per
+; name. Rewritten from scratch each time so it always describes what is actually
+; on the machine now, including names dropped since an earlier release.
+;
+; "From scratch" needs the clear below to be true. Without it the drawer only ever
+; grew, and a name we STOPPED shipping stayed marked as ours forever: the backup
+; loops would go on skipping it, so a completely unrelated C: command that later
+; took that name would never be backed up -- and Uninstall would delete it.
+;
+; Safe to clear here because every path calls this after the loop that reads the
+; previous manifest, which is the one thing that must happen first (P_UpgradeOurs
+; uses it to tell our own binaries from the user's).
+(procedure P_WriteManifest
+(
+	(if (>= (exists #manifest (noreq)) 1)
+		(foreach #manifest "#?"
+			(delete (tackon #manifest @each-name))))
+	; SYS:Storage need not exist. (makedir) is not relied on to create the parent
+	; as well -- the marker written just after this one lands in the same drawer,
+	; and both now sit in the window where C: has been renamed aside and not yet
+	; refilled, so a failure here is a failure at the worst possible moment.
+	(makedir "SYS:Storage")
+	(makedir #manifest)
+	(foreach #tools-source "#?"
+		(textfile
+			(dest (tackon #manifest @each-name))
+			; NOT an empty string. The whole manifest mechanism is "does a file of
+			; this name exist", and whether an empty append creates a file at all is
+			; not something to stake that on: if it does not, the drawer exists while
+			; every name inside is missing, which reads as "we installed nothing" --
+			; and that is the state in which the update path renames all of our own
+			; commands to <name>.orig and Uninstall silently removes nothing.
+			(append "AmiTCP_NG installed this command.\n")
+		)
+	)
+))
+
 (procedure P_InstallStartup
 (
 	(startup #app
@@ -436,6 +878,16 @@
 ; removes it.
 (procedure P_WriteMarker
 (
+	; This procedure writes the version marker and NOTHING else.
+	;
+	; It used to delete the install manifest as well -- cleanup that belongs to
+	; Uninstall, pasted into the one procedure every INSTALL path calls, and called
+	; by each of them immediately after P_WriteManifest had just written it. The
+	; manifest therefore never survived an install, and since both Uninstall
+	; branches drive their work from (foreach #manifest ...), Uninstall removed
+	; nothing, restored nothing, and said it had done both. The manifest is now
+	; cleared where it is actually finished with, at the end of P_Uninstall.
+	;
 	; Rewrite fresh (not append), so repeated upgrades leave a single clean line.
 	(if (>= (exists #ng-marker (noreq)) 1)
 		(delete #ng-marker (prompt "Refreshing the AmiTCP_NG version marker") (help @delete-help)))
@@ -459,6 +911,15 @@
 	; library is actually there to back up -- #existing can be true off S:Network-Startup
 	; alone (e.g. after a full-install Uninstall removed the library but left the startup),
 	; and copyfiles on a missing source would abort the whole install.
+	;
+	; This one stays a COPY while the C: command backups are renames, and the
+	; difference is deliberate. The install of our library just below carries
+	; (confirm "expert"), so an expert user can decline it and the script carries on
+	; -- and after a rename there would then be no bsdsocket.library on the machine
+	; at all. That cannot happen to the commands, whose bulk copy is unconditional.
+	; The cost is one duplicated library in LIBS: for the length of the install,
+	; against a whole duplicated command set in C:, which is what actually threatened
+	; to fill a small partition.
 	(if (and (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
 		 (= (exists "LIBS:bsdsocket.library.orig" (noreq)) 0))
 	(
@@ -469,10 +930,11 @@
 			(dest "LIBS:")
 			(newname "bsdsocket.library.orig")
 		)
-		(set #backup-note (cat
-			"\nYour original library was backed up as "
-			"'LIBS:bsdsocket.library.orig'.\n"
-		))
+		; APPEND. Every other contributor to #backup-note appends, and this one
+		; assigning is safe only because it happens to run first -- exactly the
+		; shape of the bug that silently dropped messages out of P_DbNote.
+		(set #backup-note (cat #backup-note
+			"\nYour original library saved as 'bsdsocket.library.orig'."))
 	))
 
 	(complete 40)
@@ -488,6 +950,8 @@
 		(confirm "expert")
 	)
 
+	(P_InstallUserGroup)
+
 	(complete 75)
 
 	; Install our own Roadshow-compatible commands OVER the existing stack's tools.
@@ -498,18 +962,46 @@
 	; Each original command is backed up once (to C:<name>.orig, never clobbering an
 	; earlier backup) so an Uninstall can restore it. Our commands are validated to
 	; bring a DHCP interface up on a machine that previously ran Roadshow.
+	;
+	; RENAMED, not copied. The bulk copyfiles below immediately writes our version
+	; over the name we just vacated, so a copy only ever existed to leave the old
+	; file briefly in place -- and it charged the user's C: for the privilege. A
+	; whole Roadshow command set duplicated into C: is real space on a partition
+	; that is often small and, on a floppy install, may simply not be there; the
+	; install would then fail partway with C: half replaced. A rename is a
+	; directory entry change: no second copy, nothing to run out of, and no need to
+	; measure the free space first. Uninstall already puts these back with (rename).
 	(foreach #tools-source "#?"
 		(if (and (>= (exists (tackon "C:" @each-name) (noreq)) 1)
 			 (= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 0))
-			(copyfiles
+		(
+			(rename (tackon "C:" @each-name) (tackon "C:" (cat @each-name ".orig"))
 				(prompt "Backing up your existing " @each-name)
-				(help @copyfiles-help)
-				(source (tackon "C:" @each-name))
-				(dest "C:")
-				(newname (cat @each-name ".orig"))
+				(help "Your original command is moved aside to C:" @each-name
+					".orig, where Uninstall can find it and put it back.")
 			)
-		)
+			; Name them, as the other two install paths do. This path displaces the
+			; most files of the three -- it is the one that runs on a machine with a
+			; whole rival stack installed -- and it was the only one that reported
+			; the fact as a single generic sentence.
+			(set #backup-count (+ #backup-count 1))
+		))
 	)
+	; Record the install BEFORE the commands are written, not after.
+	;
+	; The loop above has just moved the user's files out from under their own
+	; names. If the run stops between here and the end of the copy below -- disk
+	; full, a write error, the Installer's own Stop button -- those names exist
+	; only as <name>.orig, and Uninstall is the thing that puts them back. But
+	; Uninstall refuses to act without #ng-marker and does its work from the
+	; manifest, so writing both afterwards meant the one failure that needs a
+	; rollback was the one failure that could not be rolled back.
+	;
+	; Written after the backup loop, because on the update path that loop reads the
+	; PREVIOUS manifest to tell our own binaries from the user's.
+	(P_WriteManifest)
+	(P_WriteMarker)
+
 	(copyfiles
 		(prompt "Installing the AmiTCP_NG network commands into C:")
 		(help @copyfiles-help)
@@ -520,20 +1012,23 @@
 
 	(makedir "DEVS:NetInterfaces" (infos))
 	(P_InstallStartup)
-	(P_WriteMarker)
+	; Offer to carry over a user's saved Roadshow tunables (policy only -- the
+	; speed-related ones stay ours; see P_ImportRoadshow).
+	(P_ImportRoadshow)
 
 	(complete 100)
 
 	(P_DbNote)
+	(P_BackupNote)
 	(message (cat
-		"AmiTCP_NG has replaced your existing bsdsocket.library and network commands.\n"
+		"AmiTCP_NG has replaced your stack and network commands.\n"
 		#backup-note
-		"\nYour interface configuration (DEVS:NetInterfaces) is untouched and now drives "
-		"AmiTCP_NG -- with no time limit. Your previous network commands were backed up "
-		"as 'C:<name>.orig' and are restored if you Uninstall.\n\n"
-		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir
+		#moved-note
+		"\nYour interface configuration is untouched and drives\n"
+		"AmiTCP_NG with no time limit. The 'AmiTCP' drawer is at:\n"
+		"  " #amitcp-dir "\n"
 		#db-note
-		"\n\nPlease reboot your Amiga to start using AmiTCP_NG."
+		"\nReboot to start using AmiTCP_NG."
 	))
 ))
 
@@ -564,12 +1059,57 @@
 		(source #lib-source)
 		(dest "LIBS:")
 	)
+
+	(P_InstallUserGroup)
+
 	(complete 25)
 
-	; Our complete set of Roadshow-compatible commands (Online, Offline,
-	; AddNetInterface, ConfigureNetInterface, AddNetRoute, DeleteNetRoute,
-	; RemoveNetInterface, NetShutdown, GetNetStatus, ShowNetStatus, ping) -- so
-	; Roadie, NetMon and existing scripts drive the stack unchanged.
+	; Our complete set of Roadshow-compatible commands, so Roadie, NetMon and
+	; existing scripts drive the stack unchanged -- plus the general-purpose
+	; clients (ftp, netstat, ping, arp, traceroute, tftp, nslookup, sntp) and
+	; the new tools. See P_Preview for the full list.
+	;
+	; BACK UP FIRST, exactly as P_Upgrade does. This loop was missing here, and
+	; the asymmetry was backwards: the upgrade path at least knows a stack is
+	; present, while THIS path runs on a machine we have decided has no stack --
+	; which is precisely the machine that may have a standalone C:ftp or C:ping
+	; from some other package. None of the four "existing stack" signals fires
+	; for those, so a full install used to overwrite them with no backup and no
+	; mention, and a later Uninstall then deleted ours too, leaving the user
+	; with nothing where their command had been.
+	;
+	; Renamed rather than copied, for the reason given in P_Upgrade: the name is
+	; overwritten by the bulk copy immediately afterwards, so copying only bought a
+	; second copy of the user's file and the C: space to hold it.
+	(foreach #tools-source "#?"
+		(if (and (>= (exists (tackon "C:" @each-name) (noreq)) 1)
+			 (= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 0))
+		(
+			(rename (tackon "C:" @each-name) (tackon "C:" (cat @each-name ".orig"))
+				(prompt "Backing up your existing " @each-name)
+				(help "Your original command is moved aside to C:" @each-name
+					".orig, where Uninstall can find it and put it back.")
+			)
+			; Say so afterwards rather than doing it silently. Several of our
+			; names are generic (ftp, ping, netstat), so even on a machine with
+			; no TCP/IP stack this can displace something installed for another
+			; purpose entirely -- the user should be told which.
+			(set #backup-count (+ #backup-count 1))
+		))
+	)
+	; Record the install BEFORE the commands are written -- see the same block in
+	; P_Upgrade for why. The full-install sentinel goes down here too: it is what
+	; selects the branch of Uninstall that would undo this, so leaving it to the end
+	; meant an install that failed part-way could not be undone at all.
+	(P_WriteManifest)
+	(P_WriteMarker)
+	(textfile
+		(dest #fullinstall-marker)
+		(append (cat "AmiTCP_NG full-install marker. Created by the AmiTCP_NG installer "
+			"so its Uninstall can tell a full install from an upgrade. Safe to delete "
+			"only if you will not use Uninstall.\n"))
+	)
+
 	(copyfiles
 		(prompt "Installing the AmiTCP_NG network commands into C:")
 		(help @copyfiles-help)
@@ -595,7 +1135,15 @@
 		(help @makedir-help)
 		(infos)
 	)
-	(if (= (exists "data/Devs/Internet/hosts" (noreq)) 1)
+	; Only if there is not one already. The shipped file is a two-line example
+	; containing nothing but localhost, and copyfiles overwrites by default --
+	; with "force" defeating protection bits on top -- so this used to destroy a
+	; populated static host table silently, with no backup and no mention, at
+	; Novice level. DEVS:Internet is not one of the signals that says "a stack is
+	; already here", so a machine with a real hosts file reaches this path
+	; perfectly easily.
+	(if (and (= (exists "data/Devs/Internet/hosts" (noreq)) 1)
+		 (= (exists "DEVS:Internet/hosts" (noreq)) 0))
 	(
 		(makedir "DEVS:Internet" (infos))
 		(copyfiles
@@ -623,42 +1171,29 @@
 		(all)
 	)
 
-	; Drop the full-install sentinel so Uninstall can safely tell this apart from an
-	; upgrade (see #fullinstall-marker). Written last, once the full install has succeeded.
-	(textfile
-		(dest #fullinstall-marker)
-		(append (cat "AmiTCP_NG full-install marker. Created by the AmiTCP_NG installer "
-			"so its Uninstall can tell a full install from an upgrade. Safe to delete "
-			"only if you will not use Uninstall.\n"))
-	)
 	(complete 90)
 
 	(P_InstallStartup)
-	(P_WriteMarker)
+	; Offer to carry over a user's saved Roadshow tunables (policy only -- the
+	; speed-related ones stay ours; see P_ImportRoadshow).
+	(P_ImportRoadshow)
 
 	(complete 100)
 
 	; A full install can still land on an existing db/ drawer: Uninstall deliberately
 	; leaves the AmiTCP drawer behind, so a later "clean" install can find files there.
 	(P_DbNote)
+	(P_BackupNote)
 	(message (cat
-		"AmiTCP_NG is installed, with its full set of network commands.\n\n"
-		"The 'AmiTCP' drawer is at:\n  " #amitcp-dir
+		"AmiTCP_NG is installed, with its full command set.\n"
+		#backup-note
+		#moved-note
+		"\nThe 'AmiTCP' drawer is at " #amitcp-dir "\n"
 		#db-note
-		"\n\n"
-		"The network is NOT brought up automatically at boot -- for WiFi the link "
-		"must associate first, so bringing interfaces up at boot is left to you.\n\n"
-		"To configure an interface:\n\n"
-		"  1. Copy an example from 'SYS:Storage/NetInterfaces' into "
-		"'DEVS:NetInterfaces', named after the interface you want "
-		"(for example 'wifipi' or 'eth0').\n\n"
-		"  2. Edit it for your hardware (network card 'device', and either "
-		"'configure=dhcp' or a static 'address'/'netmask'/'gateway').\n\n"
-		"  3. Once your link is ready (WiFi associated, cable in), bring it up with\n"
-		"     'Execute S:Network-Startup' (all interfaces) or\n"
-		"     'AddNetInterface DEVS:NetInterfaces/<name>' -- from a Shell or your own\n"
-		"     WiFi-connect script.\n\n"
-		"Reboot to activate the AmiTCP: assign."
+		"\nThe network is NOT started at boot. Copy an example from\n"
+		"SYS:Storage/NetInterfaces into DEVS:NetInterfaces, edit it,\n"
+		"then 'Execute S:Network-Startup' -- see the ReadMe. Reboot\n"
+		"to activate the AmiTCP: assign."
 	))
 ))
 
@@ -680,6 +1215,60 @@
 		(newname "bsdsocket.library")
 		(confirm "expert")
 	)
+
+	(P_InstallUserGroup)
+
+	; Back up anything in C: that is NOT already recorded as one of ours.
+	;
+	; This path had no backup at all, on the reasoning that everything with our
+	; names is already ours. That holds only for names that shipped in the
+	; release the user already has -- and the command set has grown, adding
+	; exactly the generic names (ftp, ping, netstat, nslookup, tftp, arp,
+	; traceroute, sntp). Upgrading from an earlier AmiTCP_NG therefore
+	; overwrote a user's standalone C:ftp with no backup and no mention, and
+	; the later Uninstall deleted ours and had nothing to put back.
+	;
+	; The manifest is what makes this safe: a name we installed before is in
+	; there, so it is skipped, and only genuinely new names are backed up. That
+	; is the distinction the previous release could not draw, which is why
+	; simply pasting the other loop here would have filed OUR OWN binaries as
+	; the user's originals.
+	;
+	; #ours-list is what keeps this honest, and Main works it out (see "WHICH NAMES
+	; IN C: ARE ALREADY OURS?"): the manifest when the machine has one, otherwise
+	; what the release it was installed by actually shipped.
+	;
+	; Gating the whole loop off when there was no manifest was wrong in a way worth
+	; recording: it made the first upgrade of every existing installation skip the
+	; backup entirely, so the EIGHT names new in this release went straight over
+	; whatever held them -- and three of those names are shipped by Roadshow itself.
+	;
+	; Renamed rather than copied, for the reason given in P_Upgrade: the name is
+	; overwritten by the bulk copy immediately afterwards, so copying only bought a
+	; second copy of the user's file and the C: space to hold it.
+	(foreach #tools-source "#?"
+		(if (and (and (>= (exists (tackon "C:" @each-name) (noreq)) 1)
+			      (= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 0))
+			 (= (exists (tackon #ours-list @each-name) (noreq)) 0))
+		(
+			(rename (tackon "C:" @each-name) (tackon "C:" (cat @each-name ".orig"))
+				(prompt "Backing up your existing " @each-name)
+				(help "Your original command is moved aside to C:" @each-name
+					".orig, where Uninstall can find it and put it back.")
+			)
+			(set #backup-count (+ #backup-count 1))
+		))
+	)
+	; Record the install BEFORE the commands are written -- see the same block in
+	; P_Upgrade for why.
+	;
+	; The order is load-bearing on THIS path in particular: the loop above reads the
+	; previous manifest to tell our own binaries from the user's, so rewriting it
+	; any earlier would make every name look like one of ours and no backup would
+	; ever be taken again.
+	(P_WriteManifest)
+	(P_WriteMarker)
+
 	(copyfiles
 		(prompt "Updating the AmiTCP_NG network commands in C:")
 		(help @copyfiles-help)
@@ -690,15 +1279,24 @@
 
 	(makedir "DEVS:NetInterfaces" (infos))
 	(P_InstallStartup)
-	(P_WriteMarker)
+	; Offer to carry over a user's saved Roadshow tunables (policy only -- the
+	; speed-related ones stay ours; see P_ImportRoadshow).
+	(P_ImportRoadshow)
 
 	(P_DbNote)
+	(P_BackupNote)
 	(message (cat
-		"Your existing AmiTCP_NG installation has been updated to version " #ng-version ".\n\n"
-		"The library and network commands were replaced; your interface configuration "
-		"(DEVS:NetInterfaces) is untouched."
+		"AmiTCP_NG has been updated to version " #ng-version ".\n\n"
+		"The library and network commands were replaced; your\n"
+		"interface configuration is untouched.\n"
+		; The backup loop above fills #backup-note in and this message used to drop
+		; it on the floor -- so the one path that can quietly displace a command of
+		; the user's (a name this release has newly taken) was the one path that
+		; never said which. The other two install paths both print it.
+		#backup-note
+		#moved-note
 		#db-note
-		"\n\nPlease reboot your Amiga to start using the updated AmiTCP_NG."
+		"\nReboot to start using the updated AmiTCP_NG."
 	))
 ))
 
@@ -709,6 +1307,64 @@
 ; ===========================================================================
 (procedure P_Uninstall
 (
+	; Did a branch below actually roll something back? Only then is the install
+	; manifest finished with (see the end of this procedure).
+	(set #undo-done 0)
+
+	; Which list of command names do we undo?
+	;
+	; The manifest -- the record of what THIS machine had installed -- whenever it
+	; is there, because it is the only list that stays right when you uninstall
+	; with a different version of the archive than you installed with.
+	;
+	; But it only exists from this revision onwards. Every machine running a
+	; released AmiTCP_NG has our marker and no manifest, and driving the loops
+	; straight off it made Uninstall a silent no-op on exactly those machines: not
+	; one command removed, not one <name>.orig renamed back, and a closing message
+	; claiming both had happened.
+	;
+	; The fallback must NOT be this archive's own payload. That distinction deletes
+	; user files: these loops do (delete C:<name>) for every name in the list, and
+	; this archive ships eight names v4.1.5 never installed; on a v4.1.5 machine
+	; those eight are the user's, carry no .orig because we never displaced them,
+	; and would be deleted outright by an Uninstall run straight from this archive.
+	;
+	; So Uninstall uses the very same #ours-list as the install paths, worked out in
+	; Main. It is the same question -- "what did we put here?" -- and it had drifted
+	; into two answers.
+	;
+	; Residual, stated honestly. The legacy list is a superset of what the oldest
+	; releases installed: v4.1.0-4.1.4 shipped 11 of its 17 names, and rxprofile
+	; only ever shipped in betas. So on one of those an Uninstall can still delete
+	; a user's own ftp, netstat, nslookup, sntp, tftp or rxprofile. That is much
+	; narrower than the released installer managed -- it enumerated whatever the
+	; archive in your hand happened to carry -- and the manifest ends it for good
+	; from this revision on.
+
+	; Nothing at all unless OUR marker is present.
+	;
+	; The branch used to be chosen by a stray LIBS:bsdsocket.library.orig, or by
+	; the full-install sentinel, and neither is written by every install path --
+	; P_Upgrade skips the library backup when there was no library to back up,
+	; and writes no sentinel. That state is reached by the most ordinary sequence
+	; there is: install, uninstall (which leaves S:Network-Startup behind), then
+	; install again -- the second install takes the upgrade path, records nothing
+	; either test can see, and the second Uninstall reported "nothing was
+	; removed" while leaving the library and every command in place. It then made
+	; it worse by deleting the version marker anyway, so the NEXT install backed
+	; up our own library as if it were the user's, and the one after that
+	; "restored" it to them.
+	;
+	; #ng-marker is written by every install path without exception, so it is the
+	; only honest test for "is this ours". The .orig files below now only choose
+	; restore-versus-delete per file; they no longer choose the branch.
+	(if (= (exists #ng-marker (noreq)) 0)
+	(
+		(message "No AmiTCP_NG installation was found on this machine, so "
+			 "nothing has been changed.")
+		(exit (quiet))
+	))
+
 	(if (>= (exists "LIBS:bsdsocket.library.orig" (noreq)) 1)
 	(
 		; --- undo an UPGRADE: restore the originals we backed up ---
@@ -718,10 +1374,12 @@
 		(rename "LIBS:bsdsocket.library.orig" "LIBS:bsdsocket.library"
 			(prompt "Restoring your previous bsdsocket.library") (help "This moves your backed-up original file back into place."))
 
-		; Undo the command set an upgrade installed: for each command we ship, remove our
-		; copy and, where we backed up the original (C:<name>.orig), move it back.
-		; Commands we added that Roadshow did not have (no .orig) are simply removed.
-		(foreach #tools-source "#?"
+		; Undo the command set this install actually put there -- driven by the
+		; MANIFEST, not by the archive we happen to be running. Enumerating
+		; data/C meant uninstalling with a different version left our extra
+		; commands behind AND stranded the user's <name>.orig forever, because
+		; no later run would ever look for that name again.
+		(foreach #ours-list "#?"
 		(
 			(if (>= (exists (tackon "C:" @each-name) (noreq)) 1)
 				(delete (tackon "C:" @each-name)
@@ -732,7 +1390,31 @@
 					(help "This moves your backed-up original command back into place.")))
 		))
 
-		(set #undo-note "Your previous bsdsocket.library and network commands have been restored.")
+		; usergroup.library, which needs one more test than the stack library does.
+		; The branch we are in was entered because bsdsocket.library.orig exists, and
+		; that says nothing about usergroup: upgrading over a stack that had no
+		; usergroup.library at all leaves ours installed with no .orig beside it. So
+		; remove ours unconditionally, and only restore if there is something to
+		; restore -- an unguarded rename would fail on exactly that machine.
+		(if (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+			(delete "LIBS:usergroup.library"
+				(prompt "Removing the AmiTCP_NG usergroup.library") (help @delete-help)))
+		(if (>= (exists "LIBS:usergroup.library.orig" (noreq)) 1)
+			(rename "LIBS:usergroup.library.orig" "LIBS:usergroup.library"
+				(prompt "Restoring your previous usergroup.library")
+				(help "This moves your backed-up original file back into place.")))
+
+		; Say what actually happened. bsdsocket.library is always restored on
+		; this branch (its .orig existing is what selects the branch), but
+		; usergroup.library only if there was one to restore -- a stack that
+		; never had one leaves no backup, and claiming we put back a file that
+		; never existed is the kind of message that makes a user go looking for
+		; it. Built conditionally, the way #backup-note and #db-note already are.
+		(if (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+			(set #undo-note "Your previous bsdsocket.library, usergroup.library and network commands have been restored.")
+			(set #undo-note "Your previous bsdsocket.library and network commands have been restored.")
+		)
+		(set #undo-done 1)
 	)
 	; No upgrade backup is present. Only tear anything down if a FULL install of OURS is
 	; actually here -- detected by our own full-install sentinel (#fullinstall-marker),
@@ -747,44 +1429,245 @@
 		(if (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
 			(delete "LIBS:bsdsocket.library"
 				(prompt "Removing the AmiTCP_NG library") (help @delete-help)))
+		(if (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+			(delete "LIBS:usergroup.library"
+				(prompt "Removing the AmiTCP_NG usergroup.library") (help @delete-help)))
+		; A full install is only offered on a machine with no stack, but a
+		; usergroup.library could still have been there on its own and been backed up
+		; by P_InstallUserGroup's insurance copy. Put it back if so.
+		(if (>= (exists "LIBS:usergroup.library.orig" (noreq)) 1)
+			(rename "LIBS:usergroup.library.orig" "LIBS:usergroup.library"
+				(prompt "Restoring your previous usergroup.library")
+				(help "This moves your backed-up original file back into place.")))
 
-		; Delete exactly the commands we install, by enumerating our own C: payload.
-		(foreach #tools-source "#?"
+		; Delete exactly the commands we install, by enumerating our own C:
+		; payload -- then put back anything we displaced.
+		;
+		; The restore half used to be missing here, and only on this branch: a
+		; full install now backs up a command it would overwrite (a standalone
+		; C:ftp or C:ping from some other package), so without this the user's
+		; original survived the install and was then stranded as ftp.orig by the
+		; uninstall, leaving them with no working ftp at all -- while the ReadMe
+		; promised it would be put back. Same loop the upgrade branch already
+		; had; the backup and the restore have to be added as a pair. Driven by
+		; the manifest, for the same reason as the upgrade branch above.
+		(foreach #ours-list "#?"
+		(
 			(if (>= (exists (tackon "C:" @each-name) (noreq)) 1)
 				(delete (tackon "C:" @each-name)
-					(prompt "Removing " @each-name) (help @delete-help))
-			)
-		)
+					(prompt "Removing " @each-name) (help @delete-help)))
+			(if (>= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 1)
+				(rename (tackon "C:" (cat @each-name ".orig")) (tackon "C:" @each-name)
+					(prompt "Restoring your previous " @each-name)
+					(help "This moves your backed-up original command back into place.")))
+		))
 
 		; Remove the sentinel last, so a repeated Uninstall becomes a clean no-op.
 		(delete #fullinstall-marker (prompt "Removing the AmiTCP_NG install marker") (help @delete-help))
-		(set #undo-note "The AmiTCP_NG library and commands have been removed.")
+		; A stray pre-existing usergroup.library, if there was one, has just been
+		; put back by the restore above -- mention it, or someone who forgot they
+		; had one years ago gets no hint that it reappeared.
+		(if (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+			(set #undo-note "The AmiTCP_NG libraries and commands have been removed, and the usergroup.library that was here before was restored.")
+			(set #undo-note "The AmiTCP_NG libraries and commands have been removed.")
+		)
+		(set #undo-done 1)
 	)
 	(
 		; --- nothing of ours detected: change nothing (safe on a repeated Uninstall) ---
 		(set #undo-note "No AmiTCP_NG installation was detected, so nothing was removed.")
 	)))
 
-	; Remove the AmiTCP_NG version marker (it identifies our install; once gone, a later
-	; run sees no AmiTCP_NG and treats the machine accordingly).
-	(if (>= (exists #ng-marker (noreq)) 1)
+	; Clear the install manifest -- HERE, at the point it has finished being read,
+	; and only when a branch above actually acted on it.
+	;
+	; Not on the no-op branch: that one leaves our commands in place, so throwing
+	; away the record of which commands they are would strand them permanently --
+	; no later run could ever identify them again, and the user's <name>.orig files
+	; would never be renamed back.
+	;
+	; The existence test is not decoration: the manifest is absent on every machine
+	; installed by a released version, and it was lost when this block was moved
+	; here out of P_WriteMarker, where it had always had one.
+	(if (and (= #undo-done 1) (>= (exists #manifest (noreq)) 1))
+	(
+		(foreach #manifest "#?"
+			(delete (tackon #manifest @each-name)))
+		(delete #manifest (prompt "Removing the AmiTCP_NG install record")
+			(help @delete-help))
+	))
+
+	; Remove the AmiTCP_NG version marker -- but ONLY if something was actually
+	; rolled back.
+	;
+	; It used to go unconditionally, which contradicted the branch right above it:
+	; the no-op branch deliberately keeps the manifest so a later run can still
+	; identify our commands, and then this deleted the very marker that lets a later
+	; run get that far (the gate at the top of this procedure exits without it). The
+	; machine still has our library and our commands, so it should still say so.
+	(if (and (= #undo-done 1) (>= (exists #ng-marker (noreq)) 1))
 		(delete #ng-marker (prompt "Removing the AmiTCP_NG version marker") (help @delete-help)))
 
 	; Drop the AmiTCP: assign (this session) and neutralise the S:User-Startup hook by
 	; replacing our tagged block with a harmless comment.
-	(makeassign "AmiTCP" (safe))
-	(startup #app
-		(prompt "Removing the AmiTCP_NG lines from S:User-Startup")
-		(help @startup-help)
-		(command "; AmiTCP_NG has been uninstalled")
+	;
+	; Also gated, because the no-op branch means the library and the commands are
+	; still installed. Stripping the assign and the startup lines out from under a
+	; working installation, while reporting "nothing was removed", left a stack that
+	; could not find its own database -- the one outcome worse than either doing the
+	; job or leaving well alone.
+	(if (= #undo-done 1)
+	(
+		(makeassign "AmiTCP" (safe))
+		(startup #app
+			(prompt "Removing the AmiTCP_NG lines from S:User-Startup")
+			(help @startup-help)
+			(command "; AmiTCP_NG has been uninstalled")
+		)
+	))
+
+	(if (= #undo-done 1)
+		(message (cat
+			#undo-note "\n\n"
+			"Your 'AmiTCP' drawer and your interface configuration in DEVS:NetInterfaces "
+			"were left in place; delete them by hand if you no longer want them.\n\n"
+			"Please reboot your Amiga to complete the rollback."
+		))
+		; The no-op case, told properly. "Nothing was removed" on its own reads like
+		; a failure and leaves the user with no idea what state the machine is in.
+		(message (cat
+			"AmiTCP_NG is installed on this machine, but this installer cannot find\n"
+			"the record of what it replaced -- there is no backed-up library and no\n"
+			"full-install marker.\n\n"
+			"Nothing has been changed. The alternative was to delete files with\n"
+			"nothing to put back in their place.\n\n"
+			"To remove it by hand, IN THIS ORDER:\n\n"
+			"  1. The AmiTCP_NG commands in C: (listed in '" #ours-list "').\n"
+			"  2. 'LIBS:bsdsocket.library' and 'LIBS:usergroup.library'.\n"
+			"  3. The AmiTCP_NG block in 'S:User-Startup', and the AmiTCP: assign.\n"
+			"  4. LAST of all, '" #ng-marker "' (and '" #manifest "' if present).\n\n"
+			; The order is not tidiness. Deleting the marker first makes the next
+			; run see a foreign stack rather than ours, and its upgrade path would
+			; then move whatever of our commands were left in C: aside as though
+			; they were the user's own files -- and report them as such.
+			"Leaving the marker until last matters: without it, running this\n"
+			"installer again treats what is left as somebody else's stack."
+		))
+	)
+))
+
+; ===========================================================================
+;  Build #cmd-list (and #cmd-n, the count) from the commands this archive really
+;  carries, for Preview to show.
+;
+;  Preview used to carry a hand-written list of twelve names. Twice that many are
+;  installed (and a beta archive carries one more again). Every command added since that list was written -- ping, netstat,
+;  ftp, tftp, nslookup, sntp, arp, traceroute and the new tools -- went in without
+;  being named, and those are precisely the generic names most likely to collide
+;  with something the user already has in C:. A preview that under-reports what it
+;  will overwrite is worse than no preview, because it was believed.
+;
+;  Reading the payload drawer means the list cannot drift from what is shipped
+;  again: add a command to the archive and Preview names it, with no second place
+;  to remember to edit.
+; ===========================================================================
+;  It also builds #clash-list / #clash-n: the names that are in C: RIGHT NOW and
+;  would be moved aside to <name>.orig. That is the part a user actually needs --
+;  "we install ftp" only matters to someone who has an ftp of their own -- and it
+;  is answerable here, so Preview answers it instead of describing the rule and
+;  leaving them to check two dozen names by hand.
+;
+;  The test is a copy of the one the install loops use, so the two cannot disagree:
+;  a file must be there, must not already have a .orig beside it (an earlier backup
+;  is never clobbered, so that name gets overwritten without a new one), and on an
+;  update must not be recorded in the manifest as ours from last time.
+(procedure P_CommandList
+(
+	(set #cmd-list "")
+	(set #cmd-n 0)
+	(set #clash-list "")
+	(set #clash-n 0)
+
+	; Preview reads the SAME #ours-list the install will use (worked out in Main),
+	; so it cannot describe an install that will not happen -- and it reads it
+	; without writing anything, which is why the legacy list is a drawer in the
+	; archive rather than something the install has to seed first.
+	;
+	; usergroup.library needs saying separately: it is not a C: command, so the
+	; clash list below does not cover it, and the update branch of Preview was the
+	; one place that never mentioned it.
+	(set #ug-note "")
+	(if (and (= #ours 1) (= #ug-ours 0))
+		(if (and (>= (exists "LIBS:usergroup.library" (noreq)) 1)
+			 (= (exists "LIBS:usergroup.library.orig" (noreq)) 0))
+			(set #ug-note (cat
+				"  * Move LIBS:usergroup.library aside to .orig first: this release\n"
+				"    is the first to install one, so the one you have is not ours.\n"))
+		)
 	)
 
-	(message (cat
-		#undo-note "\n\n"
-		"Your 'AmiTCP' drawer and your interface configuration in DEVS:NetInterfaces "
-		"were left in place; delete them by hand if you no longer want them.\n\n"
-		"Please reboot your Amiga to complete the rollback."
+	(foreach #tools-source "#?"
+	(
+		; THREE names per line, not four. Long lines in a requester cannot be
+		; relied on to wrap, so the breaks are put in here -- and the break is by
+		; COUNT while the limit is a WIDTH. Our longest names run to 21
+		; characters (ConfigureNetInterface, CheckAmiTCPNGConfig,
+		; ManageNetInterfaces), and foreach returns directory order, not the order
+		; they are listed in the build script -- so the long ones can land together.
+		; Four of them plus indent and separators comes to 87 columns and is cut
+		; off; three is 67 and always fits.
+		;
+		; (- n (* (/ n 3) 3)) is n modulo 3: the Installer has no modulo operator,
+		; and its (/) is integer division, which makes this the standard spelling.
+		(if (= #cmd-n 0)
+			(set #cmd-list (cat "    " @each-name))
+			(if (= (- #cmd-n (* (/ #cmd-n 3) 3)) 0)
+				(set #cmd-list (cat #cmd-list ",\n    " @each-name))
+				(set #cmd-list (cat #cmd-list ", " @each-name))
+			)
+		)
+		(set #cmd-n (+ #cmd-n 1))
+
+		; Would this name displace a file of the user's?
+		(set #cl-skip 0)
+		(if (= (exists (tackon "C:" @each-name) (noreq)) 0)
+			(set #cl-skip 1))
+		(if (>= (exists (tackon "C:" (cat @each-name ".orig")) (noreq)) 1)
+			(set #cl-skip 1))
+		; Only on the update path is the manifest meaningful: it records what WE
+		; put there last time, and those are not the user's files. On the other
+		; paths there is no manifest of ours to consult, and consulting a stale
+		; one left behind by a removed install would under-report -- which is the
+		; exact failure this whole procedure exists to end.
+		(if (and (= #ours 1)
+			 (>= (exists (tackon #ours-list @each-name) (noreq)) 1))
+			(set #cl-skip 1))
+
+		(if (= #cl-skip 0)
+		(
+			(if (= #clash-n 0)
+				(set #clash-list (cat "    " @each-name))
+				(if (= (- #clash-n (* (/ #clash-n 3) 3)) 0)
+					(set #clash-list (cat #clash-list ",\n    " @each-name))
+					(set #clash-list (cat #clash-list ", " @each-name))
+				)
+			)
+			(set #clash-n (+ #clash-n 1))
+		))
 	))
+
+	; One sentence naming exactly what would move, or saying plainly that nothing
+	; would. Built here so all three Preview branches say the same true thing.
+	; Careful with the zero case: on an update every one of those names IS in C: --
+	; they are ours, and correctly excluded. The claim to make is about the user's
+	; files, not about what is in the drawer.
+	(if (= #clash-n 0)
+		(set #clash-note
+			"\n  * Move nothing of yours aside: none of those names belongs to a file of yours.")
+		(set #clash-note (cat
+			"\n  * Move " #clash-n " file(s) of yours aside first, renamed to '<name>.orig'\n"
+			"    so nothing is lost, and put back by Uninstall:\n\n" #clash-list))
+	)
 ))
 
 ; ===========================================================================
@@ -792,45 +1675,88 @@
 ; ===========================================================================
 (procedure P_Preview
 (
+	(P_CommandList)
 	(if #ours
 		(set #plan (cat
-			"An AmiTCP_NG UPDATE would be performed (an existing AmiTCP_NG install was found):\n\n"
-			"  * Replace 'LIBS:bsdsocket.library' with this version (" #ng-version ").\n"
-			"  * Replace the AmiTCP_NG network commands in C:.\n"
-			"  * Leave DEVS:NetInterfaces untouched, and leave every setting already in\n"
-		"    your 'AmiTCP' drawer as it is -- adding only settings this release\n"
-		"    introduced that are missing from db/AmiTCP.config and db/netdb.\n"
-			"  * Make no new backups; any original pre-AmiTCP_NG stack backup is preserved\n"
-			"    for Uninstall."
+			"An AmiTCP_NG UPDATE would be performed (version " #ng-version "):\n\n"
+			"  * Replace LIBS:bsdsocket.library and LIBS:usergroup.library.\n"
+			; The one branch where the usergroup rule changed was the one that did
+			; not mention it. On a machine with no manifest -- every machine running
+			; a released version -- the usergroup.library present is NOT ours, and
+			; the install really does back it up. #clash-note covers C: only.
+			#ug-note
+			"  * Write " #cmd-n " commands into C: (named on the next screen).\n"
+			"  * Keep DEVS:NetInterfaces and every setting in your AmiTCP drawer,\n"
+			"    adding only settings this release introduces.\n"
+			"  * Point AmiTCP: at " #amitcp-dir ", and rewrite the AmiTCP_NG\n"
+			"    lines in S:User-Startup to name it.\n"
+			"  * Leave any pre-AmiTCP_NG library backup alone, for Uninstall."
 		))
 	(if #existing
 		(set #plan (cat
 			"An UPGRADE would be performed (an existing bsdsocket.library was found):\n\n"
-			"  * Create " #amitcp-dir "/db and install the network database there.\n"
-			"  * Set up the 'AmiTCP:' assign to " #amitcp-dir ".\n"
-			"  * Back up 'LIBS:bsdsocket.library' to 'LIBS:bsdsocket.library.orig'.\n"
-			"  * Replace 'LIBS:bsdsocket.library' with AmiTCP_NG.\n"
-			"  * Back up your existing network commands (Online, AddNetInterface,\n"
-			"    ShowNetStatus, ...) to 'C:<name>.orig' and install AmiTCP_NG's own.\n"
-			"  * Add the AmiTCP: assign and Network-Startup to 'S:User-Startup'.\n\n"
-			"Your interface configuration (DEVS:NetInterfaces) would be left untouched. "
-			"Roadshow's own config tools drive AmiTCP_NG down a path that hangs, so we "
-			"install our commands over them; Uninstall restores your originals."
+			"  * Create " #amitcp-dir "/db, install the network database, and\n"
+			"    assign AmiTCP: to it.\n"
+			"  * Move LIBS:bsdsocket.library aside to .orig (an existing backup is\n"
+			"    never overwritten) and install ours. Same for usergroup.library.\n"
+			"  * Write " #cmd-n " commands into C: (named on the next screen).\n"
+			"  * Add the AmiTCP: assign to S:User-Startup, with a background touch\n"
+			"    that brings the loopback interface up. No network card is started\n"
+			"    at boot -- you do that when the link is ready.\n"
+			"\nDEVS:NetInterfaces is left untouched. The commands are replaced\n"
+			"because Roadshow's own config tools drive AmiTCP_NG down a path\n"
+			"that hangs; Uninstall restores your originals."
 		))
 		(set #plan (cat
 			"A FULL INSTALL would be performed (no existing stack was found):\n\n"
-			"  * Create " #amitcp-dir "/db and install the network database there.\n"
-			"  * Set up the 'AmiTCP:' assign to " #amitcp-dir ".\n"
-			"  * Install 'LIBS:bsdsocket.library'.\n"
-			"  * Install our network commands into C: (Online, Offline, AddNetInterface,\n"
-			"    ConfigureNetInterface, AddNetRoute, DeleteNetRoute, RemoveNetInterface,\n"
-			"    NetShutdown, GetNetStatus, ShowNetStatus, ping).\n"
-			"  * Install 'S:Network-Startup', example interface configs into\n"
-			"    SYS:Storage/NetInterfaces, and a DEVS:Internet/hosts file.\n"
-			"  * Add the AmiTCP: assign and Network-Startup to 'S:User-Startup'."
+			"  * Create " #amitcp-dir "/db, install the network database, and\n"
+			"    assign AmiTCP: to it.\n"
+			"  * Install LIBS:bsdsocket.library and LIBS:usergroup.library (moving\n"
+			"    an existing usergroup.library aside to .orig first).\n"
+			"  * Write " #cmd-n " commands into C: (named on the next screen).\n"
+			"  * Install S:Network-Startup and example interface configurations\n"
+			"    into SYS:Storage/NetInterfaces.\n"
+			"  * Install an example DEVS:Internet/hosts -- only if you have none.\n"
+			"    An existing host table is never touched.\n"
+			"  * Add the AmiTCP: assign to S:User-Startup, with a background touch\n"
+			"    that brings the loopback interface up. No network card is started\n"
+			"    at boot -- you do that when the link is ready."
 		))
 	))
+	; An existing configuration being carried to the drawer just chosen is a real
+	; change to the machine, so Preview has to say it will happen. Reported off
+	; #have-cfg, not #cfg-moved: the latter is set by the install itself, which by
+	; definition has not run.
+	(if (and (= #have-cfg 1)
+		 (= (exists (tackon #amitcp-dir "db/AmiTCP.config") (noreq)) 0))
+		(set #plan (cat #plan
+			"\n  * Copy the AmiTCP configuration already on this machine into\n"
+			"    " #amitcp-dir "/db, so choosing this location does not leave your\n"
+			"    settings behind. The drawer it is in now is only read."
+		))
+	)
+	; Preview must describe everything an install would do, including the offer
+	; to carry settings over -- otherwise it under-reports.
+	(if (exists "ENVARC:Roadshow" (noreq))
+		(set #plan (cat #plan
+			"\n  * Offer to carry over your saved Roadshow settings (IP forwarding,\n"
+			"    ICMP redirects, subnets-are-local, TTL, mask replies, UDP\n"
+			"    checksums). Speed settings are not -- AmiTCP_NG sizes those from\n"
+			"    this machine. Your Roadshow configuration is only read."
+		))
+	)
 	(message #plan
+		(prompt "Preview -- nothing has been changed on your system.")
+	)
+	; The command list gets a requester of its own rather than being pasted onto
+	; the end of the plan. Together they came to nearly thirty lines, and the
+	; Installer gives a message no scrollbar -- on a 640x200 screen the tail simply
+	; would not be there, and the tail is the part that names what gets displaced.
+	(message (cat
+		"These are the " #cmd-n " commands that would be written into C:\n\n"
+		#cmd-list "\n"
+		#clash-note
+	)
 		(prompt "Preview -- nothing has been changed on your system.")
 	)
 ))
@@ -844,7 +1770,83 @@
 	"providing a drop-in 'bsdsocket.library'."
 ))
 
-; AmiTCP_NG is a plain MC68000 build and runs on every Amiga -- no CPU choice.
+; ---------------------------------------------------------------------------
+; PRE-RELEASE GATE. Before the CPU check, before any question, before anything is
+; read or written -- because the point of it is that some people should stop here.
+;
+; Refusing by default is the whole design. The Installer answers every question
+; itself at Novice level, so a default of "yes" would put a test build on the
+; machine of precisely the person least equipped to deal with it, without ever
+; showing them this text. Defaulting to no means the careless path is the safe one.
+; ---------------------------------------------------------------------------
+(if (= #ng-prerelease 1)
+(
+	; The answer goes into a variable and the variable is tested, rather than
+	; comparing an (askbool ...) form in place. Both halves of that are patterns
+	; the shipped installer already uses; testing a question inline is not, and
+	; unattested constructions in this file have now cost one broken release.
+	; Testing for NO also avoids an (if) whose first branch is ().
+	(set #pre-ok (askbool
+		; ELEVEN LINES, and it has to stay that way: this requester shows about 13
+		; and there is no scrollbar, so anything past the bottom is simply not
+		; there -- including the question itself. Keep the lines short too; long
+		; ones are clipped, not wrapped.
+		(prompt "*** PRE-RELEASE TEST BUILD -- NOT A RELEASE ***\n\n"
+			"AmiTCP_NG " #ng-version " is unfinished software, for testing.\n\n"
+			"  * It replaces your TCP/IP stack and network commands.\n"
+			"  * It has NOT had the testing a release gets.\n"
+			"  * These files are replaced without notice.\n\n"
+			"Back up first, and know how to boot without it.\n\n"
+			"Install this pre-release anyway?")
+		(help "A test build, not a finished release.\n\n"
+			"No stops the installer now, having changed nothing.\n\n"
+			"Say Yes only if you mean to help test it, you have a backup, and "
+			"you can recover this machine if its networking stops working.\n\n"
+			"For a version to USE, take the newest release NOT marked as a "
+			"pre-release.")
+		(default 0)))
+	(if (= #pre-ok 0)
+		(abort "Nothing was installed and nothing has been changed.\n\n"
+			"For a version to use, take the newest AmiTCP_NG release "
+			"that is not marked as a pre-release."))
+))
+
+; ---------------------------------------------------------------------------
+; Refuse a CPU-specific archive on a CPU that cannot run it. FIRST, before any
+; question is asked or any file is touched: past this point the script writes to
+; S:User-Startup, and a machine that Gurus at boot cannot be talked out of it.
+;
+; Ranked, never matched exactly -- (database "cpu") reports a 68060 as "68040"
+; on older Installer versions, so an equality test would reject the fastest
+; machines we support. "At least" is the only safe comparison.
+;
+; (database "cpu") is read ONCE into a variable and the variable is used
+; everywhere after. Assigning a database lookup to a name is what the shipped
+; AmiTCP 3.0b2 script does; calling it inside a comparison, and again inside an
+; (abort), is not a form anything here is known to accept -- and this whole guard
+; runs before the first question, so if it is rejected nobody can install at all.
+(set #cpu-name (database "cpu"))
+
+(set #this-cpu 0)
+(if (= #cpu-name "68010") (set #this-cpu 10))
+(if (= #cpu-name "68020") (set #this-cpu 20))
+(if (= #cpu-name "68030") (set #this-cpu 30))
+(if (= #cpu-name "68040") (set #this-cpu 40))
+(if (= #cpu-name "68060") (set #this-cpu 60))
+
+(if (< #this-cpu #ng-cpu)
+	; Arguments passed straight to (abort), not wrapped in a (cat). The shipped
+	; AmiTCP 3.0b2 script aborts with a plain run of strings; (abort (cat ...))
+	; is not a form anything here is known to accept.
+	(abort "This archive holds the 680" #ng-cpu " build of AmiTCP_NG, but this "
+		"Amiga has a " #cpu-name ".\n\n"
+		"It would install without complaint and then crash on the next "
+		"reboot, because part of it runs at start-up -- so this stops here "
+		"instead.\n\n"
+		"Use the plain AmiTCP_NG archive (no CPU suffix in its name). That "
+		"one runs on every Amiga, and on this machine it is the right "
+		"choice, not a compromise.")
+)
 
 ; Detect an existing TCP/IP stack from SEVERAL independent signals, to pick UPGRADE
 ; vs FULL INSTALL automatically (a full install over an existing stack would be
@@ -860,6 +1862,80 @@
 ; straight version upgrade rather than a foreign-stack replace.
 (set #ours 0)
 (if (>= (exists #ng-marker (noreq)) 1) (set #ours 1))
+
+; Is there already an AmiTCP configuration drawer on this machine? We cannot ask
+; WHERE it is -- the Installer will not turn an assign back into a path -- but the
+; AmiTCP: assign reaches it, which is enough both to warn about the destination
+; question and to copy the contents wherever the user sends us (P_SetupConfig).
+;
+; (noreq) is what makes this safe on a machine with no such assign: it suppresses
+; the "please insert volume AmiTCP:" requester and simply answers 0.
+(set #have-cfg 0)
+(if (>= (exists "AmiTCP:db/AmiTCP.config" (noreq)) 1) (set #have-cfg 1))
+
+; Can we look inside a file? Needed by the version test below and by P_MergeFile.
+; Worked out once, here, rather than separately in each place that wants it --
+; Preview never calls P_SetupConfig, so a copy living in there was unavailable to
+; exactly the run that has to describe what the install would decide.
+(set #cansearch 0)
+(if (>= (exists "C:Search" (noreq)) 1) (set #cansearch 1))
+
+; ---------------------------------------------------------------------------
+;  WHICH NAMES IN C: ARE ALREADY OURS?
+;
+;  Every path that must not mistake our own binaries for the user's files reads
+;  the answer from here -- the update path's backup loop, Preview's account of it,
+;  usergroup.library, and Uninstall's delete/restore loops. One decision, made once,
+;  because when this was decided separately in each place the copies disagreed:
+;  one of them fell back to THIS archive's payload, which on an older machine names
+;  eight commands we never installed -- and Uninstall deletes what the list names.
+;
+;  #ours-gen says whether the machine already has the current generation of the
+;  install (the full command set plus usergroup.library), whatever list said so.
+; ---------------------------------------------------------------------------
+(set #ours-gen  0)
+(set #ours-list #legacy)
+
+(if (>= (exists #manifest (noreq)) 1)
+	; A manifest: the machine tells us itself, exactly, and no guessing is needed.
+	(
+		(set #ours-list #manifest)
+		(set #ours-gen  1)
+	)
+	; No manifest, so the machine predates one. Ask whether it is nonetheless a
+	; COMPLETE 4.1.6 beta: the marker names 4.1.6 AND both commands that only a
+	; complete build installs are present. All three must agree.
+	;
+	; If C:Search is missing we cannot ask, and we keep the older answer. That
+	; asymmetry is deliberate and worth stating plainly: guessing "older" costs a
+	; backup of our own binary, wrongly described to the user as theirs, which
+	; Uninstall then restores -- irritating, recoverable, nothing lost. Guessing
+	; "current" overwrites a file of the user's with no backup at all, and has
+	; Uninstall delete it. Only one of those is undoable.
+	(if (and (= #ours 1) (= #cansearch 1))
+	(
+		(set #proof 0)
+		(if (and (>= (exists #proof-a (noreq)) 1)
+			 (>= (exists #proof-b (noreq)) 1))
+			(set #proof 1))
+		; The return code goes into a variable before it is compared, the way
+		; P_MergeFile has always done it -- that form is in the shipped installer,
+		; comparing a (run ...) in place is not.
+		(set #ng-rc (run (cat "C:Search >NIL: \"" #ng-marker "\" SEARCH \""
+					#legacy-cutover "\" QUIET")))
+		(if (and (= #proof 1) (= #ng-rc 0))
+		(
+			(set #ours-list #legacy416)
+			(set #ours-gen  1)
+		))
+	))
+)
+
+; usergroup.library ships for the first time in this release, so it is ours only
+; on a machine of the current generation. On anything older the library present
+; belongs to somebody else (Roadshow's, or AmiTCP 3.0b2's) and must be backed up.
+(set #ug-ours 0)
+(if (and (= #ours 1) (= #ours-gen 1)) (set #ug-ours 1))
 
 ; Choose the action.
 (set #action

@@ -47,14 +47,273 @@ stock A500 up.
 
 # The full Roadshow-compatible command set
 ./docker/build-tools.sh           #  -> build/Online build/Offline build/AddNetInterface ...
+
+# LIBS:usergroup.library — the user/group/account library (independent of the stack)
+./docker/build-usergroup.sh       #  -> build/usergroup.library
 ```
+
+### `usergroup.library`
+
+Roadshow ships `LIBS:usergroup.library`; AmiTCP_NG historically shipped only its
+*headers*, so installing our stack over Roadshow took that library away from any
+software using it. `docker/build-usergroup.sh` builds our own.
+
+It shares no code with the stack (bar `src/api/amiga_errlists.c`, the errno
+strings `ug_StrError()` returns) and does not need the stack running — it is a
+standalone library about accounts, not networking.
+
+The ABI is not guesswork: our `fd/usergroup_lib.fd` and Roadshow's SFD list the
+same 39 functions in the same order from bias 30, and three independent sources
+agree on every offset (the FD, the gcc inline stubs in
+`netinclude/inline/usergroup.h`, and Roadshow's pragmas).
+
+The account data comes from `DEVS:Internet/users` and `DEVS:Internet/groups` —
+Roadshow's own files, in AmigaDOS `ReadArgs` format, not Unix colon-separated
+ones:
+
+```
+users    NAME/A,PASSWORD/K,UID/A/N,GID/A/N,GECOS,DIR,SHELL      e.g.  NAME=root UID=0 GID=0
+groups   NAME/A,ID/A/N,USERS/M                                  e.g.  NAME=wheel ID=0 USERS=root
+```
+
+Either file may be missing, in which case the built-in `root`/`nobody` and
+`wheel`/`nogroup` entries are used — the same ones Roadshow ships.
+
+**Six vectors, in two groups, are deliberately not implemented**, and both groups match what Roadshow's
+own 4.31 binary appears to do:
+
+- `crypt()` — the 4.3BSD DES password hash. Reproducing DES from memory risks a
+  function that computes confident *wrong* hashes and rejects every correct
+  password, so it is not attempted. It returns `"*"` (the traditional "cannot log
+  in" marker) and sets `ENOSYS`: a valid string that can never match a stored
+  hash, so password checks fail closed rather than crash on a `NULL`.
+- `utmp` / `lastlog` — the login-session databases. They need a login program
+  maintaining them; nothing here writes one, so `getutent()` reports an empty
+  database and `setlastlog()` returns `ENOSYS` rather than pretending to record.
+
+## The network databases
+
+The stack loads `AmiTCP:db/netdb` — AmiTCP's single tagged file, carrying `H`ost,
+`N`et, `S`ervice and `P`rotocol records — and then the Roadshow-style files in
+`DEVS:Internet`:
+
+```
+DEVS:Internet/hosts       address name [aliases...]
+DEVS:Internet/networks    name address [aliases...]
+DEVS:Internet/protocols   name number [aliases...]
+DEVS:Internet/services    name port/proto [aliases...]
+```
+
+Reading these closes a compatibility gap that lost real configuration: install
+over Roadshow and every services, protocols and networks entry you had ever
+customised silently stopped existing. It also fixes something worse and closer to
+home — we *installed* a `DEVS:Internet/hosts` file, and `CheckAmiTCPNGConfig`
+validated it, while nothing whatsoever read it. Adding a host there did nothing
+at all, and our own checker said the file was fine.
+
+No new parser was needed. `read_netdb()` could already parse a file whose lines
+are one record type with the leading letter omitted (that is what
+`WITH file PREFIX SERVICE` does), and the per-record formats turned out to be the
+ones Roadshow already writes. The one difference was the separator: Roadshow
+accepts `80,tcp` as well as `80/tcp`, so `addservent()` now takes both.
+
+**Order is precedence, and it is deliberate.** Lookups return the first match, so
+these files are read *after* `netdb`, making them purely additive: no name that
+resolves today starts resolving differently, and the only change is that names
+which previously did not resolve at all now do. On a stack people already run,
+"adds entries" is a much safer promise than "may quietly change which port a
+service means". A missing file is the normal case and is silent; a file that *is*
+read logs one line saying how many entries came out of it, which is the thing
+that answers "did it pick up my file?".
+
+One thing worth knowing: network numbers go through `inet_aton()`, whose one-part
+rule is that the whole value *is* the address — so `127` yields `0.0.0.127`, not
+the `127.0.0.0` someone thinking in network numbers would expect. That predates
+this change and applies equally to `netdb`'s own `N loopback 127`; write the
+address in full if it matters to you.
 
 `build-tools.sh` builds, and lists with sizes:
 
 ```
 Online, Offline, AddNetInterface, ConfigureNetInterface, RemoveNetInterface,
-NetShutdown, AddNetRoute, DeleteNetRoute, GetNetStatus, ShowNetStatus, ping
+NetShutdown, AddNetRoute, DeleteNetRoute, GetNetStatus, ShowNetStatus,
+AmiTCPControl, arp, SampleNetSpeed, traceroute, CheckAmiTCPNGConfig,
+NetLogViewer, ManageNetInterfaces, PacketCapture, ping, netstat, tftp,
+nslookup, ftp, sntp
 ```
+
+(`rxprofile` is built too, but ships only in `-beta` releases — see
+`build-release.sh`.)
+
+`PacketCapture` captures frames off an interface through the library's Berkeley
+Packet Filter vectors, prints a line per packet, and — the part that matters —
+writes a **libpcap file** that opens in Wireshark or `tcpdump -r`.
+
+```
+PacketCapture INTERFACE [FILE pcap] [COUNT n] [SNAPLEN n]
+              [PROMISC] [QUIET]
+```
+
+The file is the point. Diagnosing a network at a distance has so far meant
+working from a description of the symptom; a capture is the network itself. It
+is written big-endian, which needs no byte swapping on a 68k and none at the far
+end either — pcap's magic number is exactly what tells a reader which way round
+the file is.
+
+Timestamps are converted from Amiga system time (epoch 1 Jan 1978) to Unix time
+on the way out. Without that every capture would open dated eight years early
+and could not be lined up against a capture taken anywhere else.
+
+Ethernet interfaces capture as `DLT_EN10MB`; `lo0` captures as `DLT_NULL`, whose
+"link layer" is a four-byte address family. That loopback tap did not exist
+until this tool went looking for it — `bpf_dlt_of()` already reported `DLT_NULL`
+for `IFT_LOOP`, but nothing in `if_loop.c` ever called the tap, so a capture on
+`lo0` was silently always empty. It is now taken once in `looutput()`, before the
+packet is enqueued and while it is still ours to read.
+
+`SNAPLEN` keeps only the first N bytes of each packet, which is how you capture
+a long run of traffic onto an Amiga-sized disk when the headers are all you
+need. There is no "capture N bytes" ioctl to call: the number of bytes kept is
+whatever the channel's *filter* returns, and a channel with no filter keeps
+whole frames — so `SNAPLEN` is expressed as a one-instruction filter program,
+`BPF_RET | BPF_K`. Omitting it installs no filter at all and captures
+everything. If the library refuses the filter, the tool says so and records the
+real (untruncated) length in the file header rather than letting the file claim
+a truncation that never happened.
+
+Stop with Ctrl-C. That arrives as `EINTR` out of the blocking read rather than
+as a signal the tool gets to poll, and is treated as a normal stop, not a
+failure. The closing line reports how many packets the filter matched and how
+many the library had to drop — a non-zero drop count means the capture has
+holes in it. A failed write is reported too, and exits non-zero: a truncated
+pcap that is announced as written gets analysed anyway.
+
+`ManageNetInterfaces` keeps `DEVS:NetInterfaces` down to the interfaces this
+machine can actually bring up, parking the rest in `SYS:Storage/NetInterfaces`.
+
+```
+ManageNetInterfaces [INSTALL|CLEANUP|SYNC] [CHECK] [COMMIT]
+                    [QUIET] [VERBOSE] [IGNOREDEVICES "dev,dev"]
+```
+
+The test is a real `OpenDevice()`, immediately closed with no command sent — not
+"does the driver file exist". The case it exists for is a driver that is present
+but unusable: `a2065.device` in `DEVS:Networks` on a machine with no Zorro bus
+opens never and exists always, and a config left active for it makes every boot
+try and fail. Nothing is put online and no packet moves.
+
+**It changes nothing unless you say `COMMIT`.** With neither switch it reports
+what it would do and stops, which is the right default for a tool whose job is
+moving your configuration files. `CHECK` is the explicit spelling of that.
+`IGNOREDEVICES` protects named drivers from being parked — useful for hardware
+that is genuinely absent right now but will be back (a PCMCIA card, a docked
+adaptor).
+
+`SYNC` runs CLEANUP before INSTALL, so parking a dead interface frees its name
+before a parked config that wants it is promoted.
+
+`NetLogViewer` watches the stack's log as it happens, with scrollback.
+
+```
+NetLogViewer [FILE name] [LINES n] [FILTER text] [LEVEL n] [LIVE]
+             [LEFT n] [TOP n] [WIDTH n] [HEIGHT n]
+```
+
+**Finding the log.** With no `FILE`, it works out where the stack is actually
+writing rather than assuming: `LOGFILENAME=` from `AmiTCP:db/AmiTCP.config`, then
+each of the destinations the stack falls back through (`ram:`, `t:`, `AmiTCP:`,
+`sys:`), taking the first that exists. `LIVE` instead asks the running stack
+(`SBTC_LOG_FILE_NAME`), which is the only fully authoritative answer because it
+reports the destination *in use* including any fallback — at the cost of opening
+`bsdsocket.library`, which starts the whole stack if it is not already up. That
+is why it is opt-in and not the default.
+
+If there is nothing to show it says why in the pane — logging switched off, no
+file yet, or an empty file — rather than presenting a blank window that looks
+identical to a broken one.
+
+`LOGCONSOLE=ON` shows log messages live and `LOGFILENAME=` writes a file any
+editor opens. **`LOGCONSOLE` is not superseded and is not going away**: it needs
+nothing running, opens itself on the first message, and is therefore what you
+want on a machine that is mid-failure — which is exactly why the console and the
+file were split into separate switches in the first place. NetLogViewer is the
+better tool when you are *looking* at a problem rather than being surprised by
+one. What neither of the old destinations gives you is going *back*: the console shows what
+just happened, and the file must be reopened to see what has been added. This
+keeps a scrollback ring (`LINES`, default 500 — fixed capacity on purpose, so a
+viewer cannot be the thing that finally exhausts a 2 MB machine), follows the
+file as it grows, and filters it.
+
+Keys: `0`-`7` set the severity floor using the same numbering as `LOGLEVEL`, `8`
+shows everything, `F` freezes following, `C` clears, `ESC` clears both filters,
+`Q` quits. The box at the bottom searches. Level filtering reads the `[warn ]`
+field the logger writes, so a line with no level (the "log opened" banner) is
+always kept — hiding it would make the log look like it had gaps.
+
+The text pane is a BOOPSI gadget class of its own (`src/tools/nlv_class.c`) so
+the scroller can drive it through `ICA_TARGET` and redraw with the application
+still asleep in `Wait()`. Row height and truncation come from the screen's font
+via `DrawInfo`, so it follows a big-font screen.
+
+`CheckAmiTCPNGConfig` reads every configuration file the stack uses and reports
+what is wrong with it — our equivalent of Roadshow's `CheckRoadshowConfig`.
+
+```
+CheckAmiTCPNGConfig [QUIET] [VERBOSE]
+```
+
+It exists because almost nothing here is rejected at boot. An unknown keyword in
+a `DEVS:NetInterfaces/` file is ignored *on purpose* so files written for a newer
+version still work — which also means `adress=192.168.0.10` configures nothing
+and says nothing. The checker names those. It catches a missing `device=`, a
+malformed address, an interface with neither an address nor DHCP, a
+`configure=auto` copied from a Roadshow config (that value is **not**
+implemented here — only `dhcp` is, with link-local as its no-server fallback), a
+`hosts` file with no `localhost`, and saved settings that are not numbers.
+
+**It does not touch the machine.** No device is probed and
+`bsdsocket.library` is deliberately not opened — our library starts the whole
+stack on the first `OpenLibrary()`, and "check my configuration" must not bring
+the network up as a side effect. Exit code is 0 clean, 5 warnings, 10 errors, so
+it can gate a script.
+
+`traceroute` walks the path with ICMP echo probes of increasing TTL, reading the
+ICMP "time exceeded" replies each router sends back.
+
+```
+traceroute HOST [MAXHOPS n] [PROBES n] [TIMEOUT n] [LOOKUP] [QUIET]
+```
+
+Reverse DNS is **off** by default (`LOOKUP` turns it on), unlike Unix
+traceroute: a hop with no PTR record costs a full resolver timeout, and thirty
+of those makes the tool unusable on exactly the networks where you reached for
+it. Addresses print as they arrive; names are opt-in.
+
+Needs `setsockopt(IPPROTO_IP, IP_TTL)` on a raw socket, which this stack did not
+support until it was written — see the note in `src/netinet/raw_ip.c` for why the
+option is handled there rather than delegated to `ip_ctloutput()`.
+
+`SampleNetSpeed` differences the per-interface byte counters
+(`IFQ_GetBytesIn`/`Out`, the same ones `ShowNetStatus` reports) between samples —
+there is no rate anywhere in the stack to read, because a rate is a difference
+over time.
+
+```
+SampleNetSpeed [interface] [LEFT n] [TOP n] [WIDTH n] [HEIGHT n] [SCREEN name]
+               [CLI] [INTERVAL n] [COUNT n]
+```
+
+Default is an Intuition window: received drawn above the centre line, sent
+below, both on one shared scale (that shared scale is the point — it is what
+makes the two comparable by eye), newest sample at the right. The live figures
+are in the title bar, because a shape with no scale on it is not a measurement.
+`CLI` gives the same sampling as text, which is what you want over a serial
+console or in a script. With no interface named, the graph sums all interfaces
+and the text mode lists them one per row.
+
+`COUNT` applies to both displays, so the window can be told to take *n* samples
+and exit — which is the only way the graphical mode can be tested without a
+human to click the close gadget.
 
 > **A note on silent errors.** `build-lib.sh` captures the compile step and only
 > succeeds if every object built, so a hidden compile error can't let a *stale*
@@ -264,8 +523,8 @@ ceiling, and the live window.
 
 The tier only sets **defaults**; explicit configuration always wins, because the
 detection runs before the config file is read. Set `tcp.sendspace` /
-`tcp.recvspace` (RoadshowData nodes, e.g. via `roadshowcontrol`) or `MBUF_CONF`'s
-`MAXMEM` to override — and `roadshowcontrol tcp.sendspace` also lets you *read*
+`tcp.recvspace` (RoadshowData nodes, e.g. via `AmiTCPControl`) or `MBUF_CONF`'s
+`MAXMEM` to override — and `AmiTCPControl GET tcp.sendspace` also lets you *read*
 back which value is active, to confirm the tier.
 
 ### Why the pool ceiling matters

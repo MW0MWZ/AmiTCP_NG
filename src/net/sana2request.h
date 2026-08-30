@@ -20,7 +20,7 @@
  * Changed ss_addr to ss_hwaddr...
  *
  * Revision 1.8  93/04/19  02:19:05  02:19:05  ppessi (Pekka Pessi)
- * ssss_addrbytes replaced with ss?iss_if.if_addrlen
+ * ss_addrbytes replaced with ss_if.if_addrlen
  * 
  * Revision 1.7  93/04/06  08:54:22  08:54:22  jraja (Jarno Tapio Rajahalme)
  * Changed bcopy's to aligned_bcopy[_const] when appropriate.

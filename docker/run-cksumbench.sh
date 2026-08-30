@@ -19,8 +19,27 @@ XIMG=amigadev/crosstools:m68k-amigaos
 echo ">>> building cksumbench for -m$CPU ..."
 docker run --rm -v "$ROOT":/work -w /work "$XIMG" bash -c "
   set -e
+  # NG_ARCH MUST be exported BEFORE sourcing ccflags.sh. NG_CFLAGS is built as
+  # \"... -Wall -Werror \$NG_ARCH\" and NG_ARCH defaults to -m68000, so an unexported
+  # NG_ARCH puts a trailing -m68000 AFTER our own -m\$CPU on the command line -- and
+  # for gcc's target selection the LAST one wins. Without this line the 68020 and
+  # 68040 runs silently compiled and tested the 68000 object; verified by objdump,
+  # the emitted code was byte-identical, while the same file built without the
+  # trailing flag really does differ per target. This project has already lost weeks
+  # to exactly this shape of mistake (the DHCP register-clobber bug reproduced only
+  # in the 68040 build while the emulator ran the 68000 library).
+  export NG_ARCH=-m$CPU
+  source docker/ccflags.sh
   m68k-amigaos-gcc -c -m$CPU src/netinet/in_cksum_asm.S -o /tmp/ck.o
-  m68k-amigaos-gcc -noixemul -O2 -m$CPU docker/bench/cksumbench.c /tmp/ck.o -o build/cksumbench
+  m68k-amigaos-gcc -c -m$CPU src/netinet/in_cksum_copy_asm.S -o /tmp/icca.o
+  # The REAL in_cksum_copy object, built with the library's own flags -- not a copy of
+  # the source pasted into the harness. Proving a transcription proves nothing about
+  # what ships. It is self-contained (nm -u reports no undefined symbols), so it links
+  # into a -noixemul harness without dragging the stack in.
+  m68k-amigaos-gcc -c src/netinet/in_cksum_copy.c -o /tmp/icc.o \\
+    \$NG_INC \$NG_DEF \$NG_CFLAGS \$NG_FORCEINC
+  echo \"   in_cksum_copy.o built with: \${NG_CFLAGS##* }\"
+  m68k-amigaos-gcc -noixemul -O2 -m$CPU docker/bench/cksumbench.c /tmp/ck.o /tmp/icc.o /tmp/icca.o -o build/cksumbench
   m68k-amigaos-strip build/cksumbench" || { echo '!!! harness build failed'; exit 1; }
 "$ROOT/docker/cc.sh" chown "$(id -u):$(id -g)" /work/build/cksumbench >/dev/null 2>&1 || true
 cp "$ROOT/build/cksumbench" "$G/C/cksumbench"

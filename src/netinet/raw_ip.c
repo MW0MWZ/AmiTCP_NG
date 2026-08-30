@@ -190,7 +190,9 @@ rip_output(m, so)
 		 * not a hard-coded MAXTTL. This is an ordinary outgoing packet on a
 		 * user's socket, so it is exactly what that setting is meant to
 		 * govern. icmp_reflect() deliberately still uses MAXTTL -- see there. */
-		ip->ip_ttl = ip_defttl;
+		/* A TTL set on this socket wins; otherwise the configurable
+		 * default, exactly as before. */
+		ip->ip_ttl = rp->rinp_ttl ? rp->rinp_ttl : ip_defttl;
 	}
 	return (ip_output(m,
 	   (rp->rinp_flags & RINPF_HDRINCL)? (struct mbuf *)0: rp->rinp_options,
@@ -232,6 +234,42 @@ rip_ctloutput(op, so, level, optname, m)
 				rp->rinp_flags &= ~RINPF_HDRINCL;
 			break;
 
+		/*
+		 * PORT (AmiTCP_NG): IP_TTL on a raw socket. Without it traceroute
+		 * cannot work at all -- walking the path IS setting the TTL.
+		 *
+		 * Handled HERE rather than by falling through to ip_ctloutput() the
+		 * way later BSDs do. That delegation is only safe in the trees where
+		 * raw IP shares struct inpcb; ours is the older split where a raw
+		 * socket's so_pcb is a struct raw_inpcb, and ip_ctloutput() would
+		 * cast it to struct inpcb and write inp_ip.ip_ttl at an offset that
+		 * belongs to something else entirely. With no MMU that is silent
+		 * corruption, not a crash.
+		 */
+		case IP_TTL:
+			/* Exact length, where IP_HDRINCL above accepts "at
+			 * least". Deliberate rather than an oversight: a
+			 * caller passing the wrong-sized value for a TTL has a
+			 * bug worth telling them about, and unlike the flag
+			 * above there is no historical caller to stay
+			 * compatible with. */
+			if (m == 0 || *m == 0 || (*m)->m_len != sizeof (int)) {
+				error = EINVAL;
+				break;
+			}
+			{
+				int optval = *mtod(*m, int *);
+
+				/* 0 is the "not set" sentinel and is never a legal
+				 * TTL to transmit, so refuse it rather than have it
+				 * mean two things. */
+				if (optval < 1 || optval > 255)
+					error = EINVAL;
+				else
+					rp->rinp_ttl = (u_char)optval;
+			}
+			break;
+
 		default:
 			error = EINVAL;
 			break;
@@ -245,6 +283,12 @@ rip_ctloutput(op, so, level, optname, m)
 		if (*m == 0)
 			return (ENOBUFS);
 		switch (optname) {
+
+		case IP_TTL:
+			(*m)->m_len = sizeof(int);
+			*mtod(*m, int *) = rp->rinp_ttl ? (int)rp->rinp_ttl
+							: (int)ip_defttl;
+			break;
 
 		case IP_OPTIONS:
 			if (rp->rinp_options) {

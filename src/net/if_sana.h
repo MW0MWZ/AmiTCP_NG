@@ -124,10 +124,86 @@ struct sana_softc {
   ULONG           ss_copyout32;
   ULONG           ss_txnobuf;	      /* TX packets dropped: send-tag mbuf alloc failed */
   ULONG           ss_rxnobuf;	      /* RX packets dropped: read re-post mbuf alloc failed */
+#if NG_RX_CSUM && NG_RX_CSUM_VERIFY
+  /* Present only in a self-checking build (NG_RX_CSUM_VERIFY, off by default): the
+   * fused receive checksum re-proved the slow way on every frame. Counters rather than
+   * only a log line, because logging is off unless configured on, and a validation run
+   * that reported success while silently checking nothing would be worse than no check
+   * at all. */
+  ULONG           ss_csumok;	      /* fused RX checksums confirmed correct */
+  ULONG           ss_csumbad;	      /* fused RX checksums that DISAGREED -- must stay 0 */
+#endif
   UWORD		  ss_reqno;	      /* # of requests to allocate */
   UWORD           ss_cflags;	      /* configuration flags */
   UBYTE           ss_offcleanup;      /* set when the driver went offline: sana_poll()
 				       * must deconfigure this interface (route/addr/DNS) */
+  /*
+   * PORT (AmiTCP_NG): how this interface was configured, remembered so it can be
+   * configured AGAIN when its device comes back online.
+   *
+   * Going offline scrubs the address, routes and dynamic DNS -- deliberately, so
+   * nothing reports a configuration that is no longer real. The Roadshow SDK says
+   * SM_Online "tries to send an S2_ONLINE command ... if the command succeeds, the
+   * other necessary configuration operations will take place", and without these
+   * fields there is nothing left to say what those operations are: the interface
+   * came back up unnumbered, with no route and no name servers, and stayed that
+   * way until someone re-ran AddNetInterface by hand.
+   *
+   * The stack READS THE CONFIG FILE to do it (ng_reconfig_task in
+   * api/amiga_roadshow_compat.c), rather than keeping a snapshot of what it was
+   * last told. A snapshot only ever held the address, mask and gateway, so extra
+   * routes, static name servers and the search domain were silently lost on every
+   * offline/online cycle -- and it had to be kept in step with everything that can
+   * change an interface, for ever. An interface is fully up or fully down.
+   *
+   * A dynamic address is NOT reused: the device may have been offline for a minute
+   * or for months, and a lease that old says nothing about the network it is
+   * rejoining, so configure=dhcp means "acquire a lease again", never "restore the
+   * old one".
+   */
+  UBYTE           ss_reconfig;	      /* device is back online: sana_poll() must reconfigure */
+  /* A reconfigure is already running for this interface. A driver that flaps --
+   * offline/online/offline in quick succession, which is exactly the wifipi
+   * failure profile -- would otherwise spawn one DHCP client per online event,
+   * each binding port 68 and each applying whatever lease it won, so the address
+   * would flip between them depending on which finished last. */
+  UBYTE           ss_reconfiguring;
+  /*
+   * Roadshow IFC_AssociatedRoute / IFC_AssociatedDNS: this interface owns the
+   * default route / the name servers it made available.
+   *
+   * The tags are the SDK's (libraries/bsdsocket.h, IFC_BASE+12 and +13) and are
+   * opt-in by design -- an interface that has not claimed them keeps its hands
+   * off routes and servers somebody else configured. WHEN a claim is redeemed is
+   * ours, though, not the SDK's: it documents the tags only as "that interface is
+   * associated with a route / a DNS" and never says at what point the association
+   * is dissolved. We withdraw them when the interface goes OFFLINE -- by an
+   * operator or because its device vanished -- and not merely when it goes down,
+   * since SM_Down explicitly "might still be online" and has no counterpart that
+   * would put them back. Our own AddNetInterface and DHCP client set both.
+   */
+  /* The driver refused S2_ONEVENT, so no event will ever tell us it is back and
+   * the watchdog probe is the only way to notice. */
+  UBYTE           ss_noevents;
+  UBYTE           ss_eventfails;	/* consecutive S2_ONEVENT failures */
+  /*
+   * Watchdog probe state -- how we notice a device that came back without saying
+   * so. See the block comment above sana_probe_step() in if_sana.c.
+   *
+   * ss_wantback is the one that matters for safety: it means the DEVICE dropped
+   * out from under a live interface, NOT that an operator took it offline. Only
+   * an interface that lost its device against its will is ever brought back
+   * automatically; one that was offlined deliberately stays down until it is
+   * asked to come up.
+   */
+  UBYTE           ss_wantback;	      /* device dropped out on its own: watch for it */
+  UBYTE           ss_probing;	      /* a probe read is outstanding on the device */
+  UBYTE           ss_probe_abort;     /* we asked for that probe read back */
+  UBYTE           ss_probe_stuck;     /* driver ignored the abort; said so once */
+  UBYTE           ss_probe_wait;      /* if_slowtimo ticks until the next probe step */
+  struct IOIPReq *ss_probe_req;	      /* the outstanding probe read, for AbortSanaIO */
+  UBYTE           ss_assoc_route;
+  UBYTE           ss_assoc_dns;
   UBYTE           ss_removing;	      /* teardown in progress: sana_up()/sana_rearm_reads()
 				       * must NOT (re-)post reads or re-arm the watchdog, so a
 				       * racing online event can't touch the freed request pool */

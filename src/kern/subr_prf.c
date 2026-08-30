@@ -245,6 +245,103 @@ ng_log_hook_deliver(struct log_msg *msg)
   return TRUE;
 }
 
+/*
+ * ng_diag() -- a SYNCHRONOUS diagnostic line, for finding out where a hang is.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT log().
+ *
+ * log()/vlog() do NOT write anything. They format the message and PutMsg() it to
+ * the NETTRACE task, which writes and flushes it later. That is the right design
+ * for production -- vlog() is called from inside splnet()/splimp() regions, and
+ * those are Forbid-equivalent, where a DOS call is illegal -- but it makes log()
+ * USELESS FOR LOCATING A HANG. When the machine wedges, every message still sitting
+ * in that queue is never written, so the last line in the log is wherever the LOG
+ * TASK stopped draining, not where the code stopped running.
+ *
+ * That is not a theory. Probing a hang with log() reported it in a different place
+ * on two builds that differed in nothing relevant, because a different number of
+ * queued lines survived each time. Hours went into localising a fault with an
+ * instrument that was quietly lying about the ordering.
+ *
+ * This writes the line, on the CALLING task, before it returns. Slow and blunt, and
+ * that is the point: if the line is on disk, the statement after it was reached.
+ *
+ * TASK LEVEL ONLY. It calls DOS. Never call it from an interrupt, a device
+ * completion, or inside splnet()/splimp() -- that restriction is precisely why
+ * vlog() queues, and it is why this must never be wired into log().
+ *
+ * The file is opened once and deliberately never closed: a diagnostic that tidies
+ * up after itself loses the last line, which is the one that matters.
+ */
+void
+ng_diag(const char *fmt, ...)
+{
+  static BPTR   diagfile = (BPTR)0;
+  static int    diagfailed = 0;
+  static struct SignalSemaphore diagsem;
+  static int    diagsem_ready = 0;
+  char          buf[220];
+  struct CSource cs;
+  va_list       ap;
+
+  if (DOSBase == NULL || diagfailed)
+    return;
+
+  /* One-time semaphore setup, itself serialised. */
+  if (!diagsem_ready) {
+    Forbid();
+    if (!diagsem_ready) {
+      InitSemaphore(&diagsem);
+      diagsem_ready = 1;
+    }
+    Permit();
+  }
+
+  /* Probes fire from several tasks; only one may do the lazy open. */
+  if (diagfile == (BPTR)0) {
+    Forbid();
+    if (diagfile == (BPTR)0 && !diagfailed) {
+      BPTR f = Open((STRPTR)NG_DIAG_FILE, MODE_READWRITE);
+      if (f) {
+	Seek(f, 0, OFFSET_END);		/* append across stack restarts */
+	diagfile = f;
+      } else {
+	diagfailed = 1;			/* do not retry on every line */
+      }
+    }
+    Permit();
+    if (diagfile == (BPTR)0)
+      return;
+  }
+
+  cs.CS_Buffer = (STRPTR)buf;
+  cs.CS_Length = sizeof(buf) - 1;
+  cs.CS_CurChr = 0;
+  va_start(ap, fmt);
+  vcsprintf(&cs, fmt, ap);
+  va_end(ap);
+
+  /*
+   * Serialise the WRITE, not just the open.
+   *
+   * diagfile is one shared FileHandle and AmigaDOS keeps the buffered position
+   * inside it, so two tasks writing at once splice or truncate each other's
+   * lines. That is not hypothetical here: the callers are traps that fire during
+   * exactly the restart-window races this instrument exists to diagnose, so two
+   * tasks tripping together is the expected case, not the unlucky one. A garbled
+   * line looks like data rather than an error, which would quietly break the one
+   * guarantee this function makes.
+   *
+   * A semaphore, NOT Forbid(): these are blocking DOS calls, which must never run
+   * with task switching disabled.
+   */
+  ObtainSemaphore(&diagsem);
+  FWrite(diagfile, buf, cs.CS_CurChr, 1);
+  FPutC(diagfile, '\n');
+  Flush(diagfile);			/* on disk BEFORE the next statement runs */
+  ReleaseSemaphore(&diagsem);
+}
+
 void
 cs_putchar(unsigned char ch, struct CSource * cs)
 {
@@ -725,6 +822,18 @@ reswitch:
 	goto textout;
       case 's':
 	p = va_arg(ap, char *);
+	/*
+	 * A NULL here used to walk from address 0 one byte at a time (strlen()
+	 * below, then the output loop) -- a BYTE-READ from 00000000 that Enforcer
+	 * reports and that a machine without one simply does not notice. Nothing
+	 * in a log line is worth a wild read: print what C libraries print and
+	 * carry on, so a diagnostic can never become the fault.
+	 *
+	 * Deliberately NOT silent. Seeing "(null)" in the log is how the caller
+	 * that passed it gets found; dropping the conversion would hide it.
+	 */
+	if (p == NULL)
+	  p = (char *)"(null)";
 textout:
 	/*
 	 * Set width to the maximum width, if maximum width is set, and

@@ -29,7 +29,12 @@
 #define	BIG_ENDIAN	4321	/* MSB first: 68000, ibm, net */
 #define	BYTE_ORDER	BIG_ENDIAN
 
-#define MAXHOSTNAMELEN  64	/* max length of hostname */
+/* PORT (AmiTCP_NG): ONE definition of the host-name length, shared with the
+ * config checker -- see <ng_hostname.h> for why it is 255 and not the 4.3BSD
+ * 64. This header WINS over the guarded copy in rpc/types.h, so it is the one
+ * that actually decides the size of host_name[]. */
+#include <ng_hostname.h>
+#define MAXHOSTNAMELEN  NG_MAXHOSTNAME	/* max length of hostname */
 #define MAXLOGNAME      32	/* max length of login name */
 
 /*

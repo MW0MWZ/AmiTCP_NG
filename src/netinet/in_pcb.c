@@ -110,6 +110,10 @@ RCS_ID_C="$Id: in_pcb.c,v 1.10 1993/06/04 11:16:15 jraja Exp $";
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/ioctl.h>
+/* wakeup(): in_ifdown_notify() below wakes connect()/linger-close() waiters,
+ * which sleep on &so->so_timeo -- a channel sorwakeup()/sowwakeup() never touch. */
+#include <kern/kern_synch_protos.h>
+#include <kern/uipc_socket2_protos.h>	/* sowakeup(), behind sorwakeup/sowwakeup */
 
 #include <net/if.h>
 #include <net/route.h>
@@ -623,6 +627,88 @@ in_pcbnotify(head, dst, fport, laddr, lport, cmd, notify)
 }
 
 /*
+ * PORT (AmiTCP_NG): tell the sockets on an interface that it has gone away.
+ *
+ * BSD raises PRC_IFDOWN from if_down() and then throws it away: inetctlerrmap[]
+ * maps it to 0, so tcp_ctlinput() and udp_ctlinput() return before doing
+ * anything. Applications are left to discover the loss when their next operation
+ * fails, or when a blocked one finally times out -- which is exactly the "the
+ * program still thinks the network is up" complaint.
+ *
+ * in_pcbnotify() cannot be reused for this. It matches on inp_faddr, the FOREIGN
+ * address, against the address it is given; if_down() supplies our own LOCAL
+ * address, so the walk would look for sockets talking TO us and hit either
+ * nothing or, worse, unrelated sockets that happen to have this address as their
+ * peer. The selector here is the local address instead.
+ *
+ * Sockets bound to INADDR_ANY are NOT matched while any other interface is still
+ * carrying an address: they are not tied to one interface, and erroring them
+ * because a DIFFERENT interface went down would be wrong on a multi-homed
+ * machine. A server listening on 0.0.0.0 keeps listening, while its established
+ * connections -- which do carry the real local address -- are told.
+ *
+ * When the LAST interface goes, that reasoning inverts: there is no network left
+ * for them to be waiting on, and leaving them blocked for ever is worse than
+ * telling them. The caller passes match_any for that case. Loopback survives, so
+ * an application serving 0.0.0.0 purely for local clients gets an error it did
+ * not strictly need -- acceptable, because so_error is consumed once and does not
+ * destroy the socket, and the alternative is an application that hangs.
+ *
+ * We set so_error DIRECTLY rather than going through tcp_notify(), and that
+ * departure is deliberate. tcp_notify() stashes a SOFT error on the tcpcb
+ * (t_softerror) precisely because an ICMP-derived signal may be spoofed or
+ * transient and should not kill a live connection on its own. This is not that:
+ * the interface really has gone, on our own authority. Do not "correct" this to a
+ * softerror by analogy with the neighbouring ICMP paths.
+ *
+ * All three wakeups are required. sorwakeup()/sowwakeup() reach readers, writers
+ * and select(); neither touches &so->so_timeo, which is where a task blocked in
+ * connect() sleeps WITHOUT A TIMEOUT (api/amiga_syscalls.c), and where a
+ * lingering close() waits. Omitting it leaves exactly those callers hanging --
+ * the case this whole exercise exists to fix. soraise_event() is reached from
+ * inside sowakeup(), so a Roadshow SBTC_SIGEVENTMASK client gets FD_ERROR for
+ * free once so_error is set.
+ *
+ * The caller must hold splimp()/splnet(): that is what keeps a concurrent
+ * soclose() (which holds splnet across in_pcbdetach) from freeing a pcb under
+ * the walk. Waking from this level is the stack's normal condition -- every
+ * received segment does it from the same held spl.
+ */
+void
+in_ifdown_notify(struct in_addr laddr, int error, int match_any)
+{
+	struct inpcb *head, *inp, *oinp;
+	struct socket *so;
+	int which;
+	extern struct inpcb tcb, udb;
+
+	if (!match_any && laddr.s_addr == INADDR_ANY)
+		return;
+
+	for (which = 0; which < 2; which++) {
+		head = which ? &udb : &tcb;
+		for (inp = head->inp_next; inp != NULL && inp != head; ) {
+			oinp = inp;
+			inp = inp->inp_next;	/* advance first, as in_pcbnotify does */
+			if (match_any) {
+				/* The LAST interface has gone: there is no network left
+				 * to wait for, so the sockets that were not tied to any
+				 * one interface are told too. */
+				if (oinp->inp_laddr.s_addr != INADDR_ANY)
+					continue;
+			} else if (oinp->inp_laddr.s_addr != laddr.s_addr)
+				continue;
+			if ((so = oinp->inp_socket) == NULL)
+				continue;
+			so->so_error = error;
+			wakeup((caddr_t)&so->so_timeo);	/* connect()/linger close() */
+			sorwakeup(so);
+			sowwakeup(so);
+		}
+	}
+}
+
+/*
  * Check for alternatives when higher level complains
  * about service problems.  For now, invalidate cached
  * routing information.  If the route was created dynamically
@@ -679,8 +765,38 @@ in_pcblookup(head, faddr, fport, laddr, lport, flags)
 {
 	register struct inpcb *inp, *match = 0;
 	int matchwild = 3, wildcard;
+	int ng_walk = 0;			/* DIAG: runaway-walk detector */
 
 	for (inp = head->inp_next; inp != head; inp = inp->inp_next) {
+		/*
+		 * LAST-RESORT TRAP. This walk runs under splnet(), which is Forbid()
+		 * here, so a corrupt chain does not merely fail -- it stops the whole
+		 * machine, silently, taking the log task with it. The cause is fixed
+		 * at source (domaininit() now re-runs the per-protocol init on every
+		 * stack start, so the heads cannot be inherited stale), but a list
+		 * this cheap to check should never again be able to hang an Amiga.
+		 *
+		 * NULL FIRST, and it matters: the loop test is `inp != head`, which
+		 * NULL passes, so without this the body dereferences address 0. On
+		 * this platform that reads the exception vectors rather than faulting,
+		 * and inp_next then holds garbage -- quite possibly an ODD address,
+		 * which on a 68000/68010 is an Address Error on the next iteration.
+		 * "Bounded" is not "safe": the count below would often never be
+		 * reached.
+		 */
+		if (inp == NULL)
+			break;			/* treat as no match */
+		if (++ng_walk > 2000) {
+			extern volatile int ng_pcb_runaway;
+			extern volatile unsigned long ng_pcb_head, ng_pcb_first,
+						     ng_pcb_cur, ng_pcb_curnext;
+			ng_pcb_runaway = ng_walk;
+			ng_pcb_head    = (unsigned long)head;
+			ng_pcb_first   = (unsigned long)head->inp_next;
+			ng_pcb_cur     = (unsigned long)inp;
+			ng_pcb_curnext = (unsigned long)inp->inp_next;
+			break;
+		}
 		if (inp->inp_lport != lport)
 			continue;
 		wildcard = 0;

@@ -185,6 +185,17 @@ unsigned long arpentries = ARPENTRIES;
 struct arptable {
   struct SignalSemaphore atb_lock;
   struct arptab         *atb_free;
+  /*
+   * The BASE of the entry array, kept solely so it can be freed.
+   *
+   * atb_free is the free-list head, which starts at the LAST element and moves
+   * as entries are taken and returned -- so it is never the address bsd_free()
+   * needs. Without this field the array's base was known only inside
+   * alloc_arptable()'s frame and was gone the moment it returned, which is why
+   * no code path anywhere freed an ARP table: it was not that somebody forgot,
+   * it was that by then it could not be done.
+   */
+  struct arptab         *atb_entriesbase;
   /* Cost gate for ng_arp_confirm_inbound(): the clock second in which this
    * interface last did a confirmation lookup. Read unlocked -- an aligned
    * 32-bit load is instruction-atomic on 68k, and a missed/duplicated
@@ -247,13 +258,49 @@ alloc_arptable(struct sana_softc* ssc, int to_allocate)
       at[i].at_succ = &at[i - 1];
     }
     atab->atb_free = &at[to_allocate - 1];
+    atab->atb_entriesbase = at;		/* the only surviving pointer to free */
   } else {
     if (atab) bsd_free(atab, M_ARPENT);
     if (at) bsd_free(at, M_ARPENT);
+    /*
+     * NULL it, because the assignment below is unconditional. Freeing atab and
+     * then storing it anyway left ss_arp.table holding a freed pointer that is
+     * not NULL -- which nothing noticed while no code ever read that field
+     * again. free_arptable() now does: it would take the "not NULL, so it is
+     * real" branch, dereference the freed struct and free it a second time, on
+     * every later teardown of this interface. A partial failure here (header
+     * allocated, entry array not) is exactly what a low-memory machine does.
+     */
+    atab = NULL;
     log(LOG_ERR, "Could not allocate ARP table for %s\n", ssc->ss_name);
   }
 
   ssc->ss_arp.table = atab;
+}
+
+/*
+ * Release an interface's ARP table. Call before freeing the softc that owns it.
+ *
+ * alloc_arptable() runs on essentially every interface bring-up, so without
+ * this every RemoveNetInterface -- and every stack shutdown -- lost the table
+ * header plus its whole entry array (ARPENTRIES entries, several KB). That did
+ * not matter when the stack was a program that exited; it does now the library
+ * can be stopped and started repeatedly without a reboot.
+ *
+ * Nothing needs unlinking first: the entries are all carved out of one array
+ * and the lists are internal to the header, so both allocations go back whole.
+ */
+void
+free_arptable(struct sana_softc *ssc)
+{
+  struct arptable *atab = ssc->ss_arp.table;
+
+  if (atab == NULL)
+    return;
+  ssc->ss_arp.table = NULL;		/* before freeing: nothing may find it */
+  if (atab->atb_entriesbase)
+    bsd_free(atab->atb_entriesbase, M_ARPENT);
+  bsd_free(atab, M_ARPENT);
 }
 
 /*
@@ -425,6 +472,7 @@ arp_request_out(register struct sana_softc *ssc,
   register struct mbuf *m;
   register struct s2_arppkt *s2a;
   struct sockaddr_sana2 ss2;
+  u_int hln, pln, arplen;
 
   /* For a BROADCAST request ss2_host is unused (sana_start() issues
    * S2_BROADCAST off M_BCAST), but sana_output()'s AF_UNSPEC case copies it
@@ -433,10 +481,35 @@ arp_request_out(register struct sana_softc *ssc,
    * destination, filled in below. */
   aligned_bzero_const((caddr_t)&ss2, sizeof (ss2));
 
+  /*
+   * The wire length of an ARP packet is decided by the address widths it
+   * actually carries, NOT by sizeof(struct s2_arppkt). That struct is a
+   * worst-case scratch container -- arphdr plus four MAXADDRARP-wide (16 byte)
+   * slots, 72 bytes -- so that any hardware/protocol address SANA-II permits
+   * fits in it. The fields below are written at the offsets the REAL widths
+   * imply, which for Ethernet/IPv4 means everything lives in the first 28
+   * bytes and the remaining 44 are zero padding.
+   *
+   * Sending all 72 is what this did until a capture showed it: our requests
+   * went out with 44 trailing zero bytes while the replies coming back were a
+   * correct 28. Harmless -- a receiver parses by ar_hln/ar_pln and ignores the
+   * tail -- but wasted on every request, and it makes any capture of our
+   * traffic look wrong to whoever reads it. This is the same formula the
+   * receive path already validates against in in_arpinput().
+   *
+   * hln is if_addrlen, which the driver has already clamped to MAXADDRSANA
+   * (== MAXADDRARP == 16), so arplen can never exceed the struct.
+   */
+  hln = ssc->ss_if.if_addrlen;
+  pln = sizeof(struct in_addr);
+  arplen = sizeof(struct arphdr) + 2 * hln + 2 * pln;
+
   if ((m = m_gethdr(M_DONTWAIT, MT_DATA)) == NULL)
     return;
-  m->m_len = sizeof(*s2a);
-  m->m_pkthdr.len = sizeof(*s2a);
+  /* Reserve and clear the WHOLE worst-case struct -- the field writes below
+   * are laid out inside it -- but transmit only the bytes in use. */
+  m->m_len = arplen;
+  m->m_pkthdr.len = arplen;
   MH_ALIGN(m, sizeof(*s2a));
   s2a = mtod(m, struct s2_arppkt *);
   aligned_bzero_const((caddr_t)s2a, sizeof (*s2a));

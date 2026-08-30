@@ -34,7 +34,8 @@
   "NOTRACKING/S," \
   "NOARP/S," \
   "ARPHDR/N/K," \
-  "P2P=POINT2POINT/S,NOSIMPLEX/S,LOOPBACK/S"
+  "P2P=POINT2POINT/S,NOSIMPLEX/S,LOOPBACK/S," \
+  "BPS/N/K"
 
 struct ssc_args {
   UBYTE *a_name;
@@ -51,6 +52,22 @@ struct ssc_args {
   LONG   a_point2point;
   LONG   a_nosimplex;
   LONG   a_loopback;
+  /*
+   * PORT (AmiTCP_NG): bps= -- override the link speed the SANA-II driver reports.
+   *
+   * if_baudrate normally comes from the driver's S2_DEVICEQUERY BPS field, and it
+   * is not just cosmetic: it drives ng_speed_window()'s TCP window auto-tune and,
+   * through ng_effective_window(), the size of the SANA-II read/write rings. A
+   * driver that reports the wrong figure -- or an emulated NIC that can only ever
+   * report its own 10 Mbit -- therefore puts the whole stack on the wrong tuning
+   * path, with no way to correct it. NULL (the keyword absent) keeps whatever the
+   * driver said, so this changes nothing unless it is asked for.
+   *
+   * MUST STAY LAST, and in step with the tail of SSC_TEMPLATE: ReadArgs() fills
+   * this struct POSITIONALLY, so inserting a field anywhere but the end silently
+   * shifts every argument after it.
+   */
+  LONG  *a_bps;
 };
 
 struct ssconfig {

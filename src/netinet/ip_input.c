@@ -132,6 +132,7 @@ RCS_ID_C="$Id: ip_input.c,v 1.15 1993/06/04 11:16:15 jraja Exp $";
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>	/* LOG_WARNING for the in_ifaddr backstop */
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/domain.h>
@@ -221,6 +222,8 @@ u_long	*ip_ifmatrix = NULL;
  * IP initialization: fill in IP protocol switch table.
  * All protocols not implemented in kernel go to raw IP protocol handler.
  */
+extern int ip_nfrags;		/* defined below; reset by ip_init() on every stack start */
+
 void
 ip_init()
 {
@@ -237,7 +240,51 @@ ip_init()
 		if (pr->pr_domain->dom_family == PF_INET &&
 		    pr->pr_protocol && pr->pr_protocol != IPPROTO_RAW)
 			ip_protox[pr->pr_protocol] = pr - inetsw;
+	/*
+	 * PORT (AmiTCP_NG): drop the interface-address list on every stack start.
+	 *
+	 * in_ifaddr is a load-time global, and its entries are MBUFS (in_control()
+	 * allocates them from the pool). A stack teardown frees that pool wholesale,
+	 * so every entry becomes dead memory -- but the head still points at the
+	 * first one, and nothing reset it, so the next stack inherited a list of
+	 * dangling pointers.
+	 *
+	 * sana_deinit() now scrubs each interface's addresses on the way down
+	 * (sana_scrub_inet(), the same call sana_remove_interface() makes), so in
+	 * normal operation this head is already empty by the time we get here.
+	 *
+	 * This stays as a BACKSTOP for the paths that never reach that teardown --
+	 * a stack that is killed rather than stopped, or any future exit that
+	 * forgets. Resetting the head cannot leak: these entries are mbufs, and the
+	 * pool they came from is freed wholesale at teardown.
+	 */
+	{ extern struct in_ifaddr *in_ifaddr;
+	  /*
+	   * SAY SO when this actually finds something. A silent backstop is how the
+	   * loopback gap hid: sana_deinit() scrubs every interface's addresses now,
+	   * so a non-empty head here means some interface was NOT scrubbed on the way
+	   * down, and the next thing to touch it walks freed pool memory. Clearing it
+	   * without a word turns a teardown bug into a permanently invisible one.
+	   */
+	  if (in_ifaddr != NULL)
+	    log(LOG_WARNING, "ip_init: in_ifaddr was not empty at stack start -- "
+		"an interface was not scrubbed during teardown\n");
+	  in_ifaddr = NULL; }
 	ipq.next = ipq.prev = &ipq;
+	/*
+	 * PORT (AmiTCP_NG): reset the companion counter with the list it counts.
+	 *
+	 * ip_nfrags is the live-reassembly-queue count behind the IP_MAXFRAGPACKETS
+	 * DoS cap in ip_reass(). It is only ever decremented by ip_freef(), and the
+	 * wholesale pool teardown does not call that -- so a forced shutdown taken
+	 * while n reassemblies were in flight leaves ip_nfrags == n while this reset
+	 * empties the list. The restarted stack then counts up from that phantom
+	 * baseline and starts evicting legitimate fragmented datagrams after 8-n
+	 * concurrent reassemblies instead of 8, until enough completions or 30s
+	 * timeouts drain it back down. Emptying the list without zeroing its counter
+	 * is only half a reset.
+	 */
+	ip_nfrags = 0;
         {
 	    struct timeval time;
 	    get_time(&time);
@@ -801,12 +848,31 @@ ip_slowtimo()
 		splx(s);
 		return;
 	}
-	while (fp != &ipq) {
-		--fp->ipq_ttl;
-		fp = fp->next;
-		if (fp->prev->ipq_ttl == 0) {
-			ipstat.ips_fragtimeout++;
-			ip_freef(fp->prev);
+	/*
+	 * LAST-RESORT TRAP, same reasoning as in_pcblookup(): this walk runs under
+	 * splnet() == Forbid(), and it is driven by a TIMER, so a corrupt ipq does
+	 * not wait for anyone to call an API -- it freezes the machine within one
+	 * slowtimo tick of the stack coming up. The NULL check matters because the
+	 * loop test is `fp != &ipq`, which NULL passes; the existing fp == 0 test
+	 * above only covers the FIRST element, not one reached mid-walk.
+	 *
+	 * ip_init() now re-runs on every stack start (see domaininit()), so ipq can
+	 * no longer be inherited stale from a torn-down stack. This is the trap.
+	 */
+	{
+		int ng_walk = 0;
+
+		while (fp != &ipq) {
+			if (fp == 0 || ++ng_walk > 2000)
+				break;
+			--fp->ipq_ttl;
+			fp = fp->next;
+			if (fp == 0)
+				break;
+			if (fp->prev->ipq_ttl == 0) {
+				ipstat.ips_fragtimeout++;
+				ip_freef(fp->prev);
+			}
 		}
 	}
 	splx(s);
@@ -996,6 +1062,33 @@ ip_dooptions(m)
 			code = cp - (u_char *)ip;
 			ipt = (struct ip_timestamp *)cp;
 			if (ipt->ipt_len < 5)
+				goto bad;
+			/*
+			 * PORT (AmiTCP_NG) fix: bound ipt_ptr BELOW as well as
+			 * above. RR and LSRR/SSRR both reject an offset under
+			 * IPOPT_MINOFF a few hundred lines up; the timestamp
+			 * option only ever checked the upper end, and every
+			 * pointer derived from it is `cp + ipt_ptr - 1`.
+			 *
+			 * With the minimum accepted ipt_len of 5, ipt_ptr == 0
+			 * passes the upper test (0 > 5-4 is false) and that
+			 * expression becomes cp - 1 -- one byte BEFORE the
+			 * option. When the timestamp is the first option, which
+			 * is the ordinary case, cp is ip+1, so the four-byte
+			 * timestamp store lands on the last octet of ip_dst.
+			 * ip_dooptions() runs before ipintr() decides whether
+			 * the packet is addressed to us, so a remote sender
+			 * could rewrite part of the destination address the
+			 * delivery test then reads. Attacker-chosen input, no
+			 * handshake or privilege needed, and nothing in normal
+			 * traffic ever sets ipt_ptr to 0 -- so it would never
+			 * have shown up in testing.
+			 *
+			 * IPOPT_MINOFF is the same floor the sibling options
+			 * use; for a timestamp the first slot starts at offset
+			 * 5, so anything below that is malformed.
+			 */
+			if (ipt->ipt_ptr < 5)
 				goto bad;
 			if (ipt->ipt_ptr > ipt->ipt_len - sizeof (long)) {
 				if (++ipt->ipt_oflw == 0)

@@ -81,7 +81,7 @@ RCS_ID_C="$Id: in.c,v 1.11 1993/06/04 11:16:15 jraja Exp $";
  *
  * This file assigns IP addresses to interfaces and keeps the per-interface address
  * list (`in_ifaddr`). It is what makes `ifconfig lo0 127.0.0.1` (and the
- * SIOCSIFADDR ioctl tmp/udptest.c issues) actually take effect:
+ * SIOCSIFADDR ioctl an application issues) actually take effect:
  *   in_control()   the ioctl handler for SIOCSIFADDR / SIOCAIFADDR / SIOCSIFNETMASK
  *                  / SIOCSIFDSTADDR etc. -- set/add/delete an interface address.
  *   in_ifinit()    the heart of it: record the address and mask on the interface,

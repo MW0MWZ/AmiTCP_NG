@@ -159,6 +159,17 @@ struct NameserventNode {
   struct MinNode  nsn_Node;
   short           nsn_EntSize;
   short           nsn_Dynamic;	/* 0 = static (config file); 1 = runtime/DHCP-added */
+  /*
+   * PORT (AmiTCP_NG): which interface made this server available, "" if nobody
+   * claimed it. Roadshow's IFC_AssociatedDNS tags an interface as providing name
+   * servers "which should be removed should the interface go down or offline" --
+   * that promise cannot be kept without knowing whose they are. Taking one
+   * interface offline used to flush EVERY dynamic server, including those another
+   * interface's lease had installed, so a machine with two NICs lost name
+   * resolution on the one still up. A NAME, not an ifnet pointer: the interface
+   * can be removed and its softc freed while these entries are still listed.
+   */
+  char            nsn_Owner[16];	/* IFNAMSIZ */
   struct nameservent {
     struct in_addr ns_addr;
   } nsn_Ent;

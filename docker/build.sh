@@ -9,7 +9,8 @@ IMG=amigadev/crosstools:m68k-amigaos
 "$ROOT/docker/gen_config_var.sh"          # regenerate the config-variable table
 # NG_ARCH selects the CPU multilib (default -m68000); forward it so ccflags.sh inside
 # the container picks up the variant build-release.sh asked for.
-docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -v "$ROOT":/work -w /work "$IMG" bash -c '
+docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -e NG_DEF_EXTRA \
+  -v "$ROOT":/work -w /work "$IMG" bash -c '
   source docker/ccflags.sh
   mkdir -p build/obj
   # --- compile every translation unit ---
@@ -31,13 +32,42 @@ docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -v "$ROOT":/work 
   # (empty on other CPUs). The asm checksum is gated on NG_CKSUM_ASM (mutually
   # exclusive with the C in_cksum.c).
   asm_srcs="src/kern/ng_move16.S"
+  # The fused RX copy+checksum. Self-gating is not possible in a .S, so only assemble
+  # it when the C side is compiled in (NG_RX_CSUM is off for 68040/060).
+  case "$NG_ARCH" in *68040*|*68060*) ;; *) asm_srcs="$asm_srcs src/netinet/in_cksum_copy_asm.S" ;; esac
   [ "$NG_CKSUM_ASM" = 1 ] && asm_srcs="$asm_srcs src/netinet/in_cksum_asm.S"
   for a in $asm_srcs; do
     o="build/obj/$(basename "${a%.S}").o"
-    if ! m68k-amigaos-gcc -c "$a" -o "$o" $NG_ARCH 2>/tmp/e; then
+    # ng_move16.S is the one file assembled for 68040 whatever the target: it holds
+    # MOVE16, which the assembler will not encode at a lower -march. It is reached
+    # only behind a run-time AFF_68040 test, and an instruction that is never executed
+    # cannot fault -- so one binary can carry it and still run on a 68000.
+    aarch="$NG_ARCH"
+    case "$a" in *ng_move16.S) aarch="-m68040" ;; esac
+    if ! m68k-amigaos-gcc -c "$a" -o "$o" $aarch 2>/tmp/e; then
       echo "ASSEMBLE FAIL: $a"; grep -m1 -iE "error:|fatal" /tmp/e; exit 1
     fi
   done
+  # --- drop any object this build did not produce ---------------------------------
+  # build/obj is linked with a bare *.o glob (below, and again in build-lib.sh) and the
+  # link carries --allow-multiple-definition, so a stray object is not a link error --
+  # it is silently included, and can REPLACE a real translation unit. That is not
+  # hypothetical: a throwaway if_sana.o from a compiler-warning check, built from
+  # older source, was linked in preference to the real one, and the resulting library
+  # behaved exactly like the code before the change under test. Objects are kept
+  # between builds on purpose (incremental rebuilds), so the fix is to keep only what
+  # belongs, not to wipe the directory.
+  keep=" bsdsocket_lib.o "
+  for s in $srcs;     do keep="$keep$(basename "${s%.c}").o "; done
+  for a in $asm_srcs; do keep="$keep$(basename "${a%.S}").o "; done
+  for o in build/obj/*.o; do
+    b="$(basename "$o")"
+    case "$keep" in
+      *" $b "*) ;;
+      *) echo "removing stray object (not from this build): $b"; rm -f "$o" ;;
+    esac
+  done
+
   # Belt-and-braces: exactly one _in_cksum must survive into the object set, whichever
   # path built it -- a duplicate would otherwise be silently arbitrated by the link-time
   # --allow-multiple-definition (there for an unrelated libnix symbol).

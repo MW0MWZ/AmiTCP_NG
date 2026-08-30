@@ -20,15 +20,25 @@ For the authoritative, current live-vs-stubbed vector table see the LVO table it
 `ipf_open`, `ipf_close`, `ipf_ioctl`, `ipf_log_read`, `ipf_log_data_waiting`,
 `ipf_set_notify_mask`, `ipf_set_interrupt_mask`.
 
-The packet-filtering (firewall) control interface. Like BPF, this is a whole
-subsystem — a rule engine plus hooks in `ip_input`/`ip_output` plus a logging
-device — with no bearing on baseline connectivity or on the config-tool
-compatibility that is this project's goal. Deferred. Callers get `ENOSYS`.
+The packet-filtering (firewall) control interface. These are only the *control*
+vectors; behind them sits a whole subsystem — a rule engine, hooks in
+`ip_input`/`ip_output`, and a logging device — none of which exists here. It has
+no bearing on baseline connectivity or on the config-tool compatibility that is
+this project's goal, so it is deferred. Callers get `ENOSYS`.
+
+(This deferral was originally argued as "like BPF, a whole subsystem". BPF has
+since been implemented, so the comparison no longer reads as it was written —
+but the size argument it was making still stands, and `ipf_*` remains the larger
+of the two jobs, since BPF only had to *observe* packets where this has to decide
+about them.)
 
 ### Network-monitor hooks — `AddNetMonitorHookTagList` / `RemoveNetMonitorHook` (2, LVO -498/-504)
 Install/remove a callback hook invoked per packet for monitoring tools. Capability
-`SBTC_HAVE_MONITORING_API` is answered **0**. Overlaps heavily with BPF in purpose;
-deferred with the same reasoning. Callers get `ENOSYS`.
+`SBTC_HAVE_MONITORING_API` is answered **0**. It overlaps heavily with BPF in
+purpose — and now that BPF is fully implemented (below), that overlap is a reason
+to leave this deferred rather than a reason to build it: anything wanting to watch
+traffic can open a BPF channel, filter in the kernel, and get timestamped frames,
+which is the better interface of the two. Callers get `ENOSYS`.
 
 ### Server API — `ProcessIsServer` / `ObtainServerSocket` (2, LVO -690/-696)
 Support for `inetd`-style servers that inherit a listening socket from a launching

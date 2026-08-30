@@ -109,8 +109,12 @@ extern void mem_free(void *ptr, size_t bsize);
 #ifndef INADDR_LOOPBACK
 #define       INADDR_LOOPBACK         (u_long)0x7F000001
 #endif
+/* PORT (AmiTCP_NG): the host-name length lives in ONE place now -- see
+ * <ng_hostname.h> for why it is 255 rather than the 4.3BSD 64, and why the
+ * config checker must take the same value from the same header. */
+#include <ng_hostname.h>
 #ifndef MAXHOSTNAMELEN
-#define        MAXHOSTNAMELEN  64
+#define        MAXHOSTNAMELEN  NG_MAXHOSTNAME
 #endif
 
 extern int _rpc_dtablesize(void);

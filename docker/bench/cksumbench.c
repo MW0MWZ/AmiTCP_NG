@@ -43,6 +43,24 @@ struct tmbuf {
 extern int in_cksum(struct tmbuf *m, int len);
 static int cksum_c(struct tmbuf *m, int len);
 
+/*
+ * The fused copy+checksum primitive, linked from the REAL src/netinet/in_cksum_copy.c
+ * object -- not a transcription of it. That distinction is the point: this closes
+ * blocker 5 in that file's own header, which says it "has been proven equal to an
+ * independent RFC 1071 reference ... but on the HOST, not on m68k", and asks for
+ * exactly this harness to be extended before anything relies on it.
+ *
+ * What m68k can break that the host cannot: the C is written byte-at-a-time precisely
+ * because an odd-address word access on a 68000 is an Address Error, and the shifts
+ * and the wide accumulator behave differently under a 16-bit-bus codegen than under
+ * the host compiler. None of that is exercised by a host run.
+ */
+extern u_long in_cksum_copy(const void *src, void *dst, u_long len, u_long sum, int *odd);
+extern u_short in_cksum_fold(u_long sum);
+
+/* The assembly under test, same contract, linked from src/netinet/in_cksum_copy_asm.S. */
+extern u_long in_cksum_copy_asm(const void *src, void *dst, u_long len, u_long sum, int *odd);
+
 struct Device *TimerBase;
 
 /* ---- logging ------------------------------------------------------------------ */
@@ -137,7 +155,9 @@ static u_long g_seed = 0x1234abcdUL;
 static u_long rnd(void) { g_seed = g_seed * 1103515245UL + 12345UL; return g_seed; }
 
 /* ---- correctness fuzz ---------------------------------------------------------- */
-#define BUFSZ 4096
+/* Big enough for the boundary cases in fuzz_copy_large(): the asm hands anything
+ * >= 0x10000 to its byte loop, and nothing else in this harness reaches that. */
+#define BUFSZ 65560
 static u_char *g_buf;		/* payload area, over-allocated for alignment shifts */
 static struct tmbuf g_mb[64];
 
@@ -211,6 +231,196 @@ static int fuzz(void)
 	return fails;
 }
 
+/* ---- correctness fuzz for in_cksum_copy() -------------------------------------- */
+/*
+ * Two things must hold, and the second is the one that is easy to forget: the SUM must
+ * match the independent reference, AND the DESTINATION BYTES must match the source. A
+ * routine that returns the right checksum while copying wrong is the worse failure of
+ * the two -- it corrupts data and passes every checksum test.
+ *
+ * The chain is walked one segment at a time with `sum` and `odd` threaded across the
+ * calls, which is exactly how the receive path would drive it (one call per destination
+ * mbuf). That threading, and the parity state behind it, is the part most likely to be
+ * wrong: a segment that starts at an odd offset contributes to the other half of its
+ * 16-bit word than the same bytes would at an even offset.
+ *
+ * Destination offsets are swept independently of source offsets, so src and dst are
+ * deliberately given every combination of residues -- including the ones where they
+ * differ in parity. src and dst never overlap (separate buffers): in_cksum_copy() is
+ * documented memcpy, NOT memmove, and testing it as if overlap were allowed would be
+ * testing a contract it does not offer.
+ */
+static u_char *g_dst;			/* destination for the C oracle, never aliased  */
+static u_char *g_dst2;			/* destination for the assembly, never aliased  */
+
+static int fuzz_copy(void)
+{
+	int fails = 0, cases = 0;
+	int len, soff, doff;
+
+	for (len = 0; len <= 512; len++) {
+		if (len > 128 && (len & 15) != 0 && (rnd() & 3) != 0) continue;
+		for (soff = 0; soff <= 3; soff++) {
+			for (doff = 0; doff <= 3; doff++) {
+				int i, want, ncuts, cuts[8], pos, seg, bad;
+				u_long sum, asum;
+				int odd, aodd;
+
+				for (i = 0; i < len; i++)
+					g_buf[soff + i] = (u_char)(rnd() >> 13);
+				for (i = 0; i < len + 8; i++)
+					g_dst[i] = g_dst2[i] = 0xA5;	/* poison: catches short copies */
+				want = ref_cksum(g_buf + soff, len);
+
+				/* Split into segments, deliberately including odd-length ones so the
+				 * cross-call parity state is exercised rather than assumed.
+				 *
+				 * The cuts[0] / cuts[0]+1 pair forces a ONE-BYTE segment at a
+				 * randomised position for every len > 3 -- the RNG picks where it
+				 * lands, never whether it exists, so the odd-length path is covered
+				 * by construction rather than by luck.
+				 *
+				 * The repeated cut then forces a ZERO-LENGTH segment immediately
+				 * after it. That is the case that actually bites: in_cksum_copy()
+				 * returns early on n == 0, BEFORE touching *odd, so an empty segment
+				 * must neither complete nor clear a pending unpaired byte. Whether a
+				 * byte is pending there depends on cuts[0]'s parity, which varies
+				 * across the sweep, so both sub-cases get hit. Without this the case
+				 * only occurred incidentally, when the RNG happened to place cuts[0]
+				 * after the fixed len-3 cut. */
+				ncuts = 0;
+				if (len > 3) {
+					cuts[ncuts++] = (int)(rnd() % (u_long)len);
+					if (cuts[0] + 1 <= len) {
+						cuts[ncuts++] = cuts[0] + 1;
+						cuts[ncuts++] = cuts[0] + 1;	/* zero-length segment */
+					}
+				}
+				if (len > 8) cuts[ncuts++] = len - 3;
+
+				/* Drive BOTH implementations over the identical segment walk. */
+				sum = 0; odd = 0; pos = 0;
+				for (seg = 0; seg <= ncuts; seg++) {
+					int end = (seg < ncuts) ? cuts[seg] : len;
+					if (end < pos) end = pos;
+					if (end > len) end = len;
+					sum = in_cksum_copy(g_buf + soff + pos, g_dst + doff + pos,
+							    (u_long)(end - pos), sum, &odd);
+					pos = end;
+				}
+				asum = 0; aodd = 0; pos = 0;
+				for (seg = 0; seg <= ncuts; seg++) {
+					int end = (seg < ncuts) ? cuts[seg] : len;
+					if (end < pos) end = pos;
+					if (end > len) end = len;
+					asum = in_cksum_copy_asm(g_buf + soff + pos, g_dst2 + doff + pos,
+								 (u_long)(end - pos), asum, &aodd);
+					pos = end;
+				}
+
+				cases++;
+				bad = 0;
+				/* --- the C oracle against the independent reference --- */
+				if ((int)in_cksum_fold(sum) != want) bad = 1;
+				for (i = 0; i < len; i++)
+					if (g_dst[doff + i] != g_buf[soff + i]) { bad = 2; break; }
+				/* The byte immediately past the copy must still be poison. */
+				if (!bad && g_dst[doff + len] != 0xA5) bad = 3;
+				/* --- the assembly against the same reference --- */
+				if (!bad && (int)in_cksum_fold(asum) != want) bad = 4;
+				if (!bad)
+					for (i = 0; i < len; i++)
+						if (g_dst2[doff + i] != g_buf[soff + i]) { bad = 5; break; }
+				if (!bad && g_dst2[doff + len] != 0xA5) bad = 6;
+				/* --- and against each other, including the parity state ---
+				 * Stronger than "both match the reference": the running sum is
+				 * chained across calls, so an implementation could agree on the
+				 * final folded value while carrying different intermediate state.
+				 * Requiring the raw sum AND *odd to agree catches that. */
+				if (!bad && asum != sum) bad = 7;
+				if (!bad && aodd != odd)  bad = 8;
+
+				if (bad) {
+					if (fails < 12)
+						bprintf("  COPY MISMATCH len=%ld soff=%ld doff=%ld kind=%ld "
+							"ref=%04lx c=%04lx asm=%04lx\n",
+							(LONG)len, (LONG)soff, (LONG)doff, (LONG)bad,
+							(LONG)(want & 0xffff),
+							(LONG)(in_cksum_fold(sum) & 0xffff),
+							(LONG)(in_cksum_fold(asum) & 0xffff));
+					fails++;
+				}
+			}
+		}
+	}
+	bprintf("  copy fuzz: %ld cases, %ld failures  (C:1=sum 2=bytes 3=ovr  ASM:4=sum 5=bytes 6=ovr  7=sum!=C 8=odd!=C)\n",
+		(LONG)cases, (LONG)fails);
+	return fails;
+}
+
+/* ---- boundary fuzz: the length at which the asm changes strategy --------------- */
+/*
+ * in_cksum_copy_asm.S hands any length >= 0x10000 to its byte loop, because `dbf`'s
+ * counter is 16-bit -- and, less obviously, because that bound is also what keeps the
+ * accumulator small enough that the routine's un-chained trailing `add.l`s cannot
+ * overflow 32 bits. The main sweep above stops at 512, so WITHOUT THIS that fallback
+ * has never once executed on target and the exact boundary has never been crossed.
+ * A hand argument that a branch is safe is not the same as having run it.
+ *
+ * Single-segment only: this is about the length boundary, not the chaining, which the
+ * main sweep already covers thoroughly.
+ */
+static int fuzz_copy_large(void)
+{
+	static const long lens[5] = { 65533, 65534, 65535, 65536, 65537 };
+	int fails = 0, cases = 0;
+	int li, soff, doff;
+
+	for (li = 0; li < 5; li++) {
+		int len = (int)lens[li];
+		for (soff = 0; soff <= 1; soff++) {
+			for (doff = 0; doff <= 1; doff++) {
+				u_long sum, asum;
+				int odd = 0, aodd = 0, want, i, bad;
+
+				for (i = 0; i < len; i++)
+					g_buf[soff + i] = (u_char)(rnd() >> 13);
+				g_dst[doff + len] = g_dst2[doff + len] = 0xA5;
+				want = ref_cksum(g_buf + soff, len);
+
+				sum  = in_cksum_copy(g_buf + soff, g_dst + doff,
+						     (u_long)len, 0UL, &odd);
+				asum = in_cksum_copy_asm(g_buf + soff, g_dst2 + doff,
+							 (u_long)len, 0UL, &aodd);
+
+				cases++;
+				bad = 0;
+				if ((int)in_cksum_fold(sum)  != want) bad = 1;
+				if (!bad && (int)in_cksum_fold(asum) != want) bad = 4;
+				if (!bad)
+					for (i = 0; i < len; i++)
+						if (g_dst2[doff + i] != g_buf[soff + i]) { bad = 5; break; }
+				if (!bad && g_dst2[doff + len] != 0xA5) bad = 6;
+				if (!bad && asum != sum) bad = 7;
+				if (!bad && aodd != odd)  bad = 8;
+
+				if (bad) {
+					bprintf("  LARGE MISMATCH len=%ld soff=%ld doff=%ld kind=%ld "
+						"ref=%04lx c=%04lx asm=%04lx\n",
+						(LONG)len, (LONG)soff, (LONG)doff, (LONG)bad,
+						(LONG)(want & 0xffff),
+						(LONG)(in_cksum_fold(sum) & 0xffff),
+						(LONG)(in_cksum_fold(asum) & 0xffff));
+					fails++;
+				}
+			}
+		}
+	}
+	bprintf("  large-length fuzz: %ld cases, %ld failures  (crosses the 0x10000 boundary)\n",
+		(LONG)cases, (LONG)fails);
+	return fails;
+}
+
 /* ---- timing (ReadEClock, auto-scaled to ~2s per measurement) ------------------- */
 static u_long eclk_freq;
 static void eclk_read(struct EClockVal *e) { ReadEClock(e); }
@@ -261,6 +471,67 @@ static void bench_len(int len)
 	     (LONG)(c ? (a * 100 / c) / 100 : 0), (LONG)(c ? (a * 100 / c) % 100 : 0));
 }
 
+/*
+ * ---- the question this whole exercise exists to answer -------------------------
+ *
+ * TODAY the receive path does TWO passes over the payload: CopyMem() into the mbuf,
+ * then a separate in_cksum() read of it. The fused primitive does ONE. Time the two
+ * arrangements against each other, doing the same total work, on the same buffers.
+ *
+ * Both legs are timed with the SAME loop shape and the same auto-scaling, so the
+ * comparison is like-for-like rather than one leg carrying different overhead. The
+ * `sink` reads keep the optimiser from discarding either result.
+ */
+static u_long bench_copy_one(int fused, int len)
+{
+	struct EClockVal t0, t1;
+	unsigned long long ticks, us, bytes;
+	u_long iters = 0;
+	volatile u_long sink = 0;
+	struct tmbuf m;
+	int odd;
+
+	m.m_next = 0; m.m_len = len; m.m_data = (char *)g_dst;
+
+	eclk_read(&t0);
+	do {
+		int k;
+		if (fused)
+			for (k = 0; k < 200; k++) {
+				odd = 0;
+				sink += in_cksum_copy_asm(g_buf, g_dst, (u_long)len, 0UL, &odd);
+			}
+		else
+			for (k = 0; k < 200; k++) {	/* today: CopyMem, then a second pass */
+				CopyMem((APTR)g_buf, (APTR)g_dst, (ULONG)len);
+				sink += (u_long)in_cksum(&m, len);
+			}
+		iters += 200;
+		eclk_read(&t1);
+		ticks = eclk_delta(&t0, &t1);
+	} while (ticks < (unsigned long long)eclk_freq);
+
+	us = ticks * 1000000ULL / (unsigned long long)eclk_freq;
+	bytes = (unsigned long long)len * iters;
+	if (us == 0) us = 1;
+	return (u_long)(bytes * 100ULL / us);
+}
+
+static void bench_copy(int len)
+{
+	u_long two, one;
+	int i;
+	for (i = 0; i < len; i++) g_buf[i] = (u_char)(rnd() >> 11);
+	two = bench_copy_one(0, len);
+	one = bench_copy_one(1, len);
+	bprintf("  len %4ld :  copy+cksum %3ld.%02ld MB/s   fused %3ld.%02ld MB/s   %ld.%02ldx\n",
+	     (LONG)len,
+	     (LONG)(two / 100), (LONG)(two % 100),
+	     (LONG)(one / 100), (LONG)(one % 100),
+	     (LONG)(two ? (one * 100 / two) / 100 : 0),
+	     (LONG)(two ? (one * 100 / two) % 100 : 0));
+}
+
 int main(void)
 {
 	struct MsgPort *mp;
@@ -271,6 +542,10 @@ int main(void)
 	bprintf("cksumbench starting...\n");
 	g_buf = (u_char *)AllocMem(BUFSZ + 8, MEMF_ANY);
 	if (!g_buf) { bprintf("no memory\n"); goto out; }
+	g_dst = (u_char *)AllocMem(BUFSZ + 8, MEMF_ANY);	/* separate: never aliases g_buf */
+	if (!g_dst) { bprintf("no memory\n"); goto out; }
+	g_dst2 = (u_char *)AllocMem(BUFSZ + 8, MEMF_ANY);
+	if (!g_dst2) { bprintf("no memory\n"); goto out; }
 
 	mp = CreateMsgPort();
 	if (!mp) { bprintf("no msgport\n"); goto out; }
@@ -286,16 +561,40 @@ int main(void)
 	if (fuzz() != 0) { bprintf("\nFAILED: checksum mismatch -- asm is NOT safe to ship.\n"); rc = 20; }
 	else {
 		bprintf("  PASS: asm is byte-for-byte identical to the reference.\n\n");
+
+		bprintf("Correctness (in_cksum_copy C + ASM vs independent reference, ON TARGET):\n");
+		if (fuzz_copy() != 0) {
+			bprintf("\nFAILED: in_cksum_copy is NOT safe to build on.\n");
+			rc = 20;
+			goto closedev;
+		}
+		bprintf("  PASS: sums match and every byte copied correctly.\n");
+		if (fuzz_copy_large() != 0) {
+			bprintf("\nFAILED: in_cksum_copy disagrees at the 0x10000 boundary.\n");
+			rc = 20;
+			goto closedev;
+		}
+		bprintf("  PASS: the >= 0x10000 byte-loop fallback agrees too.\n\n");
+
 		bprintf("Speed (single mbuf, warm buffer):\n");
 		bench_len(40);		/* bare TCP/IP header (ACK-sized)  */
 		bench_len(576);		/* common path MTU                 */
 		bench_len(1460);	/* full-MSS data segment           */
+
+		bprintf("\nRX copy+checksum: today's two passes vs one fused pass:\n");
+		bench_copy(40);
+		bench_copy(576);
+		bench_copy(1460);
 		rc = 0;
 	}
+
+closedev:
 
 	CloseDevice((struct IORequest *)&tr);
 out:
 	if (g_buf) FreeMem(g_buf, BUFSZ + 8);
+	if (g_dst) FreeMem(g_dst, BUFSZ + 8);
+	if (g_dst2) FreeMem(g_dst2, BUFSZ + 8);
 	if (g_log) { bprintf("\ndone (rc=%ld)\n", (LONG)rc); Close(g_log); }
 	return rc;
 }

@@ -126,8 +126,36 @@ domaininit()
 	register struct domain *dp;
 	register struct protosw *pr;
 
+	/*
+	 * PORT (AmiTCP_NG): the DOMAIN TABLE is built once; the PER-PROTOCOL init
+	 * must run on EVERY stack start.
+	 *
+	 * This is a restartable library: the stack can be torn down and started
+	 * again in the same Exec session, and the protocol globals are load-time,
+	 * so they survive that. The whole function used to return early here once
+	 * domain_initialized was set, which meant a restarted stack NEVER re-ran
+	 * ip_init()/udp_init()/tcp_init() -- and those are what reset udb, tcb and
+	 * ipq to empty.
+	 *
+	 * The consequence was not subtle. A forced shutdown abandons a client's
+	 * base without closing its sockets, so their PCBs stay linked in udb. The
+	 * pools are then freed wholesale, so those PCBs become dead memory that is
+	 * STILL LINKED, and the restart never cleared the head. The next bind()
+	 * walked that chain into freed memory, reached a NULL inp -- which the
+	 * `inp != head` loop test happily accepts -- dereferenced address 0 and
+	 * span for ever. That walk runs under splnet(), which is Forbid() here, so
+	 * the whole machine stopped dead with nothing in the log.
+	 *
+	 * So: gate only the ADDDOMAIN() splicing below (which MUST stay run-once,
+	 * or the domains chain gets duplicated), and let the init loop run every
+	 * time. ip/udp/tcp_init() are idempotent list-head resets; the route
+	 * domain's rtinitheads() carries its own separate guard and returns early,
+	 * which is deliberate -- its radix tree is bsd_malloc'd, NOT pool memory,
+	 * so re-initialising that head would leak the whole route table on every
+	 * restart. Do not "tidy" that into this loop.
+	 */
 	if (domain_initialized)
-	  return TRUE;
+	  goto run_protocol_init;
 
 #undef unix
 #ifndef AMITCP
@@ -153,6 +181,7 @@ domaininit()
 	ADDDOMAIN(imp);
 #endif
 
+run_protocol_init:
 	for (dp = domains; dp; dp = dp->dom_next) {
 		if (dp->dom_init)
 			(*dp->dom_init)();

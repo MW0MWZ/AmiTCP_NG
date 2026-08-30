@@ -201,12 +201,15 @@ int   bpf_validate(struct bpf_insn *f, int len);
  * AmiTCP_NG BPF channel core (net/bpf.c). ng_bpf_tap() feeds a complete
  * link-layer frame (as an mbuf chain) to every listening channel;
  * ng_bpf_tap_ether() is the SANA-II "cooked" helper that reconstructs the
- * Ethernet header from the separately-delivered addresses + type first. Both
- * are cheap no-ops when no channel is listening.
+ * Ethernet header from the separately-delivered addresses + type first;
+ * ng_bpf_tap_af() is the loopback helper, prepending the 4-byte address family
+ * that IS the DLT_NULL "link layer". All are cheap no-ops when no channel is
+ * listening.
  */
 void ng_bpf_tap(struct ifnet *ifp, struct mbuf *m);
 void ng_bpf_tap_ether(struct ifnet *ifp, const u_char *dst, const u_char *src,
 		      u_short ethertype, struct mbuf *m);
+void ng_bpf_tap_af(struct ifnet *ifp, u_long af, struct mbuf *m);
 
 /*
  * Channel API driven by the bpf_* library vectors (net/bpf.c, wired in Phase 4).

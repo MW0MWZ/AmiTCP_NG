@@ -296,6 +296,10 @@ socreate(dom, aso, type, proto)
 	return (0);
 }
 
+volatile int ng_pcb_runaway = 0;	/* DIAG: set by in_pcblookup on a runaway walk */
+volatile unsigned long ng_pcb_head = 0, ng_pcb_first = 0,
+		       ng_pcb_cur = 0, ng_pcb_curnext = 0;
+
 int
 sobind(so, nam)
 	struct socket *so;
@@ -308,6 +312,36 @@ sobind(so, nam)
 	    (*so->so_proto->pr_usrreq)(so, PRU_BIND,
 		(struct mbuf *)0, nam, (struct mbuf *)0);
 	splx(s);
+	/* DIAG: report OUTSIDE splnet() -- ng_diag() calls DOS and must not run
+	 * under Forbid. */
+	/*
+	 * ONCE per stack lifetime, deliberately.
+	 *
+	 * This runs with syscall_semaphore held and the caller priority-boosted to
+	 * the net task's level (see ObtainSyscallSemaphore), so every other task's
+	 * socket call is queued behind it -- and ng_diag() does a synchronous disk
+	 * Flush(). One such stall buys a diagnosis worth having; repeating it on
+	 * every bind() against a list that is still corrupt would turn a bounded
+	 * trap into a system-wide drag, at exactly the moment (a restart race) when
+	 * the machine can least afford it.
+	 *
+	 * The latch is per stack instance: the trap should now be unreachable at all
+	 * (domaininit() re-runs the per-protocol init on every start, so the heads
+	 * cannot be inherited stale), and if it ever does fire, once is enough to
+	 * know that assumption broke.
+	 */
+	if (ng_pcb_runaway) {
+		static int reported = 0;
+
+		if (!reported) {
+			reported = 1;
+			ng_diag("DIAG sobind: PCB RUNAWAY %ld: head=%lx head->next=%lx "
+				"cur=%lx cur->next=%lx",
+				(long)ng_pcb_runaway, ng_pcb_head, ng_pcb_first,
+				ng_pcb_cur, ng_pcb_curnext);
+		}
+		ng_pcb_runaway = 0;
+	}
 	return (error);
 }
 
@@ -698,7 +732,10 @@ nopages:
 				if (atomic && top == 0 && len < mlen)
 					MH_ALIGN(m, len);
 			}
+			NG_PROF_ADDR("in ", uio->uio_iov->iov_base, mtod(m, caddr_t), (long)len);
+			NG_PROF_IN(NG_PROF_COPYIN);
 			uioread(mtod(m, caddr_t), (int)len, uio);
+			NG_PROF_OUT(NG_PROF_COPYIN, (long)len);
 			resid = uio->uio_resid;
 			m->m_len = len;
 			*mp = m;
@@ -837,8 +874,10 @@ soreceive(so, paddr, uio, mp0, controlp, flagsp)
 			goto bad;
 
 		do {
-			uiowrite(mtod(m, caddr_t),
-			    (int) min(uio->uio_resid, m->m_len), uio);
+			NG_PROF_IN(NG_PROF_COPYOUT);
+			{ long _n = (long)min(uio->uio_resid, m->m_len);
+			  uiowrite(mtod(m, caddr_t), (int)_n, uio);
+			  NG_PROF_OUT(NG_PROF_COPYOUT, _n); }
 			m = m_free(m);
 		} while (uio->uio_resid && error == 0 && m);
 
@@ -1013,7 +1052,9 @@ dontblock:
 
 		if (mp == 0) {
 			splx(s);
+			NG_PROF_IN(NG_PROF_COPYOUT);
 			uiowrite(mtod(m, caddr_t) + moff, (int)len, uio);
+			NG_PROF_OUT(NG_PROF_COPYOUT, (long)len);
 			s = splnet();
 		} else
 			uio->uio_resid -= len;

@@ -28,6 +28,98 @@
 #define DIAGNOSTIC 1
 
 /*
+ * Use Exec's CopyMemQuick for payload copies whose ends are both longword-aligned
+ * and whose length is a longword multiple (src/kern/ng_copy.c). CopyMem is general
+ * and re-analyses alignment on every call; CopyMemQuick demands the aligned case and
+ * is then a tight move.l loop. On the emulated 7 MHz 68000 this cut a UDP loopback
+ * round trip's per-byte cost from 8.88 to 3.65 us/byte -- a full-MTU round trip from
+ * 18.9 ms to 11.4 ms.
+ *
+ * Set to 0 to fall back to CopyMem everywhere, which is the behaviour every release
+ * up to 4.1.6 shipped -- the switch exists so a machine that misbehaves can be tested
+ * against the old path without a rebuild of anything else.
+ */
+#define NG_COPYQUICK	1
+
+/*
+ * TEMPORARY: time the four passes a packet's payload makes through the stack, to
+ * find where the per-byte cost actually goes. See src/kern/ng_stageprof.c.
+ * Costs eight timer reads per round trip; harmless at benchmark scale, wrong to
+ * ship. Set to 0 and delete once the question is answered.
+ */
+#define NG_STAGEPROF	0
+
+#define NG_PROF_COPYIN	0
+#define NG_PROF_CKSOUT	1
+#define NG_PROF_CKSIN	2
+#define NG_PROF_COPYOUT	3
+#define NG_PROF_NULL	4	/* calibration: enter+leave with no work between */
+#define NG_PROF_NSTAGE	5
+
+#if NG_STAGEPROF
+void ng_prof_enter(int stage);
+void ng_prof_leave(int stage, long nbytes);
+void ng_prof_packet(void);
+void ng_prof_addr(const char *tag, void *src, void *dst, long len);
+#define NG_PROF_ADDR(t,s,d,n)	ng_prof_addr(t,s,d,n)
+#define NG_PROF_IN(s)	ng_prof_enter(s)
+#define NG_PROF_OUT(s,n)	ng_prof_leave(s,n)
+#define NG_PROF_PKT()	ng_prof_packet()
+#else
+#define NG_PROF_IN(s)
+#define NG_PROF_OUT(s,n)
+#define NG_PROF_PKT()
+#define NG_PROF_ADDR(t,s,d,n)
+#endif
+
+/*
+ * Fuse the SANA receive copy with the Internet checksum (net/sana2copybuff.c), so a
+ * received frame crosses memory twice instead of three times.
+ *
+ * GATED BY CPU, on measurement rather than taste. Fused vs today's CopyMem+in_cksum,
+ * at 40/576/1460 bytes: 68000 1.29/1.26/1.24x, 68020 1.44/1.33/1.29x, but 68040
+ * 1.32/1.00/0.96x -- a LOSS at the sizes that carry the data, because 4K of data cache
+ * keeps the frame resident and makes today's second pass nearly free. MOVE16 cannot
+ * rescue a fused loop: it is memory-to-memory and routes nothing through a data
+ * register to add from, so a one-pass 68040 variant is architecturally impossible.
+ *
+ * NB the 68040 figures are EMULATED and varied between runs (0.92x then 0.96x at
+ * 1460); confirm on real hardware before treating this gate as settled.
+ */
+#if defined(__mc68040__) || defined(__mc68060__)
+#define NG_RX_CSUM	0
+#else
+#define NG_RX_CSUM	1
+#endif
+
+/*
+ * A SELF-CHECKING BUILD: recompute every fused receive checksum the slow way and
+ * compare, both where it is produced (the SANA copy) and where it is consumed
+ * (tcp_input / udp_input). Any disagreement is logged and counted, and the disproved
+ * sum is refused rather than used.
+ *
+ * OFF by default, and it must stay off in anything shipped or measured:
+ *
+ * ⚠️ A BUILD WITH THIS ON IS SLOWER THAN BASELINE, NOT FASTER. It adds a full extra
+ * pass over the payload at DEVICE-INTERRUPT priority, on top of the fused copy -- so
+ * total interrupt-time work exceeds even the old plain-copy path, whose checksum
+ * happened later at IP/TCP level rather than inside the driver's interrupt. The
+ * 1.24-1.29x figures above are fused-vs-baseline and include NONE of this. That
+ * matters at this call site in particular: it produced a receive-ring re-arm livelock
+ * once before, so time-in-interrupt here is not a free variable.
+ *
+ * Kept rather than deleted because it earns its place as a diagnostic: if a machine
+ * ever shows corruption that might be checksum-related, one flag turns the stack into
+ * something that proves or clears itself under real traffic. It has already found two
+ * real defects that way. Deliberately NOT gated on DIAGNOSTIC, which ships.
+ *
+ * Validated with this ON: 145,000+ frames on 68000 hardware under a sustained SMB
+ * download, zero disagreements, with both the producer and the TCP consumer confirmed
+ * live; UDP consumer confirmed under emulation.
+ */
+#define NG_RX_CSUM_VERIFY	0
+
+/*
  * Be compatible with BSD 4.2. Affects only checksumming of UDP data. If true
  * the checksum is NOT calculated by default.
  */

@@ -218,6 +218,11 @@ static int show_interface_info(const char *name)
 {
   struct ng_sin sin, mask; LONG mtu = 0, hwt = 0, state = 0, unit = 0, mss = 0;
   ULONG rx = 0, tx = 0, ierr = 0, idrop = 0, inobuf = 0, oqdrop = 0, oerr = 0, onobuf = 0;
+  /* Byte counters are SBQUAD_T: {sbq_High, sbq_Low}, high word first. They must be
+   * a two-ULONG pair even though the stack's if_ibytes/if_obytes are 32 bits and the
+   * high word is therefore always 0 -- passing a plain ULONG leaves the library
+   * writing sbq_Low into the caller's stack past the variable. */
+  ULONG bin[2] = { 0, 0 }, bout[2] = { 0, 0 };
   struct TagItem tg[20]; char ip[24], hb[24]; char *dev = 0;   /* IFQ_DeviceName -> STRPTR */
   sin.sin_addr = 0; mask.sin_addr = 0;
   tg[0].ti_Tag = IFQ_DeviceName_;     tg[0].ti_Data = (ULONG)&dev;
@@ -236,7 +241,9 @@ static int show_interface_info(const char *name)
   tg[13].ti_Tag = IFQ_OutputDrops;    tg[13].ti_Data = (ULONG)&oqdrop;
   tg[14].ti_Tag = NGIFQ_OutErrors;    tg[14].ti_Data = (ULONG)&oerr;
   tg[15].ti_Tag = NGIFQ_OutNoBuf;     tg[15].ti_Data = (ULONG)&onobuf;
-  tg[16].ti_Tag = TAG_END;            tg[16].ti_Data = 0;
+  tg[16].ti_Tag = IFQ_GetBytesIn;     tg[16].ti_Data = (ULONG)bin;
+  tg[17].ti_Tag = IFQ_GetBytesOut;    tg[17].ti_Data = (ULONG)bout;
+  tg[18].ti_Tag = TAG_END;            tg[18].ti_Data = 0;
   if (ng_queryif((void *)name, tg) != 0) return 0;
 
   Printf((STRPTR)"Interface \"%s\"\n", (LONG)name);
@@ -250,8 +257,18 @@ static int show_interface_info(const char *name)
   if (sin.sin_addr)  { fmt_ip(sin.sin_addr, ip);  Printf((STRPTR)"Address                      = %s\n", (LONG)ip); }
   else                                             Printf((STRPTR)"Address                      = (Not configured)\n");
   if (mask.sin_addr) { fmt_ip(mask.sin_addr, ip); Printf((STRPTR)"Network mask                 = %s\n", (LONG)ip); }
-  Printf((STRPTR)"Packets received             = %ld\n", (LONG)rx);
-  Printf((STRPTR)"Packets sent                 = %ld\n", (LONG)tx);
+  Printf((STRPTR)"Packets received             = %lu\n", (ULONG)rx);
+  Printf((STRPTR)"Packets sent                 = %lu\n", (ULONG)tx);
+  /* %lu, not %ld: these are unsigned and a busy interface passes 2^31 in a single
+   * session (the PiStorm reached ~7 MB/s, which is 2 GB in five minutes), where a
+   * signed conversion would start printing negative byte counts.
+   *
+   * These read 0 until traffic flows, which is correct -- but they read 0 forever
+   * before this, because nothing ever asked the library for them. The counters and
+   * their tags were both already there and working; ShowNetStatus simply queried
+   * packets and never bytes, which is what made the transfer figures look broken. */
+  Printf((STRPTR)"Bytes received               = %lu\n", (ULONG)bin[1]);
+  Printf((STRPTR)"Bytes sent                   = %lu\n", (ULONG)bout[1]);
   Printf((STRPTR)"Input errors (media)         = %ld\n", (LONG)ierr);
   Printf((STRPTR)"Input drops (queue full)     = %ld\n", (LONG)idrop);
   Printf((STRPTR)"Input drops (no mbuf)        = %ld\n", (LONG)inobuf);

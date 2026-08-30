@@ -756,11 +756,17 @@ ng_hostent_from_response(struct SocketBase *libPtr, void *response, int len,
 }
 
 /*
- * id_addr variable is used by both the gethostname() and gethostid().
- * 
+ * PORT (AmiTCP_NG): there used to be a `static ULONG id_addr` here, cached for the
+ * life of the stack and shared by every opener -- the autodoc below even promised
+ * "the id will not change" once set. That promise is the second half of issue #4:
+ * after NetShutdown removed every interface, gethostid() went on returning the
+ * address the machine had BEFORE it was shut down, so an application asking "what
+ * is my address" to decide whether it was online got a stale yes. Both callers now
+ * query the live interface list instead; findid() is a short walk under splimp()
+ * and neither caller is on a hot path.
+ *
  * host_name is the host_name configuration variable.
  */
-static ULONG id_addr = 0;
 
 void findid(ULONG *); /* defined in net/if.c */
 
@@ -880,9 +886,9 @@ LONG SAVEDS RAF3(_gethostname,
    */
   if (*host_name == '\0') {
     struct hostent * hent;
+    ULONG id_addr = 0;			/* live, not cached -- see above */
     /* gethostid() */
-    if (id_addr == 0)
-      findid(&id_addr);
+    findid(&id_addr);
     if (id_addr != 0) { /* query if we have an address */
       hent = gethostbyaddr(libPtr, (const char *)&id_addr,
 			   sizeof(id_addr), AF_INET);
@@ -958,9 +964,16 @@ LONG SAVEDS RAF3(_gethostname,
 *       printf("My primary IP address is: %s.\n", Inet_NtoA(id));
 *
 *   NOTES
-*       Non-zero id is returned as soon as a interface is configured.
-*       After that the id will not change, not even if the id is the
-*       address of the loopback interface.
+*       The address of the first configured, non-loopback interface that is
+*       up. It tracks the machine: bring an interface up and it appears, take
+*       every interface down (NetShutdown) and this returns 0 again.
+*
+*       AmiTCP 3.0b2 behaved differently and this autodoc used to describe it:
+*       the id was cached on first use and never changed afterwards, and the
+*       loopback address counted. That made gethostid() report an address on a
+*       machine with no network at all, which is not what Roadshow does and is
+*       not useful to the applications that ask (see issue #4). A caller that
+*       wants a stable identifier for the session must cache it itself.
 *
 *   BUGS
 *
@@ -973,9 +986,11 @@ ULONG SAVEDS RAF1(_gethostid,
 #if 0     
 {
 #endif
+  ULONG id_addr = 0;
+
+  NG_CHECK_DEAD(0);
   NG_ENSURE_STACK();
   (void)libPtr;
-  if (id_addr == 0)
-    findid(&id_addr);
+  findid(&id_addr);
   return id_addr;
 }

@@ -143,3 +143,37 @@ RESULT: DHCP OK (address leased over the NIC)
 - **Build fails at CMake configure.** Check `libenet-dev` and the SDL2 `-dev`
   packages are present (they are in the Dockerfile); and confirm the pinned tag
   is `v7.1.1` (v8.x needs SDL3).
+
+## Reproducing issue #4 (address reported after `NetShutdown`)
+
+`gethostid()` must report an address while an interface is up and **no** address once
+`NetShutdown` has removed them all — that is what Roadshow does, and applications use
+it to decide whether they are online. It needs a real interface, so it only reproduces
+on this harness, not the loopback-only FS-UAE one.
+
+```bash
+docker run --rm -v "$PWD":/work -w /work amigadev/crosstools:m68k-amigaos bash -c \
+  'm68k-amigaos-gcc -noixemul -O2 -m68000 tmp/hostidtest.c -o tmp/hostidtest'
+cp tmp/hostidtest emu/hdd/System/Workbench3.2/hostidtest
+```
+
+Boot script:
+
+```
+C:AddNetInterface DEVS:NetInterfaces/smoke >SYS:online.log
+SYS:hostidtest ONLINE  >SYS:hostid-online.log
+C:NetShutdown          >SYS:shutdown.log
+SYS:hostidtest OFFLINE >SYS:hostid-offline.log
+```
+
+```bash
+NET=1 TIMEOUT=240 ./docker/run-amiberry.sh
+tr -d '\r' < emu/hdd/System/Workbench3.2/hostid-offline.log
+```
+
+Both phases must say `RESULT: HOSTID OK`. **Run the ONLINE phase too** — an OFFLINE
+pass on its own is worthless, because a stack that never came up also reports no
+address. That is not hypothetical: an early version of this test called the wrong LVO
+(`-210`, `gethostbyname`) which returned 0 for any input, so OFFLINE "passed" while
+proving nothing. ONLINE failing is what exposed it.
+

@@ -82,7 +82,7 @@ RCS_ID_C="$Id: udp_usrreq.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
  *
  * UDP is the simplest transport: no connection, no reliability -- just a port pair
  * and an optional checksum wrapped around IP. Because it is small, it is the best
- * transport to read first, and it is exactly the path tmp/udptest.c exercises.
+ * transport to read first, and it is exactly the path a UDP round-trip exercises.
  *   udp_output()   prepend the UDP header, compute the checksum, call ip_output.
  *   udp_input()    on receive: find the matching inpcb by (local port, remote
  *                  addr/port) via in_pcblookup (in_pcb.c), append the datagram to
@@ -121,6 +121,9 @@ RCS_ID_C="$Id: udp_usrreq.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 #include <netinet/ip_output_protos.h>
 #include <netinet/ip_icmp_protos.h>
 #include <netinet/in_cksum_protos.h>
+#if NG_RX_CSUM
+#include <netinet/in_cksum_copy_protos.h>
+#endif
 #include <netinet/in_pcb_protos.h>
 #include <netinet/in_protos.h>
 #include <kern/uipc_socket2_protos.h>
@@ -145,6 +148,19 @@ udp_init()
 {
 
 	udb.inp_next = udb.inp_prev = &udb;
+	/*
+	 * PORT (AmiTCP_NG): reset the one-behind lookup cache with the list.
+	 *
+	 * udp_input() dereferences udp_last_inpcb UNCONDITIONALLY, with no walk and
+	 * no bound, before falling back to in_pcblookup(). Left stale across a stack
+	 * restart it points into pool memory that mbdeinit() has freed and something
+	 * else may already own, so the FIRST inbound datagram the new stack sees --
+	 * no client action required -- reads its ports and addresses out of that. If
+	 * the garbage happens to compare equal it is taken as a HIT and the packet is
+	 * appended to inp_socket->so_rcv, which is a write through an arbitrary
+	 * pointer. Resetting it here costs one store.
+	 */
+	udp_last_inpcb = &udb;
 }
 
 #if	!COMPAT_42
@@ -170,6 +186,7 @@ udp_input(m, iphlen)
 	struct in_addr dest; /* not REALLY used */
 
 	udpstat.udps_ipackets++;
+	NG_PROF_PKT();
 
 	/*
 	 * Strip IP options, if any; should skip this,
@@ -232,6 +249,17 @@ udp_input(m, iphlen)
 	if (ip->ip_len != len) {
 		m_adj(m, len - ip->ip_len);
 		/* ip->ip_len = len; */
+#if NG_RX_CSUM
+		/*
+		 * PORT (AmiTCP_NG): this trim is the ONE place in the local receive path
+		 * that removes bytes from INSIDE the region the SANA copy summed. Every
+		 * other m_adj() on the way here either touches only padding beyond ip_len
+		 * or runs after the checksum. A stored sum still covering those bytes is
+		 * now wrong, so invalidate it AT THE MUTATION -- do not expect the
+		 * consumer below to remember that this happened.
+		 */
+		m->m_flags &= ~M_CSUM_DONE;
+#endif
 	}
 	/*
 	 * Save a copy of the IP header in case we want restore it
@@ -247,7 +275,42 @@ udp_input(m, iphlen)
 		((struct ipovly *)ip)->ih_prev = 0;
 		((struct ipovly *)ip)->ih_x1 = 0;
 		((struct ipovly *)ip)->ih_len = uh->uh_ulen;
-		if ((uh->uh_sum = in_cksum(m, len + sizeof (struct ip)))) {
+#if NG_RX_CSUM
+		/* Same trade as tcp_input: the transport bytes were summed during the
+		 * receive copy, so only the pseudo-header is left to add. Note uh_sum == 0
+		 * (no checksum, legal per RFC 768) is already excluded by the test above,
+		 * so this path only runs where a checksum must actually be verified. */
+		if (m->m_flags & M_CSUM_DONE) {
+			u_long s;
+#if NG_RX_CSUM_VERIFY
+			/* BEFORE uh_sum is written -- in_cksum() sums the checksum field
+			 * itself, so overwriting it first makes the slow pass measure an
+			 * already-altered packet. See the matching note in tcp_input. */
+			u_short slow = (u_short)in_cksum(m, len + sizeof (struct ip));
+#endif
+			s = in_cksum_words(mtod(m, caddr_t),
+					   (u_long)sizeof (struct ip),
+					   m->m_pkthdr.csum);
+			uh->uh_sum = in_cksum_fold(s);
+#if NG_RX_CSUM_VERIFY
+			{
+				static int said = 0;
+				if (!said) { said = 1; log(LOG_DEBUG, "rxcsum: UDP consumer active"); }
+			}
+			if (slow != uh->uh_sum) {
+				udpstat.udps_badsum++;
+				log(LOG_ERR, "rxcsum: UDP consumer disagrees fast=%04lx slow=%04lx",
+				    (ULONG)uh->uh_sum, (ULONG)slow);
+				m_freem(m);
+				return;
+			}
+#endif
+		} else
+#endif
+		{ NG_PROF_IN(NG_PROF_CKSIN);
+			uh->uh_sum = in_cksum(m, len + sizeof (struct ip));
+		  NG_PROF_OUT(NG_PROF_CKSIN, (long)len); }
+		if (uh->uh_sum) {
 			udpstat.udps_badsum++;
 			m_freem(m);
 			return;
@@ -347,6 +410,12 @@ udp_input(m, iphlen)
 	 * Locate pcb for datagram.
 	 */
 	inp = udp_last_inpcb;
+	/* NULL-safe: this cache is dereferenced with no walk and no bound, so a
+	 * bad value here is read on the very first inbound datagram. udp_init()
+	 * now resets it on every stack start; this is the trap for anything that
+	 * still manages to clear it. */
+	if (inp == NULL)
+		inp = udp_last_inpcb = &udb;
 	if (inp->inp_lport != uh->uh_dport ||
 	    inp->inp_fport != uh->uh_sport ||
 	    inp->inp_faddr.s_addr != ip->ip_src.s_addr ||
@@ -566,7 +635,11 @@ udp_output(inp, m, addr, control)
 	 */
 	ui->ui_sum = 0;
 	if (udpcksum) {
+	    NG_PROF_IN(NG_PROF_CKSOUT);
 	    if ((ui->ui_sum = in_cksum(m, sizeof (struct udpiphdr) + len)) == 0)
+		;
+	    NG_PROF_OUT(NG_PROF_CKSOUT, (long)len);
+	    if (ui->ui_sum == 0)
 		ui->ui_sum = 0xffff;
 	}
 	((struct ip *)ui)->ip_len = sizeof (struct udpiphdr) + len;

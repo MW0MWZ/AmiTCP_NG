@@ -126,6 +126,7 @@ RCS_ID_C="$Id: tcp_input.c,v 3.1 1994/03/26 09:53:54 too Exp $";
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/syslog.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/protosw.h>
@@ -158,6 +159,9 @@ RCS_ID_C="$Id: tcp_input.c,v 3.1 1994/03/26 09:53:54 too Exp $";
 #include <netinet/in_pcb_protos.h>
 #include <netinet/in_protos.h>
 #include <netinet/in_cksum_protos.h>
+#if NG_RX_CSUM
+#include <netinet/in_cksum_copy_protos.h>
+#endif
 #include <kern/uipc_socket_protos.h>
 #include <kern/uipc_socket2_protos.h>
 #include <kern/accesscontrol.h>
@@ -626,7 +630,53 @@ tcp_input(m, iphlen)
 	ti->ti_x1 = 0;
 	ti->ti_len = (u_short)tlen;
 	(void)HTONS(ti->ti_len);
-	if ((ti->ti_sum = in_cksum(m, len))) {
+#if NG_RX_CSUM
+	/*
+	 * If the SANA receive copy already summed this datagram's transport bytes, the
+	 * whole second pass over the payload is unnecessary: add the pseudo-header (the
+	 * 20-byte overlay just rewritten above) to the stored sum, fold once, complement.
+	 * Arithmetically identical to in_cksum(m, len) -- one's-complement addition is
+	 * associative, and every partial sum here stays raw so it is folded exactly once.
+	 *
+	 * The stored sum covers [ip_hl*4, ip_len) as the frame arrived. Between then and
+	 * here it survives ip_stripoptions() (relocates transport bytes without changing
+	 * them; ip_hl counts 32-bit words so the region's start parity cannot move) and
+	 * m_pullup() (relocates, or allocates a new head and drops the flag). Nothing on
+	 * this path trims inside the region -- tcp_input's own m_adj() calls all happen
+	 * after this point.
+	 */
+	if (m->m_flags & M_CSUM_DONE) {
+		u_long s;
+#if NG_RX_CSUM_VERIFY
+		/*
+		 * MUST be taken BEFORE ti_sum is written. in_cksum() sums the checksum
+		 * FIELD along with everything else -- that is how the "valid packet sums
+		 * to zero" trick works -- so overwriting ti_sum first would have the slow
+		 * pass measure a packet we had already altered. Got this wrong the first
+		 * time and the cross-check caught it, which is the point of having one.
+		 */
+		u_short slow = (u_short)in_cksum(m, len);
+#endif
+		s = in_cksum_words(mtod(m, caddr_t), (u_long)sizeof (struct ip),
+				   m->m_pkthdr.csum);
+		ti->ti_sum = in_cksum_fold(s);
+#if NG_RX_CSUM_VERIFY
+		{	/* positive proof this path RAN -- "no disagreement" and "never
+			 * executed" look identical in a log otherwise. */
+			static int said = 0;
+			if (!said) { said = 1; log(LOG_DEBUG, "rxcsum: TCP consumer active"); }
+		}
+		if (slow != ti->ti_sum) {
+			tcpstat.tcps_rcvbadsum++;	/* refuse a sum we just disproved */
+			log(LOG_ERR, "rxcsum: TCP consumer disagrees fast=%04lx slow=%04lx",
+			    (ULONG)ti->ti_sum, (ULONG)slow);
+			goto drop;
+		}
+#endif
+	} else
+#endif
+		ti->ti_sum = in_cksum(m, len);
+	if (ti->ti_sum) {
 		tcpstat.tcps_rcvbadsum++;
 		goto drop;
 	}
@@ -690,6 +740,11 @@ tcp_input(m, iphlen)
 	 */
 findpcb:
 	inp = tcp_last_inpcb;
+	/* NULL-safe for the same reason as udp_input()'s cache: dereferenced with
+	 * no walk and no bound, on the first inbound segment. tcp_init() resets it
+	 * on every stack start; this is the trap. */
+	if (inp == NULL)
+		inp = tcp_last_inpcb = &tcb;
 	if (inp->inp_lport != ti->ti_dport ||
 	    inp->inp_fport != ti->ti_sport ||
 	    inp->inp_faddr.s_addr != ti->ti_src.s_addr ||
@@ -2655,7 +2710,28 @@ tcp_mss(tp, offer)
 #endif
 			bufsize = so->so_snd.sb_hiwat;
 		if (bufsize < mss)
-			mss = bufsize;
+			/*
+			 * PORT (AmiTCP_NG) fix: re-apply the floor. The
+			 * imax(mss, 32) sanity floor a few lines above only
+			 * guards the MTU-derived value -- this assignment then
+			 * overwrote it with the send-buffer high-water mark,
+			 * with nothing stopping that being ZERO.
+			 *
+			 * setsockopt(SO_SNDBUF, 0) is accepted by sbreserve(),
+			 * so any local program can set sb_hiwat to 0, and
+			 * t_maxseg then becomes 0 before the SYN is even sent.
+			 * The next lost SYN reaches tcp_timers()' TCPT_REXMT
+			 * case, which does
+			 *     min(snd_wnd, snd_cwnd) / 2 / tp->t_maxseg
+			 * -- a divide by zero, i.e. a 68k Trap #5 inside the
+			 * net task, taking the whole stack down for every
+			 * application using it, not just the one that asked
+			 * for the daft buffer size. tcp_sack_pipe() already
+			 * defends itself against t_maxseg == 0; these two
+			 * stock divides never got the same treatment, so fix
+			 * it at the source instead.
+			 */
+			mss = imax((int)bufsize, 1);
 		else {
 			bufsize = min(bufsize, sb_max) / mss * mss;
 			(void) sbreserve(&so->so_snd, bufsize);

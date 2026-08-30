@@ -3,7 +3,10 @@
 ;
 ; Bring up every network interface configured under DEVS:NetInterfaces/. Each
 ; file there describes one interface (see the examples in SYS:Storage/NetInterfaces).
-; This runs from S:User-Startup so the network is up by the time Workbench opens.
+; The installer does NOT wire this into S:User-Startup -- deliberately, because
+; some hardware (WiFi especially) is not ready that early and a bring-up that
+; fails at boot is harder to diagnose than one you ran yourself. Run it by hand,
+; or add "Execute S:Network-Startup" to your User-Startup once your setup works.
 ;
 ; The pattern ~(#?.info) matches every file EXCEPT Workbench .info icons.
 FailAt 30

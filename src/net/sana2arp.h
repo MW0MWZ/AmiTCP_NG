@@ -89,6 +89,7 @@ struct s2_arppkt {
 
 #ifdef	KERNEL
 void alloc_arptable(struct sana_softc* ssc, int to_allocate);
+void free_arptable(struct sana_softc* ssc);
 void arptimer(void);
 int arpresolve(register struct sana_softc *ssc, struct mbuf * m,
                register struct in_addr *destip, register u_char * desten,

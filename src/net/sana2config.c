@@ -400,6 +400,24 @@ ssconfig(struct sana_softc *ifp, struct ssconfig *ifc)
   }
   
   ifp->ss_ip.type = args->a_iptype ? *args->a_iptype : wd->wd_iptype;
+
+  /*
+   * PORT (AmiTCP_NG): bps= overrides the link speed the driver reported.
+   *
+   * MUST happen here, before the ring sizing below reads if_baudrate. iface_make()
+   * has already stored devicequery.BPS into if_baudrate by the time it calls us, and
+   * AddInterfaceTagList's window auto-tune reads if_baudrate back off the finished
+   * ifnet afterwards -- so overriding at this one point corrects the rings AND the
+   * TCP window from a single place. A value of 0 (or the keyword absent) leaves the
+   * driver's figure alone; ng_speed_window() already treats 0 as "unknown, keep the
+   * RAM default", so there is no way to express "force unknown" and none is wanted.
+   *
+   * Negative is rejected rather than clamped: if_baudrate is an int, and a negative
+   * baud would make ng_effective_window()'s unsigned divide produce a vast ring.
+   */
+  if (args->a_bps && *args->a_bps > 0)
+    ifp->ss_if.if_baudrate = (int)*args->a_bps;
+
   /*
    * PORT (AmiTCP_NG): size the SANA-II request rings (receive AND transmit) to this
    * link, on BOTH axes the rest of the stack tunes -- RAM and interface speed. The

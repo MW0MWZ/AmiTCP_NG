@@ -108,6 +108,7 @@ RCS_ID_C="$Id: amiga_netdb.c,v 3.2 1994/04/06 15:37:29 too Exp $";
 #include <kern/amiga_config.h>
 #include <kern/amiga_netdb.h>
 #include <kern/accesscontrol.h>
+#include <api/dns_cache.h>		/* ng_dnscache_flush() on an ARexx RESET */
 
 #include <netinet/in.h>
 
@@ -126,6 +127,7 @@ int inet_aton(register const char *cp, struct in_addr *addr);
 int strcmp(const char *s1, const char *s2);
 
 LONG read_netdb(struct NetDataBase *ndb, UBYTE *fname, const UBYTE** errstrp, struct CSource *res, int prefixindex);
+static void ng_netdb_free_previous(void);	/* defined by netdb_deinit(); see there */
 
 /*
  * Global pointer for the NetDataBase
@@ -414,11 +416,14 @@ addservent(struct NetDataBase *ndb,
   int aliases, plen;
 
   if (rdargs = ReadArgs(NETDBTEMPLATE, Args, rdargs)) {
-    /* convert port number */
+    /* Convert "port/proto". PORT (AmiTCP_NG): ',' is accepted as well as '/',
+     * because Roadshow accepts both and we now read DEVS:Internet/services --
+     * a file written for Roadshow may legitimately say "80,tcp", and rejecting
+     * it would drop the entry with nothing but a syntax warning in the log. */
     UBYTE *s_proto = (UBYTE*)Args[KNDB_DATA];
-    if ((plen = StrToLong(s_proto, &Args[KNDB_DATA])) > 0 &&
-	s_proto[plen++] == '/') {
-      int protonamelen = strlen((char *)(s_proto = s_proto + plen)) + 1;
+    plen = StrToLong(s_proto, &Args[KNDB_DATA]);
+    if (plen > 0 && (s_proto[plen] == '/' || s_proto[plen] == ',')) {
+      int protonamelen = strlen((char *)(s_proto = s_proto + plen + 1)) + 1;
       sn = node_alloc(sizeof (*sn) + protonamelen,
 		      (UBYTE*)Args[KNDB_NAME],
 		      (UBYTE **)Args[KNDB_ALIAS], &aliases);
@@ -624,6 +629,7 @@ addnameservent(struct NetDataBase *ndb,
   }
   nsn->nsn_EntSize = sizeof (nsn->nsn_Ent);
   nsn->nsn_Dynamic = 0;			/* statically configured (from the config file) */
+  nsn->nsn_Owner[0] = '\0';		/* nobody owns a config-file server */
   nsn->nsn_Ent.ns_addr = ns_addr;
 
   AddTail((struct List*)&ndb->ndb_NameServers, (struct Node*)nsn);
@@ -1009,13 +1015,174 @@ do_netdb(struct CSource *csarg, UBYTE **errstrp, struct CSource *res)
     retval = addndbent(NDB, rdargs, errstrp);
 
     UNLOCK_NDB(NDB);
-    
+
+    /*
+     * An ARexx ADD can add a NAMESERVER (NS= is a NETDBENTRY keyword), which
+     * changes the resolver set under a cache that knows nothing about it -- the
+     * one mutation path that the rest of this work missed, because it predates
+     * the name-server vectors and goes through the generic entry parser.
+     *
+     * Flushed for ANY successful ADD rather than only for a name server, and
+     * that breadth is deliberate twice over. addndbent() does not report which
+     * kind of entry it parsed, so narrowing this would mean re-parsing the
+     * command purely to decide; and an added HOST entry is a local answer for a
+     * name that may well be sitting in the cache with a different address, which
+     * wants discarding just as much. Over-flushing costs a few re-queries of a
+     * cache that holds at most 128 entries; under-flushing is a wrong answer.
+     */
+    if (retval == RETURN_OK)
+      ng_dnscache_flush();
+
     FreeDosObject(DOS_RDARGS, rdargs);
   }
   else 
     retval = RETURN_FAIL;
 	
   return retval;
+}
+
+/*
+ * PORT (AmiTCP_NG): the Roadshow-format databases in DEVS:Internet.
+ *
+ * Roadshow keeps its network databases as separate Unix-style files under
+ * DEVS:Internet; we inherited AmiTCP's single tagged AmiTCP:db/netdb. A user
+ * installing us over Roadshow therefore silently lost every services, protocols
+ * and networks entry they had ever customised -- and worse, we INSTALLED a
+ * DEVS:Internet/hosts file and had CheckAmiTCPNGConfig validate it while nothing
+ * whatsoever read it, so adding a host there did nothing at all and our own
+ * checker said the file was fine.
+ *
+ * No new parser is needed. read_netdb()'s `prefixindex` already parses a file
+ * whose lines are all one record type with the leading letter omitted -- that is
+ * what `WITH file PREFIX SERVICE` uses -- and the per-record formats turn out to
+ * be the same ones Roadshow writes:
+ *
+ *   hosts       address name [aliases...]        (KNDB_HOST)
+ *   networks    name address [aliases...]        (KNDB_NET, via inet_aton, so a
+ *                                                 partial "127" works as well as
+ *                                                 "127.0.0.0")
+ *   protocols   name number [aliases...]         (KNDB_PROTO)
+ *   services    name port/proto [aliases...]     (KNDB_SERV)
+ *
+ * '#' and ';' comments, mid-line or whole-line, are already handled by
+ * read_netdb() itself.
+ *
+ * ORDER IS PRECEDENCE, and it is deliberate. Nodes are AddTail()ed and every
+ * lookup in api/getxbyy.c walks forward from the head returning the FIRST match,
+ * so whatever is read first wins. These files are read AFTER AmiTCP:db/netdb,
+ * which makes them purely ADDITIVE: no name that resolves today starts resolving
+ * differently, and the only change anyone sees is that names which previously did
+ * not resolve at all now do. On a stack people already run, "adds entries" is a
+ * far safer promise than "may quietly change which port a service means".
+ *
+ * A missing file is the normal case -- most machines have never had Roadshow --
+ * so absence is silent. Only a file we actually read is worth a log line, and
+ * that line is the one thing that answers "did it pick up my file?".
+ */
+static const struct {
+  const char *ndb_file;
+  int         ndb_prefix;
+} roadshow_dbs[] = {
+  { "DEVS:Internet/hosts",     KNDB_HOST  },
+  { "DEVS:Internet/networks",  KNDB_NET   },
+  { "DEVS:Internet/protocols", KNDB_PROTO },
+  { "DEVS:Internet/services",  KNDB_SERV  }
+};
+
+#define NROADSHOWDBS	(sizeof roadshow_dbs / sizeof roadshow_dbs[0])
+
+/* Does the file exist? Used only to tell "no Roadshow here" (normal, silent)
+ * from "the file is there and would not read" (worth a warning). */
+static int
+file_exists(const char *path)
+{
+  BPTR l = Lock((CONST_STRPTR)path, ACCESS_READ);
+
+  if (l == 0)
+    return 0;
+  UnLock(l);
+  return 1;
+}
+
+/* Length of one of the NDB's MinLists, for the "n entries" log line below. */
+static int
+ndb_listlen(struct MinList *l)
+{
+  struct MinNode *n;
+  int count = 0;
+
+  for (n = l->mlh_Head; n->mln_Succ; n = n->mln_Succ)
+    count++;
+  return count;
+}
+
+/* Which list a given record type lands in. Named members rather than pointer
+ * arithmetic over the struct: the two orderings (declaration vs file name) do
+ * not agree, and a silent mismatch here would only ever show up as a wrong
+ * number in a log line -- the kind of bug nobody chases. */
+static struct MinList *
+ndb_list_for(struct NetDataBase *ndb, int prefix)
+{
+  switch (prefix) {
+  case KNDB_HOST:	return &ndb->ndb_Hosts;
+  case KNDB_NET:	return &ndb->ndb_Networks;
+  case KNDB_SERV:	return &ndb->ndb_Services;
+  case KNDB_PROTO:	return &ndb->ndb_Protocols;
+  }
+  return NULL;
+}
+
+/*
+ * Merge the DEVS:Internet databases into `ndb`. Never fails the caller: these
+ * files are optional, and a stack that refused to start because a machine had no
+ * Roadshow leftovers would be absurd.
+ *
+ * NOTE THE PRIVATE SCRATCH BUFFER, which is not tidiness. read_netdb() writes a
+ * Fault() message into res->CS_Buffer whenever it cannot open a file, and the
+ * `res` that reset_netdb() is handed belongs to the ARexx caller -- it is the
+ * string a script gets back as RESULT. Threading it through here would mean that
+ * on any machine WITHOUT these files (which is most of them, and not an error at
+ * all) a successful `RESET` returned RC=0 alongside a stray "object not found"
+ * message that nothing had gone wrong to produce. So these reads get somewhere
+ * private to scribble on, and the caller's buffer is left alone.
+ */
+static void
+read_roadshow_dbs(struct NetDataBase *ndb)
+{
+  UBYTE faultbuf[REPLYBUFLEN + 1];	/* private: see above */
+  struct CSource scratch;
+  const UBYTE *errstr = NULL;
+  int i, before, after;
+
+  scratch.CS_Buffer = faultbuf;
+  scratch.CS_Length = sizeof (faultbuf);
+  scratch.CS_CurChr = 0;
+
+  for (i = 0; i < (int)NROADSHOWDBS; i++) {
+    struct MinList *l = ndb_list_for(ndb, roadshow_dbs[i].ndb_prefix);
+    LONG r;
+
+    if (l == NULL)
+      continue;
+    before = ndb_listlen(l);
+    r = read_netdb(ndb, (UBYTE *)roadshow_dbs[i].ndb_file, &errstr, &scratch,
+		   roadshow_dbs[i].ndb_prefix);
+    after = ndb_listlen(l);
+
+    if (after != before)
+      log(LOG_INFO, "netdb: %s: %ld entries\n",
+	  roadshow_dbs[i].ndb_file, (long)(after - before));
+    else if (r != RETURN_OK && file_exists(roadshow_dbs[i].ndb_file))
+      /*
+       * read_netdb() cannot tell "no such file" from "the disk went away"
+       * apart in its return value, and one of those is normal while the other
+       * is the whole reason someone's entries vanished. The Lock() decides
+       * which: a file that is THERE and still would not read is worth saying
+       * out loud. A file that simply is not there says nothing.
+       */
+      log(LOG_WARNING, "netdb: %s exists but could not be read: %s\n",
+	  roadshow_dbs[i].ndb_file, errstr ? (const char *)errstr : "?");
+  }
 }
 
 /*
@@ -1033,6 +1200,11 @@ init_netdb(void)
   res.CS_Length = sizeof (result); 
   res.CS_CurChr = 0;
   
+  /* Reclaim the database from a previous run of the stack, if there was one.
+   * Here rather than in netdb_deinit(), where it would race NETTRACE -- see
+   * the note there. */
+  ng_netdb_free_previous();
+
   /* Allocate the NetDataBase */
   if (!(NDB = alloc_netdb(NULL))) {
     return RETURN_FAIL;
@@ -1042,6 +1214,9 @@ init_netdb(void)
   retval = read_netdb(NDB, netdbname, (const UBYTE **)&errstr, &res, -1);
   if (retval)
     log(LOG_WARNING, "init_netdb: file %s: %s", netdbname, errstr);
+
+  /* Then the Roadshow-format files, which add to what netdb already defined. */
+  read_roadshow_dbs(NDB);
 
   /*
    * PORT (AmiTCP_NG): forgive a missing/unreadable netdb file -- honour this
@@ -1056,13 +1231,94 @@ init_netdb(void)
    */
   setup_accesscontroltable(NDB);
 
+  /*
+   * Start from an empty cache. On a cold boot this is a no-op -- nothing has been
+   * resolved yet. It matters on a RESTART: the library can be shut down and
+   * started again without a reboot (see netdb_deinit()), and the DNS cache is
+   * file-scope state in api/dns_cache.c that nothing tears down, so entries
+   * resolved by the previous run would otherwise survive into this one -- with a
+   * database, and possibly a name server list, that has been reloaded from disk
+   * in between and need not say the same thing any more.
+   */
+  ng_dnscache_flush();
+
   return RETURN_OK;
 }
 
 
+/*
+ * Free the whole network database.
+ *
+ * This was an empty placeholder, which was a correct enough answer when AmiTCP
+ * was a program that ran once and exited -- the OS reclaimed everything at exit
+ * and freeing it by hand bought nothing. The self-starting library invalidated
+ * that: it can be started, shut down and started again without a reboot, and
+ * init_netdb() unconditionally does `NDB = alloc_netdb(NULL)`, so every restart
+ * used to overwrite the only pointer to the previous database and strand all of
+ * it -- the hosts, networks, services and protocols lists, the access-control
+ * table, and the struct itself.
+ *
+ * free_netdb_contents() is the same helper reset_netdb() already uses for
+ * exactly this purpose, so this is the file's own established pattern rather
+ * than a new one. NDB is cleared afterwards: leaving a pointer to freed memory
+ * in a global is how a later reader finds it and, with no MMU, quietly succeeds.
+ */
+/*
+ * ON NOT TAKING ndb_Lock HERE, since reset_netdb() does take it around the same
+ * free_netdb_contents() call and the asymmetry is otherwise a fair thing to
+ * query -- this file has a history of use-after-frees around exactly that lock.
+ *
+ * The lock lives INSIDE the struct being freed. Holding it across the
+ * bsd_free() would mean releasing a semaphore in memory that had just been
+ * handed back, which is worse than not holding it. reset_netdb() has no such
+ * problem: it frees the CONTENTS of the live NDB and keeps the struct, lock and
+ * all.
+ *
+ * What makes it safe is the caller, not a lock. netdb_deinit() runs only from
+ * ng_teardown_subsystems(), which both shutdown paths reach only after
+ * api_hide() and -- on the library path -- ng_stack_quiesce() has confirmed no
+ * bases remain open. There is no client left to be mid-lookup. If that ever
+ * stops being true, this needs revisiting rather than a lock adding.
+ */
 void netdb_deinit(void)
 {
-  /* A Placeholder for possible future deinitializations */
+  /*
+   * DELIBERATELY DOES NOT FREE. An earlier version of this function did, and
+   * that was wrong in a way worth recording.
+   *
+   * The leak it was fixing is real: init_netdb() does `NDB = alloc_netdb(NULL)`
+   * unconditionally, so a restart used to strand the previous database. But
+   * freeing it HERE freed it while NETTRACE was still alive -- ng_stack_quiesce()
+   * deliberately does not count NETTRACE's own library base, and nothing in
+   * teardown stops its ARexx port, which serves KILL, RESET and ADD. Every one
+   * of the ~20 consumers of the global NDB (api/getxbyy.c's lookups,
+   * kern/accesscontrol.c, do_netdb(), reset_netdb()) dereferences it with no
+   * NULL check and takes a semaphore that lives INSIDE the struct. A KILL
+   * followed by a RESET, or any lookup in flight, was then a use-after-free --
+   * silent, on a machine with no MMU.
+   *
+   * So the free moved to ng_netdb_free_previous(), called from init_netdb()
+   * before the new database is allocated. That reclaims the old one just as
+   * effectively, but at a moment when no ARexx command can be in flight: on
+   * both startup paths init_netdb() runs before NETTRACE is signalled to start
+   * serving.
+   */
+}
+
+/*
+ * Release a previous database, if any. Called at the START of init_netdb().
+ * See netdb_deinit() above for why the free lives here and not there.
+ */
+static void
+ng_netdb_free_previous(void)
+{
+  struct NetDataBase *ndb = NDB;
+
+  if (ndb == NULL)
+    return;
+  NDB = NULL;			/* first: nothing may find it while it is dying */
+  free_netdb_contents(ndb);
+  bsd_free(ndb, M_NETDB);
 }
   
 /*
@@ -1082,6 +1338,13 @@ LONG reset_netdb(struct CSource *cs,
   }
 
   retval = read_netdb(newnetdb, netdbname, (const UBYTE **)errstrp, res, -1);
+
+  /* Reload the DEVS:Internet files too, so an ARexx RESET picks up an edit to
+   * them exactly as it does an edit to netdb. Doing this only in init_netdb()
+   * would make the two paths disagree, and the difference would only ever be
+   * noticed by someone already confused about why their edit had no effect. */
+  if (retval == RETURN_OK)
+    read_roadshow_dbs(newnetdb);
 
   if (retval == RETURN_OK) {
     /*
@@ -1152,6 +1415,15 @@ LONG reset_netdb(struct CSource *cs,
     NDB->ndb_Generation++;
 
     UNLOCK_NDB(NDB);
+
+    /*
+     * The reload replaced the name server list along with everything else, so any
+     * cached answer may have come from a server that is no longer configured --
+     * and someone who has just edited the database and issued a RESET is entitled
+     * to see the effect of it immediately, not after a TTL of up to an hour.
+     * Outside the NDB lock: the flush takes the cache's own lock.
+     */
+    ng_dnscache_flush();
   } else {
     /* Parse failed: discard the temporary database's contents. Only its contents
      * -- the struct itself is freed once, below, on both paths (freeing it here

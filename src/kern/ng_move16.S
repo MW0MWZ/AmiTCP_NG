@@ -14,9 +14,15 @@
  * this file is empty and ng_bcopy() never references it (CopyMem is already
  * movem-based there, so there is nothing to beat).
  *
+ * ALWAYS ASSEMBLED NOW, for every library variant, and this file alone is assembled
+ * with -m68040 so the assembler will accept MOVE16. That is safe on a 68000 because
+ * an instruction only faults when it is EXECUTED: ng_bcopy() calls here only after
+ * testing AttnFlags for AFF_68040 at run time, so on a lesser CPU these bytes are
+ * never reached. It is what lets one library binary use MOVE16 on the machines that
+ * have it without excluding the machines that do not.
+ *
  * Uses only caller-saved a0/a1/d0 -- no register save/restore needed.
  */
-#if defined(__mc68040__) || defined(__mc68060__)
 	.text
 	.align	2
 	.globl	_ng_move16
@@ -29,4 +35,3 @@ _ng_move16:
 	subq.l	#1,d0			/* 32-bit count: no dbf 64K-block limit */
 	bne	1b
 2:	rts
-#endif

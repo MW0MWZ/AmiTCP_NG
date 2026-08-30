@@ -81,6 +81,28 @@ extern struct Library *SocketBase;
 #define NGIFQ_TcpMss		(NG_TU + 0x004E4730)
 
 /* ---- vector wrappers ------------------------------------------------------- */
+/* ---- sockets + ioctl (arp) --------------------------------------------------
+ * LVOs cross-checked two ways: counting the library's own UserLibrary_funcTable
+ * and parsing the SDK's bsdsocket_lib.sfd. Both agree on socket -30,
+ * SocketBaseTagList -294 and IoctlSocket -114. (Beyond -294 the 2006 SFD runs 60
+ * bytes behind this library -- Roadshow gained ten vectors after that SFD was
+ * cut -- which is why ObtainRoadshowData is -714 here and -654 there. IoctlSocket
+ * sits before that divergence, so both sources are authoritative for it.) */
+static long __attribute__((unused)) ng_socket(long dom, long typ, long proto) {			/* socket -30 (d0,d1,d2) */
+  register long _d0 __asm("d0")=dom; register long _d1 __asm("d1")=typ;
+  register long _d2 __asm("d2")=proto; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-30)":"+r"(_d0),"+r"(_d1),"+r"(_d2):"r"(_a6):"a0","a1","memory"); return _d0;
+}
+static long __attribute__((unused)) ng_closesocket(long s) {					/* CloseSocket -120 (d0) */
+  register long _d0 __asm("d0")=s; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-120)":"+r"(_d0):"r"(_a6):"d1","a0","a1","memory"); return _d0;
+}
+static long __attribute__((unused)) ng_ioctl(long s, unsigned long req, void *arg) {		/* IoctlSocket -114 (d0,d1,a0) */
+  register long _d0 __asm("d0")=s; register long _d1 __asm("d1")=(long)req;
+  register void *_a0 __asm("a0")=arg; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-114)":"+r"(_d0),"+r"(_d1),"+r"(_a0):"r"(_a6):"a1","memory"); return _d0;
+}
+
 static long __attribute__((unused)) ng_errno(void) {						/* Errno -162 */
   register long _d0 __asm("d0"); register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-162)":"=r"(_d0):"r"(_a6):"d1","a0","a1","memory"); return _d0;
@@ -94,6 +116,37 @@ static long __attribute__((unused)) ng_delroute(void *tags) {					/* DeleteRoute
   register long _d0 __asm("d0"); register void *_a0 __asm("a0")=tags;
   register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-420)":"=r"(_d0),"+r"(_a0):"r"(_a6):"d1","a1","memory"); return _d0;
+}
+/* Roadshow internal-configuration data (see AmiTCPControl). A node's rdn_Data
+ * points at the stack's live variable; rdn_Flags carries RDNF_ReadOnly for the
+ * options the stack tunes for itself (socket buffers, timestamps). */
+#define NG_ORD_ReadAccess	0
+#define NG_ORD_WriteAccess	1
+#define NG_RDNT_Integer		0
+#define NG_RDNF_ReadOnly	(1 << 0)
+struct NGRoadshowDataNode {
+  struct MinNode rdn_MinNode;
+  STRPTR  rdn_Name;
+  UWORD   rdn_Flags;
+  WORD    rdn_Type;
+  ULONG   rdn_Length;
+  APTR    rdn_Data;
+};
+static long __attribute__((unused)) ng_obtain_rsd(long access) {				/* ObtainRoadshowData -714 (d0 -> d0) */
+  register long _d0 __asm("d0")=access;
+  register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-714)":"+r"(_d0):"r"(_a6):"d1","a0","a1","memory"); return _d0;
+}
+static void __attribute__((unused)) ng_release_rsd(void *list) {				/* ReleaseRoadshowData -720 (d0) */
+  register long _d0 __asm("d0")=(long)list;
+  register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-720)":"+r"(_d0):"r"(_a6):"d1","a0","a1","memory");
+}
+static long __attribute__((unused)) ng_change_rsd(void *list, void *name, unsigned long len, void *data) {
+  register long _d0 __asm("d0")=(long)len;   register void *_a0 __asm("a0")=list;		/* ChangeRoadshowData -726 */
+  register void *_a1 __asm("a1")=name;       register void *_a2 __asm("a2")=data;
+  register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-726)":"+r"(_d0),"+r"(_a0),"+r"(_a1),"+r"(_a2):"r"(_a6):"d1","memory"); return _d0;
 }
 static long __attribute__((unused)) ng_removeif(void *name, long force) {			/* RemoveInterface -732 (a0,d0) */
   register long _d0 __asm("d0")=force; register void *_a0 __asm("a0")=name;
@@ -165,6 +218,17 @@ static long __attribute__((unused)) ng_createaam(long ver, long proto, const cha
   register void *_a2 __asm("a2")=tags; register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-474)":"+r"(_d0),"+r"(_d1),"+r"(_a0),"+r"(_a1):"r"(_a2),"r"(_a6):"memory"); return _d0;
 }
+/*
+ * The counterpart to ng_createaam(), and it MUST be called. CreateAddrAllocMessageA
+ * makes one AllocVec covering the message and every result buffer, and the library
+ * never frees it by itself -- ReplyMsg() only posts the reply back. AmigaOS does not
+ * reclaim AllocVec memory when a process exits either, so a missing delete is not
+ * "leaked until the tool quits", it is gone until the machine is rebooted.
+ */
+static void __attribute__((unused)) ng_deleteaam(void *aam) {					/* DeleteAddrAllocMessage -480 (a0) */
+  register void *_a0 __asm("a0")=aam; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-480)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
+}
 static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfaceConfig -486 (a0) */
   register void *_a0 __asm("a0")=aam; register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-486)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
@@ -174,6 +238,7 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
 #define NG_SBTB_CODE		1
 #define NG_SBTC_SYSTEM_STATUS	56
 #define NG_SBTC_HERRNO		7	/* SBTC_HERRNO: the resolver's h_errno */
+#define NG_SBTC_HAVE_ROADSHOWDATA_API 67	/* stack exposes the config data API */
 #define NG_SBTM_GETVAL(code)	(NG_TU | (((code) & 0x3FFF) << NG_SBTB_CODE))
 
 /* AmiTCP_NG-private GET-only diagnostic codes (mirror of SBTC_NG_* in the library's
@@ -254,7 +319,10 @@ struct ng_dnsnode {
 static __attribute__((unused)) void *ng_getrouteinfo(long af, long flags) {			/* GetRouteInfo -438 (d0,d1) */
   register void *_d0 __asm("d0"); register long _d0i __asm("d0")=af;
   register long _d1 __asm("d1")=flags; register struct Library *_a6 __asm("a6")=SocketBase;
-  __asm__ __volatile__("jsr a6@(-438)":"=r"(_d0):"r"(_d0i),"r"(_d1),"r"(_a6):"a0","a1","memory");
+  /* _d1 is IN-OUT: d1 is scratch across an AmigaOS library call, so declaring it
+   * input-only would let gcc keep a live value there across the jsr. Same defect
+   * that broke the DHCP client's d_recvfrom -- see amiga_roadshow_compat.c. */
+  __asm__ __volatile__("jsr a6@(-438)":"=r"(_d0),"+r"(_d1):"r"(_d0i),"r"(_a6):"a0","a1","memory");
   return _d0;
 }
 static void __attribute__((unused)) ng_freerouteinfo(void *p) {					/* FreeRouteInfo -432 (a0) */
@@ -268,6 +336,35 @@ static __attribute__((unused)) struct List *ng_obtaindnslist(void) {				/* Obtai
 static void __attribute__((unused)) ng_releasednslist(struct List *l) {				/* ReleaseDomainNameServerList -528 */
   register struct List *_a0 __asm("a0")=l; register struct Library *_a6 __asm("a6")=SocketBase;
   __asm__ __volatile__("jsr a6@(-528)":"+r"(_a0):"r"(_a6):"d0","d1","a1","memory");
+}
+
+/* ---- Berkeley Packet Filter ------------------------------------------------
+ * LVOs from the library's own UserLibrary_funcTable (src/api/amiga_libtables.c),
+ * which is the authority here: the 2006 SFD runs behind this library past -294.
+ * Register assignments are the SFD's, and note that bpf_set_notify_mask is
+ * (d1,d0) -- the REVERSE of its neighbour bpf_set_interrupt_mask (d0,d1), which
+ * is an easy thing to mirror wrongly from a glance at the file.
+ *
+ * These return -1 with Errno() set (BPF_RETURN in api/amiga_bpf.c), not a
+ * negative errno, so failures must be reported through ng_errno().
+ */
+static long __attribute__((unused)) ng_bpf_open(long chan) {					/* bpf_open -366 (d0) */
+  register long _d0 __asm("d0")=chan; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-366)":"+r"(_d0):"r"(_a6):"d1","a0","a1","memory"); return _d0;
+}
+static long __attribute__((unused)) ng_bpf_close(long chan) {					/* bpf_close -372 (d0) */
+  register long _d0 __asm("d0")=chan; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-372)":"+r"(_d0):"r"(_a6):"d1","a0","a1","memory"); return _d0;
+}
+static long __attribute__((unused)) ng_bpf_read(long chan, void *buf, long len) {		/* bpf_read -378 (d0,a0,d1) */
+  register long _d0 __asm("d0")=chan; register void *_a0 __asm("a0")=buf;
+  register long _d1 __asm("d1")=len; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-378)":"+r"(_d0),"+r"(_a0),"+r"(_d1):"r"(_a6):"a1","memory"); return _d0;
+}
+static long __attribute__((unused)) ng_bpf_ioctl(long chan, unsigned long cmd, void *buf) {	/* bpf_ioctl -402 (d0,d1,a0) */
+  register long _d0 __asm("d0")=chan; register unsigned long _d1 __asm("d1")=cmd;
+  register void *_a0 __asm("a0")=buf; register struct Library *_a6 __asm("a6")=SocketBase;
+  __asm__ __volatile__("jsr a6@(-402)":"+r"(_d0),"+r"(_d1),"+r"(_a0):"r"(_a6):"a1","memory"); return _d0;
 }
 
 #endif /* NG_LVO_H */

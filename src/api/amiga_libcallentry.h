@@ -131,10 +131,33 @@ extern const char wrongTaskErrorFmt[];
  * ng_stack_ensure_running()). In the PROGRAM build ng_stack_running is TRUE from
  * api_init(), so this is always a no-op there.
  */
+/*
+ * Start the stack if it is not running -- UNLESS this base belongs to a stack that has
+ * already been shut down.
+ *
+ * The dead test lives HERE, and not only in CHECK_TASK*, because a good number of
+ * vectors never use those macros at all: the whole mbuf_* family, RemoveInterface,
+ * BeginInterfaceConfig, the RoadshowData trio, AddDomainNameServer and more call this
+ * and nothing else. Without the test, a straggler calling any one of them through a
+ * base left over from a NetShutdown would silently RESPAWN THE ENTIRE STACK -- new
+ * task, new interfaces, a fresh DHCP round -- which is precisely what the operator
+ * used a shutdown to prevent. Every vector that can start the stack must first be able
+ * to refuse to.
+ *
+ * Vectors that touch no stack state at all (inet_addr, Inet_NtoA and friends) do not
+ * call this and correctly keep working.
+ *
+ * What this does NOT do is make such a call FAIL -- the macro is used from vectors
+ * with every return type, so it cannot return a value of its own. The vectors that go
+ * through CHECK_TASK*() do fail cleanly, via NG_CHECK_DEAD. The ones that only come
+ * here proceed, exactly as they would have before any of this existed; what they no
+ * longer do is drag a whole new stack up behind them.
+ */
 #define NG_ENSURE_STACK()						\
   { extern volatile BOOL ng_stack_running;				\
     extern BOOL ng_stack_ensure_running(void);				\
-    if (!ng_stack_running) (void)ng_stack_ensure_running(); }
+    if (!ng_stack_running && !(libPtr != NULL && libPtr->sbDead))	\
+      (void)ng_stack_ensure_running(); }
 
 /* DIAGNOSTIC-only: warn when a library vector is entered with little headroom on
  * the CALLER's task stack. The deepest protocol descent from a vector is ~1.5 KB
@@ -209,7 +232,26 @@ extern void ng_low_stack_check(void);
  * vector's own a6, so the delisting that hides the base from every list walk
  * does not protect this site.
  */
+/*
+ * PORT (AmiTCP_NG): refuse a call through a base whose stack has been shut down.
+ *
+ * NetShutdown can take the network down while a program still holds a base open, so
+ * that base outlives everything it refers to. It is deliberately left allocated (the
+ * program still has the pointer), but it must not be USED: its sockets and the whole
+ * stack behind them are gone. Fail here, at the door, rather than anywhere deeper.
+ *
+ * Placed before NG_ENSURE_STACK() on purpose. Otherwise the first call through a dead
+ * base would lazily start a BRAND NEW stack and then run against a base belonging to
+ * the old one -- which is worse than either failing or restarting cleanly.
+ */
+#define NG_CHECK_DEAD(retval)				\
+  if (libPtr->sbDead) {					\
+    writeErrnoValue(libPtr, ENETDOWN);			\
+    return retval;					\
+  }
+
 #define CHECK_TASK()					\
+  NG_CHECK_DEAD(-1);					\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
   if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\
@@ -225,6 +267,7 @@ extern void ng_low_stack_check(void);
   NG_ENSURE_CTX()
 
 #define CHECK_TASK_NULL()				\
+  NG_CHECK_DEAD(NULL);					\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
   if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\
@@ -242,6 +285,7 @@ extern void ng_low_stack_check(void);
 #define CHECK_TASK2() CHECK_TASK_NULL()
 
 #define CHECK_TASK_VOID()				\
+  NG_CHECK_DEAD();					\
   NG_ENSURE_STACK();					\
   NG_STACK_CHECK();					\
   if (!(libPtr->flags & SBFF_CAN_SHARE) &&		\

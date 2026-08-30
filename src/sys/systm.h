@@ -159,6 +159,20 @@ _remque(register struct queue_node *node)
 void cs_putchar(unsigned char, struct CSource *);
 void panic(const char *, ...);
 void log(unsigned long, const char *, ...);
+
+/*
+ * SYNCHRONOUS diagnostic line -- see ng_diag() in kern/subr_prf.c.
+ *
+ * Use this, NOT log(), when you are trying to find out where something hangs.
+ * log() queues to the NETTRACE task, so a wedge loses every message still in the
+ * queue and the last line written is not the last line reached. ng_diag() writes
+ * and flushes on the calling task before it returns.
+ *
+ * TASK LEVEL ONLY: it calls DOS. Never from an interrupt, a device completion, or
+ * inside splnet()/splimp().
+ */
+#define NG_DIAG_FILE	"SYS:ngdiag.log"
+void ng_diag(const char *, ...);
 unsigned long vlog(unsigned long, const char *, va_list);
 
 /*

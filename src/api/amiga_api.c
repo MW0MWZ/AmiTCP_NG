@@ -593,6 +593,27 @@ ULONG * SAVEDS RAF1(UL_Close,
     return NULL;
 
   /*
+   * PORT (AmiTCP_NG): a base whose stack was shut down under it.
+   *
+   * api_abandon_bases() has already taken this off the list, NULLed its thisTask and
+   * balanced the master open count -- everything that could point outward is dealt
+   * with. What must NOT happen now is the ordinary teardown below: it closes the
+   * sockets in dTable and frees per-opener structures, and those sockets went with
+   * the stack. Following them would be a walk through freed memory.
+   *
+   * So this leaks the base's own storage, deliberately, exactly as the shared-base
+   * path a few lines down does and for the same reason: leaking one base beats
+   * touching memory that has already been handed back. It is bounded -- one base per
+   * program that ignored the shutdown warning -- and the alternative is silent
+   * corruption on a machine with no MMU.
+   */
+  if (libPtr->sbDead) {
+    log(LOG_WARNING, "bsdsocket: base closed after its stack was shut down -- "
+	"its storage is left allocated rather than followed into freed memory\n");
+    return NULL;
+  }
+
+  /*
    * PORT (AmiTCP_NG): do not tear down a base other tasks have been sharing.
    *
    * Everything below assumes the closer is the only user: it closes the
@@ -634,6 +655,14 @@ ULONG * SAVEDS RAF1(UL_Close,
 	"bsdsocket: base closed after being shared -- not freeing it, its "
 	"sockets and memory are left allocated in case a task is still inside");
     Remove((struct Node *)libPtr);
+    /*
+     * Mark it dead as well. Once it is off socketBaseList, api_abandon_bases() can
+     * never see it -- so if the network is later shut down while a sharer is still
+     * calling through this base, nothing else would ever set sbDead and that sharer
+     * would walk into a torn-down stack. Setting it here costs nothing while the
+     * stack is up: the base is already closed as far as its opener is concerned.
+     */
+    libPtr->sbDead = TRUE;
     /*
      * Still balance the master's open count: it was incremented by ELL_Open()
      * for this base, and leaving it inflated would permanently prevent the
@@ -876,7 +905,22 @@ BOOL api_show()
   Forbid();
   for (libNode = SysBase->LibList.lh_Head; libNode->ln_Succ;
        libNode = libNode->ln_Succ) {
-    if (!strncmp(libNode->ln_Name, (const char *)libName, sizeof (SOCLIBNAME) - 3)) {
+    /*
+     * ln_Name CAN BE NULL, and this walk is over EXEC'S OWN library list -- every
+     * library on the machine, ours and everyone else's, none of which we control.
+     *
+     * That is not a theoretical worry: an A3000 with one unnamed library in the
+     * list made strncmp() walk from address 0, giving a reproducible "BYTE-READ
+     * from 00000000 ... MOVE.B (A1)+,D1" on every NetShutdown -- which is when
+     * api_hide()/api_show() run. The crash IS the proof that such a node exists in
+     * the wild; no appeal to what the headers do or do not promise is needed.
+     *
+     * A NULL name simply is not "bsdsocket.library", so skipping it is also the
+     * correct answer, not merely the safe one. The DEBUG branch below indexes the
+     * same pointer, so it is covered by this test too.
+     */
+    if (libNode->ln_Name &&
+	!strncmp(libNode->ln_Name, (const char *)libName, sizeof (SOCLIBNAME) - 3)) {
 #ifdef DEBUG
       int i;
       if (libNode->ln_Name[sizeof (SOCLIBNAME) - 3] == '\0') 
@@ -940,6 +984,60 @@ VOID api_setfunctions() /* DOES NOTHING NOW */
 /*
  * Send CTRL_C to all tasks having socketbase open. 
  */
+/*
+ * Abandon every base still open, safely, because the stack is going down anyway.
+ *
+ * NetShutdown proceeds even when a program is still holding bsdsocket.library open:
+ * the breaks it sends first are a warning, not a veto, or one wedged application
+ * could keep the machine's networking up for ever. That leaves this problem: the
+ * program still holds a base pointer, and everything the base refers to -- its
+ * sockets, the mbufs behind them, the whole stack -- is about to be freed.
+ *
+ * Freeing the base is not an option; the program would then be holding a pointer to
+ * reused memory, and there is no MMU to catch what it does with it. So each base is
+ * treated exactly the way UL_Close() already treats one it cannot free: taken off the
+ * list so nothing finds it again, LEFT ALLOCATED so the holder's pointer stays valid,
+ * and stripped of everything that points outward.
+ *
+ *   thisTask   NULLed. It is the owner's Task, and sowakeup()/sohasoutofband()
+ *              Signal() through it; on a recycled Task that can relink Exec's own
+ *              queues. Both Signal sites already test for NULL.
+ *   sbDead     set, so the next call through this base fails with ENETDOWN at the
+ *              vector entry rather than reaching into a stack that no longer exists,
+ *              and so its CloseLibrary() frees only the base's own storage.
+ *
+ * The master open count is balanced for each one, exactly as the shared-base path
+ * does: ELL_Open() incremented it per base, and leaving it inflated would stop the
+ * count ever reaching zero, so a later expunge could never complete.
+ */
+VOID api_abandon_bases(void)
+{
+  extern struct List socketBaseList;
+  struct Node *libNode, *next;
+  int n = 0;
+
+  Forbid();
+  for (libNode = socketBaseList.lh_Head; libNode->ln_Succ; libNode = next) {
+    struct SocketBase *sb = (struct SocketBase *)libNode;
+    next = libNode->ln_Succ;
+
+    if (sb->thisTask == Nettrace_Task)		/* NETTRACE tidies itself up */
+      continue;
+
+    Remove(libNode);
+    sb->thisTask = NULL;
+    sb->sbDead   = TRUE;
+    if (MasterSocketBase->lib_OpenCnt > 0)
+      MasterSocketBase->lib_OpenCnt--;
+    n++;
+  }
+  Permit();
+
+  if (n)
+    log(LOG_WARNING, "network shut down with %ld base%s still open: left allocated, "
+	"further calls through them will fail\n", (long)n, (n == 1) ? "" : "s");
+}
+
 VOID api_sendbreaktotasks()
 {
   extern struct List socketBaseList; /* :/ */

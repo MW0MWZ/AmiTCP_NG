@@ -63,9 +63,10 @@ STRPTR KW_VARS = (STRPTR)
   "MBS=MBUF_STAT,MBTS=MBUF_TYPE_STATS,MBC=MBUF_CONF,LOG,TASKNAME,"
   "NTH=NTHBASE,DBSANA=DEBUGSANA,DBICMP=DEBUGICMP,DBIP=DEBUGIP,"
   "GTW=GATEWAY,REDIR=IPSENDREDIRECTS,USENS=USENAMESERVER,"
-  "ULO=USELOOPBACK,TCPSND=TCP_SENDSPACE,TCPRCV=TCP_RECVSPACE,"
-  "TCPMSS=TCP_MSSDFLT,TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,"
-  "LOGF=LOGFILENAME,LOGGING,LOGCON=LOGCONSOLE,LOGL=LOGLEVEL";
+  "ULO=USELOOPBACK,MV16=USEMOVE16,TCPSND=TCP_SENDSPACE,"
+  "TCPRCV=TCP_RECVSPACE,TCPMSS=TCP_MSSDFLT,"
+  "TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,LOGF=LOGFILENAME,"
+  "LOGGING,LOGCON=LOGCONSOLE,LOGL=LOGLEVEL,MBCHK=MBUFCHECK";
 
 /* extern declarations */
 
@@ -91,6 +92,7 @@ extern LONG ipforwarding;
 extern LONG ipsendredirects;
 extern LONG usens;
 extern LONG useloopback;
+extern LONG ng_use_move16;
 extern ULONG tcp_sendspace;
 extern ULONG tcp_recvspace;
 extern int tcp_mssdflt;
@@ -100,6 +102,7 @@ extern STRPTR logfilename;
 extern LONG log_enabled;
 extern LONG log_console_enabled;
 extern LONG log_level ;	 int loglevel_changed(void *pt, LONG new);
+extern LONG ng_mbufcheck;
 /* Global variables */
 STRPTR KW_Protocols = (STRPTR)KW_ROUTES;
 struct cfg_variable variables[] = {
@@ -125,6 +128,7 @@ struct cfg_variable variables[] = {
 { VAR_ENUM, VF_RW, NULL, &ipsendredirects, boolean_enum },
 { VAR_ENUM, VF_RW, NULL, &usens, (notify_f)"NO,FIRST,SECOND" },
 { VAR_ENUM, VF_RW, NULL, &useloopback, boolean_enum },
+{ VAR_ENUM, VF_RW, NULL, &ng_use_move16, boolean_enum },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_sendspace, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_recvspace, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_mssdflt, NULL },
@@ -133,5 +137,6 @@ struct cfg_variable variables[] = {
 { VAR_STRP, VF_RW, NULL, &logfilename, logname_changed },
 { VAR_ENUM, VF_RW, NULL, &log_enabled, boolean_enum },
 { VAR_ENUM, VF_RW, NULL, &log_console_enabled, boolean_enum },
-{ VAR_LONG, VF_RW, NULL, &log_level, loglevel_changed }
+{ VAR_LONG, VF_RW, NULL, &log_level, loglevel_changed },
+{ VAR_ENUM, VF_RCONF, NULL, &ng_mbufcheck, boolean_enum }
 };

@@ -81,8 +81,8 @@ RCS_ID_C="$Id: if_loop.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
  * on it is immediately handed back to the input path, so 127.0.0.1 talks to
  * itself. It is the simplest possible `ifnet` and therefore the best first
  * example of the interface contract (compare the far more involved net/if_sana.c).
- * docs/ARCHITECTURE.md section 7. This is the exact path tmp/udptest.c drives to
- * prove the whole socket->UDP->IP->interface->IP->UDP->socket round-trip.
+ * docs/ARCHITECTURE.md section 7. This is the exact path a loopback UDP round-trip
+ * exercises end to end: socket -> UDP -> IP -> interface -> IP -> UDP -> socket.
  *
  *   loattach()  creates lo0 during startup and installs it in the interface list.
  *   looutput()  the if_output: instead of touching hardware, it loops the mbuf
@@ -111,6 +111,7 @@ RCS_ID_C="$Id: if_loop.c,v 1.7 1993/06/04 11:16:15 jraja Exp $";
 #include <net/if_types.h>
 #include <net/netisr.h>
 #include <net/route.h>
+#include <net/bpf.h>			/* ng_bpf_tap_af() -- capture tap */
 
 
 #if	INET
@@ -199,6 +200,19 @@ looutput(ifp, m, dst, rt)
 		m_freem(m);
 		return (EAFNOSUPPORT);
 	}
+	/*
+	 * Capture tap. Deliberately here: after the address family has been
+	 * validated (so we never tap something we are about to reject) but before
+	 * IF_ENQUEUE, because once the mbuf is on the queue it belongs to the
+	 * input path and the net task may already have consumed and freed it.
+	 *
+	 * Loopback traffic is tapped ONCE even though it is both sent and
+	 * received here -- this single call is the whole of lo0's "wire", and
+	 * tapping again after the enqueue would put every localhost packet in the
+	 * capture twice.
+	 */
+	ng_bpf_tap_af(ifp, (u_long)dst->sa_family, m);
+
 	s = splimp();
 	if (IF_QFULL(ifq)) {
 		IF_DROP(ifq);

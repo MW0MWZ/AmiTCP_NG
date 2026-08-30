@@ -331,10 +331,12 @@ ip_output(m0, opt, ro, flags)
 	 * Fill in IP header.
 	 */
 	if ((flags & IP_FORWARDING) == 0) {
-		ip->ip_v = IPVERSION;
+		/* One byte store for both nibbles -- see IP_SET_VHL in netinet/ip.h.
+		 * Written separately these were two BFINS on -m68020 and up, on the
+		 * path every outbound packet takes. */
+		IP_SET_VHL(ip, IPVERSION, hlen);
 		ip->ip_off &= IP_DF;
 		ip->ip_id = htons(ip_id++);
-		ip->ip_hl = hlen >> 2;
 	} else {
 		hlen = ip->ip_hl << 2;
 		ipstat.ips_localout++;
@@ -491,7 +493,10 @@ ip_output(m0, opt, ro, flags)
 		*mhip = *ip;
 		if (hlen > sizeof (struct ip)) {
 			mhlen = ip_optcopy(ip, mhip) + sizeof (struct ip);
-			mhip->ip_hl = mhlen >> 2;
+			/* mhip is a copy of ip, so the version nibble is already
+			 * IPVERSION -- rewrite the whole byte rather than inserting
+			 * into it (see IP_SET_VHL). */
+			IP_SET_VHL(mhip, IPVERSION, mhlen);
 		}
 		m->m_len = mhlen;
 		mhip->ip_off = ((off - hlen) >> 3) + (ip->ip_off & ~IP_MF);

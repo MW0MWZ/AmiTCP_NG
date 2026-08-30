@@ -242,6 +242,16 @@ struct SocketBase {
  * before that task has made its first call, so neither the live flag nor the
  * context list proves it is safe to free. */
   BOOL			everShared;
+/* PORT (AmiTCP_NG): this base belonged to a stack that has since been shut down.
+ *
+ * A NetShutdown proceeds even when a program is still holding a base open -- the
+ * breaks are a warning, not a veto. That program keeps its pointer, so the base
+ * cannot be freed; but everything it refers to (sockets, mbufs, the descriptor
+ * table's contents) is torn down with the stack. Marked dead, the base stays
+ * allocated and every vector entered through it fails cleanly with ENETDOWN
+ * instead of walking into freed memory, and its eventual CloseLibrary() frees
+ * only the base's own storage. */
+  BOOL			sbDead;
 };
 
 /* 

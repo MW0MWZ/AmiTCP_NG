@@ -67,8 +67,33 @@
 
 #define LOG_TASK_NAME "NETTRACE"
 #define LOG_TASK_PRI 4
-#define LOG_BUFS 4
-#define LOG_BUF_LEN 128
+/*
+ * PORT (AmiTCP_NG): log message pool -- COUNT and per-line LENGTH.
+ *
+ * Upstream shipped 4 buffers of 128 bytes, and both were too small in a way
+ * that is invisible from the log itself:
+ *
+ *   LENGTH -- vlog() formats into a CSource of exactly log_buf_len bytes
+ *   (kern/subr_prf.c). stuffChar() silently DISCARDS every character past the
+ *   end and the terminator costs one more, so a line was cut at 127 characters
+ *   with no ellipsis and no marker -- it simply stopped. Since it is the
+ *   FORMATTED length that counts, a short format string still truncated as soon
+ *   as a %s substituted a device name or a full path, which is exactly when the
+ *   line mattered. (The timestamp/level prefix is written separately from
+ *   LEVELBUF and does not eat into this.)
+ *
+ *   COUNT -- vlog() drops the message entirely when no buffer is free, and the
+ *   "N log messages lost" accounting only reports once a later message gets
+ *   through. Four in flight is nothing for a burst, so a fault that logs hard
+ *   (the case worth reading) is the case most likely to lose its own evidence.
+ *
+ * These are the FALLBACK values. ng_ram_tier() (kern/amiga_main.c) overwrites
+ * log_cnf on both init paths before log_init() consumes it, so the real sizes
+ * scale with installed RAM -- a 512 KB A500 must not pay a big machine's price.
+ * They are still raised here so the fallback alone is not a truncating one.
+ */
+#define LOG_BUFS 32
+#define LOG_BUF_LEN 512
 #define TOCONS	0x01
 #define TOTTY	0x02
 #define TOLOG	0x04

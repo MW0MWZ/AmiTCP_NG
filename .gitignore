@@ -6,6 +6,8 @@
 #     licensed SANA-II drivers, the Commodore NDK, third-party SDKs).
 
 # --- Compiled output -------------------------------------------------------
+__pycache__/
+*.pyc
 build/
 *.o
 *.a

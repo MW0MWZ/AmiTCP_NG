@@ -749,7 +749,9 @@ send:
 	ti->ti_ack = htonl(tp->rcv_nxt);
 	if (optlen) {
 		aligned_bcopy((caddr_t)opt, (caddr_t)(ti + 1), optlen);
-		ti->ti_off = (sizeof (struct tcphdr) + optlen) >> 2;
+		/* One byte store; separately this was a BFINS into the header in
+		 * memory, per segment sent. See TH_SET_OFF in netinet/tcp.h. */
+		TH_SET_OFF(&ti->ti_t, sizeof (struct tcphdr) + optlen);
 	}
 	ti->ti_flags = flags;
 	/*

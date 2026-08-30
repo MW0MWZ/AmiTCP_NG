@@ -46,15 +46,23 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 - **Security-hardened** — randomised ISNs (**RFC 6528**), **RFC 5961**
   challenge-ACK limiting, broadcast and fragment DoS guards, and a
   whole-codebase memory-safety review.
-- **Packet capture (BPF)** — open a channel, filter, read or inject raw frames.
+- **Packet capture (BPF)** — filter, read or inject raw frames, and `PacketCapture`
+  writes a **pcap file you can open in Wireshark**, so a failing network can be
+  handed to someone who isn't sat at the Amiga.
 - **Diagnostics that ship** — every build can log, off-screen by default;
   `LOGLEVEL=7` names any library call that fails and the errno it failed with.
   No debug build to obtain.
 - **Roadshow-compatible tooling** — the extension API and capability flags, the
-  full command set (`Online`, `AddNetInterface`, `ShowNetStatus`, `ping`, …),
-  shared library bases, and an Amiga Installer.
-- **Usable on its own** — `netstat`, `nslookup`, `ftp`, `tftp` and `sntp` ship
-  with it, so a freshly installed Amiga can fetch everything else itself.
+  full 25-command set (`Online`, `AddNetInterface`, `ShowNetStatus`, `ping`, …,
+  plus `RoadshowControl` under the name Roadshow scripts expect), shared library
+  bases, and an Amiga Installer.
+- **Usable on its own** — `netstat`, `nslookup`, `ftp`, `tftp`, `sntp`, `arp`,
+  `traceroute`, `PacketCapture`, `SampleNetSpeed` (live per-interface throughput),
+  `NetLogViewer`, `CheckAmiTCPNGConfig` and `ManageNetInterfaces` ship with it, so
+  a freshly installed Amiga can fetch everything else itself.
+- **`usergroup.library`** — the user/group/account library Roadshow ships, for
+  software that expects it. Reads Roadshow's own `DEVS:Internet/users` and
+  `groups`; independent of the stack.
 - **Self-tuning** — socket buffers, SANA-II rings, the mbuf pool and the DNS
   cache size themselves to installed RAM and link speed; per-interface and
   stack-wide overrides are honoured.
@@ -64,8 +72,9 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 - Runs on **emulated AmigaOS 3.2** and **real 68k hardware** as a self-starting
   `LIBS:bsdsocket.library`.
 - **Emulator-validated** (A2065 over SLIRP): DNS, a full DHCP lease, `ping`,
-  same-host broadcast and loopback, BPF capture and injection, and the
-  socket-event mechanism end to end.
+  same-host broadcast and loopback, the socket-event mechanism end to end, and
+  BPF capture whose pcap files were checked by reading them back with `tcpdump`
+  on the host.
 - **Hardware-validated** (PiStorm + `wifipi.device`): bring-up, DHCP, routing,
   DNS and connectivity over 100 Mbit WiFi — roughly **56 Mbit down / 52 up**
   once the SANA-II transmit queue landed. **Amiga Explorer** works.
@@ -75,6 +84,13 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   hardware: header prediction was covering 98% of segments downloading and 9%
   uploading; the cause was the peer's moving window, and the fix took uploads
   to 57%.
+- **Tunable at run time** — `AmiTCPControl` reads and changes the stack's
+  internal options (`AmiTCPControl` on its own lists them all), the same command
+  shape and option names Roadshow uses, so existing scripts work unchanged.
+  `SAVE` keeps a setting across reboots. Options the stack sizes for itself from
+  your machine's RAM, CPU and link speed accept a setting but keep the tuned
+  value, saying so in the log — a script that sets them carries on instead of
+  failing, and nobody is left wondering why their number is not the one in use.
 - **Paced ARP** — the 4.3BSD base broadcast a fresh ARP request for *every*
   packet to an unresolved address, with no cap, and told the caller it had been
   sent. Now: one request a second, a bounded burst, then a hold-down that
@@ -82,7 +98,8 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
   entry is re-checked by **unicast** probe rather than trusted for twenty
   minutes, and ordinary inbound traffic confirms a peer is alive, so an active
   connection is never probed at all.
-- **CPU-tuned builds** — portable **68000**, plus **68020** and **68040**.
+- **One build for every Amiga** — a single 68000 archive that picks its copy
+  routine at run time from the CPU it finds itself on.
 - **Deferred** — IP filter (`ipf_*`), monitor hooks, server API
   ([docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md)); IP multicast *receive*
   is not implemented.
@@ -90,7 +107,15 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 ## Installing
 
 Grab the release `.lha` (or the `.adf` floppy image) and run its
-`Install-AmiTCP_NG` Installer script on your Amiga. **How much it asks depends on
+`Install-AmiTCP_NG` Installer script on your Amiga.
+
+**There is one archive, and it runs on every 68k Amiga.** There used to be
+separate `-68020` and `-68040` builds; they were dropped because compiling for
+those processors was proven in real-world testing not to make the stack any
+faster, so the only thing the extra archives reliably did was let someone
+install a build their machine could not run. The decisions that genuinely do
+depend on the processor — which memory-copy routine to use — are made at run
+time, inside this one binary. **How much it asks depends on
 the user level you pick in the Installer's opening dialog** (the standard Amiga
 Installer Novice / Intermediate / Expert choice):
 
@@ -183,7 +208,7 @@ starts. The knobs worth knowing:
 | Setting                | Meaning |
 |------------------------|---------|
 | `HOSTNAME=<name>`      | The host's own name — what `gethostname()` returns to applications. |
-| `USELOOPBACK=YES`      | Bring up the `127.0.0.1` loopback interface (recommended; the default). |
+| `MBUFCHECK=ON`         | Detect double frees and use-after-free in the packet buffers. Off by default; a diagnostic for chasing memory corruption, not something to leave on. |
 | `USENAMESERVER=SECOND` | DNS resolution order: `NO` (local hosts table only), `FIRST` (ask DNS first), `SECOND` (local table first, then DNS). |
 | `GATEWAY=NO`           | Whether to forward IP between interfaces (act as a router). |
 | `TCP_SENDSPACE=<bytes>`| TCP send-buffer size (overrides the auto-tuned default; see below). |
@@ -192,15 +217,25 @@ starts. The knobs worth knowing:
 | `LOGLEVEL=0..7`        | How much. Default 5. **7** also logs every failing library call and its errno, which is how you find out what a program is unhappy with. |
 | `LOGCONSOLE=ON\|OFF`   | Also throw the log at a console window. Default **OFF** — the window puts itself in front of whatever you are doing. |
 | `LOGFILENAME=<path>`   | Default `RAM:AmiTCP.log`. Point it at a disk if you are chasing something that only clears with a reboot. |
+| `CONSOLENAME=<path>`   | Where `LOGCONSOLE=ON` opens its window. Default `con:0/0/600/100/AmiTCPIP Log/AUTO/INACTIVE`. Point it at a file and you get a *second* log file, not a window — `CheckAmiTCPNGConfig` warns if you have. |
 
 A minimal example:
 
 ```
-useloopback=YES
 HOSTNAME=my-amiga
 ```
 
-### 4. It tunes itself to your machine and your link
+`CheckAmiTCPNGConfig` reads all of this back and reports anything wrong, without
+starting the stack or touching the hardware.
+
+### 4. Host, service and protocol names
+
+AmiTCP_NG reads its own `AmiTCP:db/netdb` **and** Roadshow's files if you have
+them — `DEVS:Internet/hosts`, `networks`, `protocols` and `services` — so a
+machine upgraded from Roadshow keeps everything it had. They add to what `netdb`
+already defines rather than replacing it, and a missing file is perfectly normal.
+
+### 5. It tunes itself to your machine and your link
 
 You normally do **not** need to touch the buffer sizes. AmiTCP_NG sets the TCP window
 automatically from two things, and uses the **smaller** of them:
@@ -253,6 +288,9 @@ internals are in **[docker/README.md](docker/README.md)**.
 # The full Roadshow-compatible command set  ->  build/Online, build/ping, ...
 ./docker/build-tools.sh
 
+# LIBS:usergroup.library  ->  build/usergroup.library
+./docker/build-usergroup.sh
+
 # A complete installable release  ->  build/release/AmiTCP_NG.lha  and  .adf
 ./docker/build-release.sh
 
@@ -271,6 +309,7 @@ git-ignored and **never committed** — see the docker guide.
 |------|----------|
 | `src/` | The TCP/IP stack: AmigaOS integration (`kern/`, `api/`), BSD networking core (`net/`, `netinet/`), the drop-in library (`lib/`), headers (`netinclude/`). |
 | `src/tools/` | The Roadshow-compatible command-line tools (source), sharing `ng_lvo.h`. |
+| `src/usergroup/` | `LIBS:usergroup.library` — the user/group/account library Roadshow ships. Independent of the stack. |
 | `install/` | The Amiga Installer script, its `ReadMe`, the network database, `Network-Startup`, and example interface configs. |
 | `docker/` | The build/test harness — Dockerfiles, scripts, and per-image how-to READMEs. |
 | `docs/` | `BUILDING.md`, `ARCHITECTURE.md`, `COMMENTING.md`, `REVIEW_FINDINGS.md`, `DEFERRED-VECTORS.md`. |

@@ -13,9 +13,10 @@
  * clamped between a floor and a cap. Capacity is chosen at start-up from the
  * installed-RAM tier (ng_ram_tier() sets ng_dns_cache_max), the same way the
  * socket buffers and mbuf pool are tiered -- small on a low-RAM machine, larger
- * when there is RAM to spare. There is no config knob or flush (Roadshow
- * exposes none either); entry storage is allocated on demand, so an idle cache
- * costs only its small slot table.
+ * when there is RAM to spare. There is no config knob (Roadshow exposes none
+ * either); entry storage is allocated on demand, so an idle cache costs only its
+ * small slot table. The cache IS flushed automatically whenever the set of name
+ * servers changes -- see ng_dnscache_flush() below.
  *
  * Only forward lookups (gethostbyname / getaddrinfo, and their negative
  * results) are cached. Reverse lookups (gethostbyaddr / PTR) are deliberately
@@ -48,6 +49,16 @@ extern int ng_dns_cache_max;
 
 /* Allocate the slot table and init the lock. Call once, after ng_ram_tier(). */
 void ng_dnscache_init(void);
+
+/*
+ * Discard every cached answer. Call after ANY change to the name server set --
+ * added, removed, withdrawn with an interface, or reloaded. Entries are keyed on
+ * the question alone and carry no record of which server answered, so a changed
+ * resolver set can leave answers behind that the new servers would not give.
+ * Safe to call before ng_dnscache_init() or with the cache disabled. Takes the
+ * cache lock, so call it OUTSIDE the NetDataBase lock.
+ */
+void ng_dnscache_flush(void);
 
 /*
  * Look up (name, type) [type is T_A or T_PTR]. On a fresh positive hit, the

@@ -149,6 +149,51 @@ struct IORequest * CheckIO(struct IORequest *req);
 
 #define ARP_MTU (sizeof(struct s2_arppkt))
 
+/*
+ * sana_submit() --- hand an IOIPReq to the device ASYNCHRONOUSLY.
+ *
+ * USE THIS INSTEAD OF A BARE BeginIO() FOR EVERY REQUEST THAT WILL BE REPLIED.
+ *
+ * SendIO() does two stores before BeginIO() and both of them matter. This file
+ * used to do neither at six separate submission sites, and the consequences were
+ * not subtle:
+ *
+ *  1. ln_Type = NT_MESSAGE. CreateIORequest() leaves a request at NT_REPLYMSG and
+ *     ReplyMsg() puts it back there, so a recycled request stays wrong for ever.
+ *     CheckIO() reads that field: on a request that is genuinely in flight it
+ *     therefore answered "already complete". Everything downstream believed it.
+ *     sana_down()'s `if (!CheckIO(req)) AbortSanaIO(req);` loop could never take
+ *     its branch, so THE STACK NEVER ABORTED ANYTHING, on any driver -- which is
+ *     also why the A3-passing AbortSanaIO() workaround appeared not to help: the
+ *     call it fixes was not being made. sana_unrun()'s abort-and-grace loop was
+ *     unreachable for the same reason, leaving it to WaitIO() and then
+ *     DeleteIORequest() requests the device still owned. With no MMU that is not
+ *     a crash anyone gets to debug.
+ *
+ *  2. io_Flags &= ~IOF_QUICK. Forces the asynchronous path, so the device replies
+ *     through the port instead of possibly satisfying us inside BeginIO() -- which
+ *     for a request with a dispatch handler and an attached mbuf is the only
+ *     behaviour the completion path knows how to handle. Currently redundant at
+ *     every call site (each either assigns io_Flags wholesale from a value that
+ *     cannot contain IOF_QUICK -- SANA2IOB_QUICK is bit 0, SANA2IOB_RAW is bit 7
+ *     -- or inherits a request that was never submitted with quick I/O). Kept
+ *     because "redundant today" is exactly what was true of the ln_Type store
+ *     until a driver went asynchronous and it cost a release.
+ *
+ * This is deliberately a helper and not six open-coded pairs of stores: the bug
+ * was fixed once already, in sana_doio_bounded() (07823c4), and the other six
+ * sites were missed. One place to get right cannot drift out of step again.
+ *
+ * NOT for sana_doio_bounded() -- that one wants quick I/O and mirrors DoIO().
+ */
+static inline void
+sana_submit(struct IOIPReq *req)
+{
+  req->ioip_s2.ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+  req->ioip_s2.ios2_Req.io_Flags &= ~IOF_QUICK;
+  BeginIO((struct IORequest *)req);
+}
+
 int debug_sana = 1;
 
 /* Global port for all SANA-II network interfaces */
@@ -186,6 +231,10 @@ struct sana_softc *ssq = NULL;
  * Local prototypes
  */
 static struct ifnet *iface_make(struct ssconfig *ifc);
+/* Defined below iface_make(), which is its first caller. */
+static LONG sana_doio_bounded(struct IOSana2Req *req, ULONG secs,
+			      const char *what, const char *ifname,
+			      int *abandoned);
 static void sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa);
 static void sana_unrun(struct sana_softc *ssc);
 static void sana_up(struct sana_softc *ssc);
@@ -196,11 +245,76 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
 static void sana_ip_read(struct sana_softc *ssc, struct IOIPReq *req);
 static void sana_arp_read(struct sana_softc *ssc, struct IOIPReq *req);
 static void sana_online(struct sana_softc *ssc, struct IOIPReq *req);
+static void sana_notify_if_last_gone(void);
+
+/*
+ * The event that means "this device can carry traffic again".
+ *
+ * S2EVENT_ONLINE, alone, because that is what Roadshow asks for and Roadshow works
+ * on the hardware this fails on (ref/roadshow-sdk/source_code/Roadshow/Online.c:
+ * `NetEventRequest->ios2_WireError = S2EVENT_ONLINE;`).
+ *
+ * This used to ask for ONLINE|CONNECT|CONFIGCHANGED, on the theory that a WiFi
+ * driver might announce its return by re-associating rather than by going online.
+ * That theory was invented here and never had anything behind it: nothing in the
+ * SANA-II specification, the headers or any driver on hand describes CONNECT or
+ * CONFIGCHANGED as an alternative to ONLINE -- CONNECT is documented as "driver has
+ * opened session", a dial-up/PPP-shaped idea, not a link-state signal.
+ *
+ * Asking for bits a driver does not implement is not free. A driver may reject the
+ * combination, and our own retry only recognises S2ERR_NOT_SUPPORTED and IOERR_NOCMD
+ * -- a driver rejecting with, say, S2ERR_BAD_ARGUMENT (an entirely reasonable answer
+ * to "I don't know that bit") sends us round the transient-failure path instead,
+ * re-arming the SAME rejected mask up to NG_S2_EVENT_MAXFAIL times before giving up
+ * on events altogether. Worse, a driver may ACCEPT the request and simply never match
+ * it, which is silent and indistinguishable from a device that never came back.
+ *
+ * So: ask for exactly what the implementation that works asks for. A driver that
+ * cannot do even this much is caught by the watchdog probe instead.
+ */
+#define NG_S2_BACK_EVENTS  (S2EVENT_ONLINE)
+
+/* How many times a driver may fail an S2_ONEVENT before we stop asking it. */
+#define NG_S2_EVENT_MAXFAIL 8
+
+/*
+ * Watchdog probe pacing, in if_slowtimo ticks (~1 s each).
+ *
+ * NG_PROBE_SECS is how long a probe read is left with the driver before we
+ * conclude it is not going to be rejected. It is a compromise: too short and a
+ * driver that is merely slow to reject looks like a driver that accepted, too
+ * long and a returning device sits unusable. NG_PROBE_ABORT_SECS is the grace
+ * given to the abort that follows, which a working driver answers at once.
+ */
+/* How long a device command (S2_ONLINE / S2_OFFLINE) may take before we stop
+ * waiting on it. Generous: bringing a radio up is allowed to take a moment, and
+ * aborting a slow-but-working driver would be its own bug. */
+/* How long teardown waits for one aborted request before abandoning it (~40 ms a
+ * turn). Generous enough for any working driver, bounded for one that is not. */
+#define NG_UNRUN_GRACE_TICKS 50
+
+#define NG_DEVCMD_SECS      15
+
+#define NG_PROBE_SECS       5
+#define NG_PROBE_ABORT_SECS 2
+
+/* Defined further down (it needs the device's AbortIO vector), but wanted earlier by
+ * sana_doio_bounded(). Only the GCC form is a function; the other compilers' branch
+ * #defines the name onto AbortIO, which needs no declaration. */
+#if defined(__GNUC__) && !defined(__SASC)
+static inline void AbortSanaIO(struct IORequest *ioRequest);
+#endif
+
+static void sana_probe_step(struct sana_softc *ssc);
+static void sana_probe_read(struct sana_softc *ssc, struct IOIPReq *req);
+static void sana_back_online(struct sana_softc *ssc, const char *how);
 static void free_written_packet(struct sana_softc *ssc, struct IOIPReq *req);
 static void sana_start(struct sana_softc *ssc);
 static void sana_rearm_reads(struct sana_softc *ssc);
 static int  sana_watchdog(struct ifnet *ifp);
-static void sana_scrub_inet(struct ifnet *ifp);
+static void sana_scrub_inet(struct ifnet *ifp, int notify);
+static void sana_flush_iface_routes(struct ifnet *ifp);
+static void sana_warn_stale_routes(void);	/* defined with the purge helpers */
 static void sana_offline_cleanup(struct sana_softc *ssc);
 
 /*
@@ -241,6 +355,15 @@ sana_init(void)
 
   if (SanaPort) {
     SanaPort->mp_Node.ln_Name = (void *)"sana_if.port";
+    /*
+     * The route table is NOT ours to assume empty. It is bsd_malloc'd, so no
+     * teardown frees it and it arrives from the previous stack instance exactly
+     * as that instance left it. sana_deinit() sweeps it clean; if anything is
+     * still here, that sweep missed something and the leftovers point at freed
+     * memory. Say so rather than run on top of it -- a silent stale global is
+     * how the loopback address gap hid for a whole session.
+     */
+    sana_warn_stale_routes();
     loattach();
     return (ULONG) 1 << SanaPort->mp_SigBit;
   }
@@ -261,6 +384,25 @@ sana_deinit(void)
 
   assert(SanaPort);
 
+  /*
+   * SWEEP THE WHOLE ROUTE TABLE FIRST, while every rt_ifa and rt_ifp in it is
+   * still live.
+   *
+   * Deleting a route is not a passive unlink: rtrequest(RTM_DELETE) reads
+   * rt->rt_ifa and calls ifa->ifa_rtrequest through it. So the sweep must happen
+   * BEFORE anything it might reference has been freed -- not after, which is
+   * where it started out and which is precisely the wrong end. By the time the
+   * loop below has torn down even one interface, a route bound to it would be
+   * deleted by dereferencing memory that loop just handed back.
+   *
+   * Doing it here also makes the per-interface purges below near-no-ops, which is
+   * fine: they stay because they are what a SINGLE interface removal needs, and
+   * a delete of an already-gone route is harmless.
+   */
+  { spl_t s0 = splimp();
+    sana_flush_iface_routes((struct ifnet *)NULL);
+    splx(s0); }
+
   while (ssq) {
     ssq->ss_removing = 1;	/* same teardown guard as sana_remove_interface (defensive:
 				 * the service loop has already stopped, so no re-arm fires) */
@@ -270,7 +412,62 @@ sana_deinit(void)
     }
     ssc = ssq;
     ssq = ssc->ss_next;
-    /* Close device */ 
+
+    /*
+     * PURGE THIS INTERFACE'S ROUTES AND ADDRESSES, exactly as
+     * sana_remove_interface() does, and in the same order -- routes first,
+     * because their rt_ifa points at the addresses scrubbed second.
+     *
+     * This loop did neither, and that is not a tidiness matter. The radix tree
+     * is bsd_malloc'd (AllocVec-backed), so unlike the mbuf pool NOTHING frees
+     * it at teardown: it survives intact into the next stack, still holding
+     * every route this interface had. Two consequences, both observed:
+     *
+     *  - The connected-network route for the old address is still RTF_UP, so
+     *    re-adding that address on the next stack fails EEXIST. That surfaced
+     *    as a DHCP lease being refused with AAMR_AddrChangeFailed: after a
+     *    shutdown the interface came back and could never get an address again.
+     *    (Measured: SIOCSIFADDR returned errno 17 on the second stack.)
+     *
+     *  - Worse, those surviving routes keep rt_ifa and rt_ifp pointing at an
+     *    ifaddr freed with the mbuf pool and a softc bsd_free'd below. See
+     *    sana_flush_iface_routes(): ip_output() derefs those and makes a wild
+     *    if_output() call on the next packet to that destination. With no MMU
+     *    that is a use-after-free the next stack inherits, silently.
+     *
+     * splimp() around both, as sana_remove_interface() does, so the table
+     * cannot mutate mid-purge.
+     */
+    { spl_t s = splimp();
+      sana_flush_iface_routes((struct ifnet *)ssc);
+      sana_scrub_inet((struct ifnet *)ssc, 0);
+      splx(s); }
+
+    /*
+     * Unlink from the GENERIC interface list too, not just ssq.
+     *
+     * There are two lists: ssq (ours) and ifnet (net/if.c's, walked by
+     * if_slowtimo(), ifinit(), ifunit(), the routing code and more). This loop
+     * only ever drained ssq, leaving every freed softc still linked into
+     * ifnet -- the stock 1993 comment above this function says as much
+     * ("main interface queue is SNAFU after deinitializing"), and it was
+     * harmless then because the process exited immediately afterwards.
+     *
+     * It is not harmless now. This is a restartable library: ifnet is a
+     * load-time global that survives a stop/start, so the next self-start
+     * walks a list whose entries have been freed. Worse, if_attach() appends
+     * at the TAIL, so loattach() re-attaching the static loif finds loif
+     * already present with a NULL if_next, stops there, and sets
+     * loif.if_next = &loif -- a self-loop that if_slowtimo() then walks
+     * forever under splimp(), which is Forbid-equivalent: the whole machine
+     * stops, silently, with nothing in the log.
+     */
+    { struct ifnet **q;
+      for (q = &ifnet; *q != NULL; q = &(*q)->if_next)
+	if (*q == (struct ifnet *)ssc) { *q = ssc->ss_if.if_next; break; }
+    }
+
+    /* Close device */
     req = CreateIOSana2Req(ssc);
     if (req) {
       CloseDevice((struct IORequest*)req);
@@ -279,7 +476,49 @@ sana_deinit(void)
       log(LOG_ERR, "sana_deinit(): Couldn't close device %s\n",
 	  ssc->ss_name);
     }
+
+    /*
+     * Free the ARP table and the softc, exactly as sana_remove_interface()
+     * does for a single interface. This loop drained the list and closed the
+     * devices but released neither, so every configured interface was lost on
+     * every shutdown -- fine when the stack exited with the program, a
+     * per-restart leak now that the library can be stopped and started again.
+     * Last, and in this order: ss_name lives inside the softc, so the log line
+     * above must have already run.
+     */
+    free_arptable(ssc);
+    bsd_free(ssc, M_IFNET);
   }
+
+  /*
+   * Leave the generic list genuinely empty for the next start.
+   *
+   * loif is a static ifnet, so it is never freed and is still linked here --
+   * and if_attach() does not clear if_next when it appends, so a stale
+   * loif.if_next left pointing at a softc we just freed would be followed on
+   * the next walk. Clearing both is what makes a restart start from nothing.
+   */
+  /*
+   * AND LOOPBACK. loif is a static ifnet and never on ssq, so the loop above
+   * never touched it -- but ng_config_loopback() re-assigns 127.0.0.1 on EVERY
+   * stack start, and in_control() appends to loif.if_addrlist, a per-interface
+   * field no reset clears. Left alone, the second start walks that list into
+   * mbuf memory the pool free already reclaimed (an odd ifa_next there is an
+   * Address Error on 68000), and rtinit() then hits the surviving 127.0.0.1 host
+   * route and fails EEXIST -- silently, because amiga_main.c discards
+   * ng_config_loopback()'s result. That is this same bug wearing lo0's clothes,
+   * and it lands on `ping 127.0.0.1`, which this project uses as its revival test.
+   *
+   * Both callees take a plain struct ifnet and touch no sana_softc field, so loif
+   * is a legal argument. No notify: the stack is going away.
+   */
+  { extern struct ifnet loif;
+    spl_t s2 = splimp();
+    sana_flush_iface_routes(&loif);
+    sana_scrub_inet(&loif, 0);
+    splx(s2);
+    ifnet = NULL;
+    loif.if_next = NULL; }
 
   if (SanaPort) {
     /* Clear possible pending signals */
@@ -294,6 +533,70 @@ sana_deinit(void)
  *  This routine polls SanaPort and processes replied
  *  requests appropriately
  */
+#define NG_RECONF_MAX 4
+
+/*
+ * PORT (AmiTCP_NG): apply the configuration of any interface whose device came
+ * back online. Called from the stack's service loop AFTER sana_poll() returns.
+ *
+ * It must not live inside sana_poll(): that runs its whole body under splnet(),
+ * which is a Forbid() equivalent in this port, and the work here opens sockets,
+ * takes the NetDataBase semaphore and may spawn the DHCP client -- all of which
+ * block. Doing it there hung the machine outright, with the interface reporting
+ * itself online and the boot script never reaching its next command.
+ *
+ * The interface NAME is copied out under a brief splimp() and everything after
+ * works from that copy, never the softc: a racing sana_remove_interface() may
+ * free it the moment we drop splimp(). ng_reconfigure_interface() looks the
+ * interface up again by name and does nothing if it has gone.
+ */
+/*
+ * Build the name a caller would use for this interface ("smoke" + unit 0 ->
+ * "smoke0"), into a buffer of at least IFNAMSIZ + 8. Shared so the two places
+ * that need a name out of a softc cannot drift apart, and so neither of them
+ * keeps the softc pointer beyond the splimp() they read it under.
+ */
+static void
+sana_ifname_copy(struct sana_softc *p, char *out)
+{
+  const char *nm = p->ss_if.if_name;
+  int n = 0, u;
+
+  while (nm && nm[n] && n < IFNAMSIZ - 1) { out[n] = nm[n]; n++; }
+  u = p->ss_if.if_unit;
+  if (u < 0) u = 0;
+  { char d[8]; int k = 0;
+    do { d[k++] = (char)('0' + (u % 10)); u /= 10; } while (u && k < (int)sizeof(d));
+    while (k > 0) out[n++] = d[--k]; }
+  out[n] = '\0';
+}
+
+void
+sana_reconfig_poll(void)
+{
+  extern void ng_reconfigure_interface(const char *ifname);
+  char  names[NG_RECONF_MAX][IFNAMSIZ + 8];
+  int   count = 0, k;
+  struct sana_softc *p;
+  spl_t s;
+
+  s = splimp();
+  for (p = ssq; p != NULL && count < NG_RECONF_MAX; p = p->ss_next) {
+    /* Skip one already being reconfigured: a flapping driver must not start a
+     * second DHCP client for the same interface. ss_reconfig stays SET so the
+     * request is honoured once the running one finishes. */
+    if (p->ss_reconfig && !p->ss_reconfiguring) {
+      p->ss_reconfig = 0;		/* cleared only now the name is recorded */
+      sana_ifname_copy(p, names[count]);
+      count++;
+    }
+  }
+  splx(s);
+
+  for (k = 0; k < count; k++)
+    ng_reconfigure_interface(names[k]);
+}
+
 BOOL
 sana_poll(void)
 {
@@ -310,6 +613,14 @@ sana_poll(void)
   s = splnet();
 
   while (io = (struct IOIPReq *)GetMsg(SanaPort)) {
+    /*
+     * A request whose interface has been torn down under it (sana_unrun() gave up
+     * waiting for a driver that would not return it) has had ioip_if cleared. It must
+     * be dropped BEFORE the dereference below -- that softc has been freed. The
+     * request itself is not reclaimed here either: the driver has only just let go of
+     * it, and nothing now tracks which pool it came from. */
+    if (io->ioip_if == NULL)
+      continue;
     /* touch the network interface */
     get_time(&io->ioip_if->ss_if.if_lastchange);
     if (io->ioip_dispatch) {
@@ -357,22 +668,29 @@ sana_poll(void)
    */
   {
     struct sana_softc *p;
-    BOOL cleaned = FALSE;
     spl_t s2;
-    extern void ng_flush_dynamic_nameservers(void);
+    extern void ng_flush_dynamic_nameservers_for(const char *ifname);
+    /* Names of interfaces that went offline AND claimed their name servers, so
+     * only those servers are withdrawn. Flushing the whole dynamic list on any
+     * offline took name resolution away from every other interface still up. */
+    char dnsflush[NG_RECONF_MAX][IFNAMSIZ + 8];
+    int  ndns = 0;
 
     s2 = splimp();
     for (p = ssq; p != NULL; p = p->ss_next) {
       if (p->ss_offcleanup) {
 	p->ss_offcleanup = 0;
 	sana_offline_cleanup(p);
-	cleaned = TRUE;
+	if (p->ss_assoc_dns && ndns < NG_RECONF_MAX)
+	  sana_ifname_copy(p, dnsflush[ndns++]);
       }
     }
     splx(s2);
 
-    if (cleaned)
-      ng_flush_dynamic_nameservers();
+    /* Outside splimp(): the flush takes the NetDataBase semaphore and blocks. */
+    { int k;
+      for (k = 0; k < ndns; k++)
+	ng_flush_dynamic_nameservers_for(dnsflush[k]); }
   }
 
   return FALSE;
@@ -512,45 +830,46 @@ iface_find(char *name, short unit)
   return NULL;
 }
 
-#ifdef NG_DHCP_DEBUG
-/* TEMP DIAGNOSTIC (-DNG_DHCP_DEBUG): append "<label> <decimal>\n" to SYS:sana.log to
- * trace SANA-II interface bring-up (OpenDevice + device queries) on real hardware.
- * iface_make runs in the caller's Process context (DOS available). */
-static void s_dbg(const char *label, long v)
-{
-  BPTR f = Open((STRPTR)"SYS:sana.log", MODE_READWRITE);
-  if (f) {
-    char b[16]; int n = 0; unsigned long u; int neg = 0;
-    long len = 0; while (label[len]) len++;
-    Seek(f, 0, OFFSET_END);
-    Write(f, (APTR)label, len);
-    Write(f, (APTR)" ", 1);
-    if (v < 0) { neg = 1; u = (unsigned long)(-v); } else u = (unsigned long)v;
-    { char t[12]; int k = 0;
-      if (u == 0) t[k++] = '0';
-      while (u) { t[k++] = '0' + (int)(u % 10); u /= 10; }
-      if (neg) b[n++] = '-';
-      while (k) b[n++] = t[--k]; }
-    b[n++] = '\n';
-    Write(f, (APTR)b, n);
-    Close(f);
-  }
-}
-#define S_LOG(label, v) s_dbg((label), (long)(v))
-#else
-#define S_LOG(label, v)
-#endif
 
 static struct ifnet *
 iface_make(struct ssconfig *ifc)
 {
   register struct sana_softc *ssc = NULL;
   register struct IOSana2Req *req;
-  struct Sana2DeviceQuery devicequery;
+  struct Sana2DeviceQuery *dq;
   LONG oerr = 0;
+  LONG err;
+  int  abandoned = 0;
+
+  /*
+   * PORT (AmiTCP_NG): the device query buffer MUST NOT live on this function's
+   * stack, because the S2_DEVICEQUERY below is now bounded and may be ABANDONED.
+   *
+   * When sana_doio_bounded() gives up on a driver it neutralises the reply port and
+   * walks away, and the driver keeps the request -- and every pointer in it --
+   * indefinitely. ios2_StatData points at this buffer. Had it stayed a local, an
+   * abandoned query would leave the driver holding a pointer into a stack frame
+   * about to be reused, and a late completion would write sizeof(Sana2DeviceQuery)
+   * bytes over whatever occupied it. With no MMU that is silent corruption, and it
+   * would be strictly worse than the hang being fixed.
+   *
+   * AllocMem, deliberately, and not the stack's own bsd_malloc pool: a leaked pool
+   * block returns to the system when the stack tears the pool down, at which point
+   * the driver would be writing into memory somebody else owns. An AllocMem block
+   * that is never freed stays ours for ever, which on this path is the point.
+   * MEMF_PUBLIC because a driver task writes it; MEMF_CLEAR so a driver that fills
+   * fewer fields than it claims leaves zeroes rather than somebody's old heap -- a
+   * zero MTU then trips the "driver reported nonsense" fallback below instead of
+   * being believed.
+   */
+  dq = (struct Sana2DeviceQuery *)AllocMem(sizeof(*dq), MEMF_PUBLIC | MEMF_CLEAR);
+  if (dq == NULL) {
+    log(LOG_ERR, "iface_make: no memory for the device query buffer\n");
+    return NULL;
+  }
 
   /* Allocate the request for opening the device */
-  if ((req = CreateIOSana2Req(NULL)) == NULL) 
+  if ((req = CreateIOSana2Req(NULL)) == NULL)
     log(LOG_ERR, "iface_find(): CreateIOSana2Req failed\n");
   else {
     req->ios2_BufferManagement = buffermanagement;
@@ -603,27 +922,34 @@ iface_make(struct ssconfig *ifc)
 	}
       }
     }
-    S_LOG("open_err", oerr);
-    S_LOG("open_wire", req->ios2_WireError);
     if (oerr) {
       sana2perror("OpenDevice", req);
     } else {
-      S_LOG("open_ok", 0);
       /* Ask for our type, address length, MTU
        * Obl. bitch: nobody tells, WHO is supplying
        * DevQueryFormat and DeviceLevel
        */
       req->ios2_Req.io_Command   = S2_DEVICEQUERY;
-      req->ios2_StatData         = &devicequery;
-      devicequery.SizeAvailable  = sizeof(devicequery);
-      devicequery.DevQueryFormat = 0L;
-      
-      DoIO((struct IORequest *)req);
-      S_LOG("devq_err", req->ios2_Req.io_Error);
-      S_LOG("addrbits", devicequery.AddrFieldSize);
-      if (req->ios2_Req.io_Error)
+      req->ios2_StatData         = dq;
+      dq->SizeAvailable          = sizeof(*dq);
+      dq->DevQueryFormat         = 0L;
+
+      /* Bounded, because a driver that swallows this command used to hang the caller
+       * for ever -- and the caller holds the library's syscall semaphore, so it took
+       * the whole library with it. See sana_doio_bounded(). */
+      err = sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_DEVICEQUERY",
+			      (const char *)ifc->args->a_dev, &abandoned);
+      if (abandoned) {
+	/* The driver still owns req -- and dq, and the open device unit. Nothing below
+	 * may read io_Error or dq, both of which it can still write at any moment, and
+	 * nothing may free any of it. Refuse the interface and leak; see the tail. */
+	log(LOG_ERR, "iface_make: %s never answered S2_DEVICEQUERY; refusing the "
+	    "interface and leaking its request rather than hanging the stack\n",
+	    ifc->args->a_dev);
+      }
+      else if (err)
 	sana2perror("S2_DEVICEQUERY", req);
-      else if (((devicequery.AddrFieldSize + 7) >> 3) > MAXADDRSANA) {
+      else if (((dq->AddrFieldSize + 7) >> 3) > MAXADDRSANA) {
 	/*
 	 * PORT (AmiTCP_NG) security fix: AddrFieldSize comes from the driver's
 	 * S2_DEVICEQUERY and is turned into if_addrlen, which is then used as the
@@ -636,15 +962,20 @@ iface_make(struct ssconfig *ifc)
 	log(LOG_ERR, "iface_make: %s reports hardware address length %ld, "
 	    "exceeding the %ld-byte SANA-II address buffers; refusing interface",
 	    ifc->args->a_dev,
-	    (long)((devicequery.AddrFieldSize + 7) >> 3), (long)MAXADDRSANA);
+	    (long)((dq->AddrFieldSize + 7) >> 3), (long)MAXADDRSANA);
       }
       else {
 	/* Get Our Station address */
 	req->ios2_StatData = NULL;
 	req->ios2_Req.io_Command = S2_GETSTATIONADDRESS;
-	DoIO((struct IORequest *)req);
-	S_LOG("getaddr_err", req->ios2_Req.io_Error);
-	if (req->ios2_Req.io_Error)
+	err = sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_GETSTATIONADDRESS",
+				(const char *)ifc->args->a_dev, &abandoned);
+	if (abandoned) {
+	  log(LOG_ERR, "iface_make: %s never answered S2_GETSTATIONADDRESS; refusing "
+	      "the interface and leaking its request rather than hanging the stack\n",
+	      ifc->args->a_dev);
+	}
+	else if (err)
 	  sana2perror("S2_GETSTATIONADDRESS", req);
 	else {
 	  req->ios2_Req.io_Command = 0;
@@ -664,10 +995,10 @@ iface_make(struct ssconfig *ifc)
 	    ssc->ss_bufmgnt = req->ios2_BufferManagement;
 	    
 	    /* Address must be full bytes */
-	    ssc->ss_if.if_addrlen  = (devicequery.AddrFieldSize + 7) >> 3;
+	    ssc->ss_if.if_addrlen  = (dq->AddrFieldSize + 7) >> 3;
 	    bcopy(req->ios2_DstAddr, ssc->ss_hwaddr, ssc->ss_if.if_addrlen);
 	    /*
-	     * PORT (AmiTCP_NG) security fix: devicequery.MTU is a ULONG coming
+	     * PORT (AmiTCP_NG) security fix: dq->MTU is a ULONG coming
 	     * from a third-party SANA-II driver, and it was stored unchecked
 	     * into if_mtu (a SIGNED short) and ss_maxmtu (a UWORD). A driver
 	     * reporting 32768 or more made if_mtu negative, which then feeds the
@@ -676,7 +1007,7 @@ iface_make(struct ssconfig *ifc)
 	     * driver reports a value too small to carry an IP datagram.
 	     */
 	    {
-	      ULONG mtu = devicequery.MTU;
+	      ULONG mtu = dq->MTU;
 
 	      if (mtu < 68)
 		mtu = 1500;		/* driver reported nonsense */
@@ -685,8 +1016,8 @@ iface_make(struct ssconfig *ifc)
 	      ssc->ss_if.if_mtu = (short)mtu;
 	      ssc->ss_maxmtu    = (UWORD)mtu;
 	    }
-	    ssc->ss_if.if_baudrate = devicequery.BPS;
-	    ssc->ss_hwtype         = devicequery.HardwareType;	
+	    ssc->ss_if.if_baudrate = dq->BPS;
+	    ssc->ss_hwtype         = dq->HardwareType;	
 	    
 	    /* These might be different on different hwtypes */
 	    ssc->ss_if.if_output = sana_output;
@@ -705,14 +1036,278 @@ iface_make(struct ssconfig *ifc)
 	  }
 	}
       }
-      if (!ssc)
+      /* Closing a unit that still has an outstanding request against it is illegal
+       * in Exec, and the driver typically faults on it. An abandoned request is by
+       * definition still outstanding, so the open reference leaks with the rest. */
+      if (!ssc && !abandoned)
 	CloseDevice((struct IORequest *)req);
     }
-    DeleteIOSana2Req(req);
+    /* The device may still write into the request and its reply port. Handing that
+     * memory back while it can is the no-MMU corruption this whole path exists to
+     * avoid; the same reasoning as sana_device_online(). */
+    if (!abandoned)
+      DeleteIOSana2Req(req);
   }
 
-  S_LOG("iface_ret", ssc ? 1 : 0);
+  /*
+   * ONE FreeMem, HERE, and only here. dq is read again long after S2_DEVICEQUERY
+   * completes -- if_addrlen, MTU, BPS and HardwareType above all come out of it,
+   * after S2_GETSTATIONADDRESS has been and gone. Freeing it at the end of the
+   * query, which is the obvious-looking place, would be a use-after-free on the
+   * ordinary success path.
+   *
+   * Skipped entirely once anything has been abandoned: the driver may still write
+   * here. That leaks this block on a path that already leaks the request, its port
+   * and the device open, and deliberately so.
+   */
+  if (!abandoned)
+    FreeMem(dq, sizeof(*dq));
+
   return (struct ifnet *)ssc;
+}
+
+/*
+ * PORT (AmiTCP_NG): switch this interface's DEVICE online or offline.
+ *
+ * The Roadshow SDK defines SM_Offline as "same as SM_Down, but also sends an
+ * S2_OFFLINE command to the underlying SANA-II device first", and SM_Online as
+ * "same as SM_Up, but tries to send an S2_ONLINE command first; if the command
+ * succeeds, the other necessary configuration operations will take place. If it
+ * fails, then this function will return with an error code set and no further
+ * configuration will have been done." This is that device command.
+ *
+ * Doing it from the STACK is what makes the interface lifecycle deterministic:
+ * when we issue the command ourselves we know the outcome immediately and need
+ * no notification from the driver. That matters because a driver is not obliged
+ * to report anything -- see the S2_ONEVENT handling in sana_online().
+ *
+ * Benign refusals are success. A device already in the requested state answers
+ * S2ERR_BAD_STATE, and one that does not distinguish the states at all answers
+ * S2ERR_NOT_SUPPORTED or IOERR_NOCMD; in each case the device is as online as it
+ * is ever going to be. Returns 0, or an errno for a real failure.
+ *
+ * Blocking, so this must be called at task level, never from a completion or under
+ * splimp() -- but bounded, so it always returns. See sana_doio_bounded() below for
+ * why that distinction is the difference between one dead interface and a dead stack.
+ */
+/*
+ * Send a device command and wait for it -- but ALWAYS come back.
+ *
+ * This replaced a plain DoIO(), and the difference is not academic. The caller runs
+ * inside ConfigureInterfaceTagList, which holds the library's syscall semaphore, and
+ * that semaphore serialises much of the socket API. A DoIO() against a driver that
+ * accepts the command and never completes it therefore does not merely fail to bring
+ * one interface back: the calling task never returns, the semaphore is never
+ * released, and every other task that needs it stops too. The whole library dies.
+ *
+ * That is not a theory. Crippling a driver so it swallows S2_ONLINE (MODE=hang in
+ * docker/run-offline.sh) wedged the emulated machine exactly so: the
+ * ONLINE command never returned, and an unrelated GetNetStatus issued afterwards
+ * never returned either. The guest never reached the end of its own boot script.
+ *
+ * So the wait is bounded, in two stages, and the last stage cannot block at all:
+ *
+ *   1. Wait up to `secs` for the driver to answer. Generous -- bringing a radio up is
+ *      allowed to take a moment, and aborting a slow-but-working driver would be its
+ *      own bug.
+ *   2. If it does not, AbortSanaIO() it (the A3-passing abort this driver family
+ *      needs -- plain AbortIO() is ignored by several SANA-II drivers) and wait a
+ *      short grace period for the abort to be honoured.
+ *   3. If the request STILL has not come back, do not wait for it, because there is
+ *      nothing left to wait on that is guaranteed to happen. Neutralise its reply
+ *      port -- PA_IGNORE and no signal task -- so that a reply arriving later is
+ *      simply linked onto a list nobody reads, rather than signalling a task that may
+ *      by then be gone (with no MMU, signalling a recycled Task corrupts whatever
+ *      occupies it). Then abandon the request and the port: they leak, deliberately,
+ *      and one leaked request on a driver this broken is a trade worth making
+ *      against hanging the machine.
+ *
+ * Returns the driver's io_Error, or IOERR_ABORTED if we gave up on it.
+ */
+static LONG
+sana_doio_bounded(struct IOSana2Req *req, ULONG secs,
+		  const char *what, const char *ifname, int *abandoned)
+{
+  struct MsgPort     *tport;
+  struct timerequest *treq;
+  struct MsgPort     *rport = req->ios2_Req.io_Message.mn_ReplyPort;
+  ULONG devmask, timmask, got;
+  LONG  err;
+  int   i;
+  int   treq_pending = 0;
+
+  *abandoned = 0;
+
+  tport = CreateMsgPort();
+  treq  = tport ? (struct timerequest *)CreateIORequest(tport, sizeof(*treq)) : NULL;
+  if (treq != NULL &&
+      OpenDevice((STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)treq, 0) != 0) {
+    DeleteIORequest((struct IORequest *)treq);
+    treq = NULL;
+  }
+  if (treq == NULL) {
+    /* No timer to be had. Fall back to the old behaviour rather than refusing to do
+     * the operation -- no worse than before this function existed. */
+    if (tport) DeleteMsgPort(tport);
+    DoIO((struct IORequest *)req);
+    return req->ios2_Req.io_Error;
+  }
+
+  devmask = 1UL << rport->mp_SigBit;
+  timmask = 1UL << tport->mp_SigBit;
+
+  /*
+   * PRESERVE QUICK I/O. This is not an optimisation; getting it wrong kills the
+   * machine.
+   *
+   * DoIO() sets IOF_QUICK before BeginIO(). A device that can satisfy the command
+   * immediately then does so inside BeginIO() and never replies via the message
+   * port -- there is nothing to wait for and nothing to reap. SendIO() does the
+   * opposite: it CLEARS IOF_QUICK, obliging the device to take the asynchronous
+   * path and reply.
+   *
+   * Submitting with SendIO() is what this function used to do, and it wedged
+   * a2065.device's open-time S2_DEVICEQUERY solid: the reply never came, and
+   * neither did the timeout below -- Wait() never returned at all, for either
+   * signal, which is the signature of a dead machine rather than a slow driver.
+   * The same command under DoIO() answers instantly. Whatever the driver does with
+   * a non-quick DEVICEQUERY during open, it does not survive it.
+   *
+   * So mirror DoIO exactly: ask for quick completion, and only take the bounded
+   * asynchronous path if the device actually cleared the flag and went async.
+   * The timer is not started until we know we have something to wait for.
+   */
+  /*
+   * ln_Type = NT_MESSAGE BEFORE BeginIO, exactly as SendIO()/DoIO() do it.
+   *
+   * This is not bookkeeping that can be skipped. CreateIORequest() leaves a fresh
+   * request with ln_Type == NT_REPLYMSG, so CheckIO() on a request that has never
+   * been sent returns NON-ZERO -- "already complete". SendIO() and DoIO() both
+   * overwrite it with NT_MESSAGE on the way in, which is what makes CheckIO mean
+   * anything afterwards.
+   *
+   * Calling BeginIO() directly without that store cost us the async path entirely:
+   * the moment a driver went asynchronous, the wait loop's first CheckIO() said the
+   * driver had answered, we broke out, and WaitIO() then blocked for ever on a reply
+   * that was never coming -- while holding the library's syscall semaphore, so the
+   * whole stack stopped behind it. Every normal driver answers these commands with
+   * quick I/O, which is why the gate never saw it; only a driver that actually goes
+   * async does, and that is precisely the case this function exists for.
+   */
+  req->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+  req->ios2_Req.io_Flags |= IOF_QUICK;
+  BeginIO((struct IORequest *)req);
+  if (req->ios2_Req.io_Flags & IOF_QUICK) {
+    /* Satisfied inside BeginIO(). No reply was sent, so there is nothing to reap
+     * and nothing to abort -- touching the reply port here would hang. */
+    err = req->ios2_Req.io_Error;
+    CloseDevice((struct IORequest *)treq);
+    DeleteIORequest((struct IORequest *)treq);
+    DeleteMsgPort(tport);
+    return err;
+  }
+
+  treq->tr_node.io_Command = TR_ADDREQUEST;
+  treq->tr_time.tv_secs    = secs;
+  treq->tr_time.tv_micro   = 0;
+  SendIO((struct IORequest *)treq);
+  treq_pending = 1;
+
+  for (;;) {
+    got = Wait(devmask | timmask);
+    if (CheckIO((struct IORequest *)req))
+      break;				/* the driver answered: normal case */
+    if (got & timmask) {
+      log(LOG_ERR, "%s: driver did not answer %s in %ld seconds\n",
+	  ifname, what, (long)secs);
+      AbortSanaIO((struct IORequest *)req);
+      /* Reap the timer's OWN completion before the grace loop below reuses treq.
+       * Wait() reports a signal but does not dequeue the reply, and re-submitting an
+       * IORequest whose previous reply is still linked on its port corrupts that
+       * port's list. */
+      WaitIO((struct IORequest *)treq);
+      treq_pending = 0;
+      break;
+    }
+  }
+
+  /* Give an honoured abort a moment to come back, without committing to WaitIO -- a
+   * driver that never received the request (or ignores AbortIO) would never complete
+   * it, and WaitIO would hang here instead of in the DoIO we just removed. */
+  for (i = 0; i < 20 && !CheckIO((struct IORequest *)req); i++) {
+    treq->tr_node.io_Command = TR_ADDREQUEST;
+    treq->tr_time.tv_secs    = 0;
+    treq->tr_time.tv_micro   = 100000;		/* 0.1 s */
+    DoIO((struct IORequest *)treq);
+  }
+
+  if (CheckIO((struct IORequest *)req)) {
+    WaitIO((struct IORequest *)req);		/* reaps it; cannot block now */
+    err = req->ios2_Req.io_Error;
+  } else {
+    log(LOG_ERR, "%s: driver kept %s and ignored the abort -- abandoning the request "
+	"rather than hanging the stack\n", ifname, what);
+    Forbid();
+    rport->mp_Flags   = PA_IGNORE;	/* a late reply must not signal anybody */
+    rport->mp_SigTask = NULL;
+    Permit();
+    *abandoned = 1;			/* the device still owns it -- do NOT free it */
+    err = IOERR_ABORTED;
+  }
+
+  /*
+   * Reap the timer ONLY if it is still outstanding, tracked explicitly rather than
+   * inferred from CheckIO().
+   *
+   * The two paths here differ, and the difference is not cosmetic. If the driver
+   * answered, treq is still queued from the SendIO above and MUST be aborted and
+   * reaped. If we timed out, treq was already reaped in the timeout branch, and the
+   * grace loop's DoIO() calls each submit and collect it again -- so by this point
+   * it is idle. Calling WaitIO() on an idle request relies on it being harmless,
+   * which is a semantic nobody here can cite from the Autodocs on disk; if it
+   * instead waits for a signal that will never come again, this function would hang
+   * precisely when a driver has hung, which is the one case it exists to survive.
+   * A flag costs nothing and does not depend on the answer.
+   */
+  if (treq_pending) {
+    if (!CheckIO((struct IORequest *)treq))
+      AbortIO((struct IORequest *)treq);
+    WaitIO((struct IORequest *)treq);
+  }
+  CloseDevice((struct IORequest *)treq);
+  DeleteIORequest((struct IORequest *)treq);
+  DeleteMsgPort(tport);
+  return err;
+}
+
+/* NOT static: declared extern by the IFC_State handler in api/amiga_roadshow_compat.c. */
+int
+sana_device_online(struct ifnet *ifp, int online)
+{
+  struct sana_softc *ssc = (struct sana_softc *)ifp;
+  struct IOSana2Req *req;
+  LONG err;
+  int  abandoned = 0;
+
+  if (ifp->if_type != IFT_SANA)
+    return EINVAL;
+  if ((req = CreateIOSana2Req(ssc)) == NULL)
+    return ENOMEM;
+
+  req->ios2_Req.io_Command = online ? S2_ONLINE : S2_OFFLINE;
+  err = sana_doio_bounded(req, NG_DEVCMD_SECS,
+			  online ? "S2_ONLINE" : "S2_OFFLINE", (const char *)ssc->ss_name,
+			  &abandoned);
+  if (err && err != S2ERR_BAD_STATE && err != S2ERR_NOT_SUPPORTED &&
+      err != IOERR_NOCMD)
+    sana2perror(online ? "S2_ONLINE" : "S2_OFFLINE", req);
+  else
+    err = 0;
+  /* Freeing a request the device still holds would hand its memory back while the
+   * driver can still write to it -- with no MMU, that is silent corruption. */
+  if (!abandoned)
+    DeleteIOSana2Req(req);
+  return err ? EIO : 0;
 }
 
 /*
@@ -726,27 +1321,56 @@ iface_make(struct ssconfig *ifc)
  * it ("eth0" -> if_name "eth", if_unit 0), so the interface can be looked up
  * afterwards. Every wire type/count field is left NULL/0, so ssconfig() fills in
  * the per-wiretype defaults (as it does for a bare config-file definition).
- * Returns the new ifnet, or NULL if the device could not be opened -- iface_make
- * cleans up entirely after itself on that path, leaving no phantom interface.
+ * Returns the new ifnet, or NULL if the device could not be opened. No phantom
+ * interface is ever left behind: if_attach() is not reached on any failure path, so
+ * nothing appears in the ifnet list. Resources are a separate question -- iface_make
+ * releases everything EXCEPT when a driver abandons a device command, where the
+ * request, its port, the device open and the query buffer are leaked on purpose
+ * rather than freed while the driver can still write to them.
  */
 struct ifnet *
 sana_add_interface(char *ifname, char *devname, long devunit,
-		   long ipreq, long wreq)
+		   long ipreq, long wreq, long bps)
 {
   struct ssconfig ssc;
   LONG unit_val = devunit;
-  LONG ipreq_val = ipreq, wreq_val = wreq;
+  LONG ipreq_val = ipreq, wreq_val = wreq, bps_val = bps;
   int i;
 
   aligned_bzero_const((caddr_t)&ssc, sizeof ssc);
 
-  for (i = 0; i < IFNAMSIZ - 1 && ifname[i] != '\0' &&
-	      !(ifname[i] >= '0' && ifname[i] <= '9'); i++)
-    ssc.name[i] = ifname[i];
-  ssc.name[i] = '\0';
-  for (ssc.unit = 0; ifname[i] >= '0' && ifname[i] <= '9'; i++)
-    ssc.unit = ssc.unit * 10 + (ifname[i] - '0');
-  S_LOG("split_unit", ssc.unit);
+  /*
+   * The unit is the TRAILING run of digits. Splitting at the FIRST digit assumed
+   * an interface name never starts with one -- untrue of the names people use: a
+   * 3Com PCMCIA config file named "3c589" gave base "" + unit 3, so the interface
+   * was created, and displayed, as "3" (github issue #6).
+   *
+   * This must stay identical to ifunit() in net/if.c, INCLUDING the clamp: that is
+   * how the interface is looked up again after it is created, and a base/unit pair
+   * the lookup computes differently is an interface nobody can find.
+   *
+   *   "eth0"   -> "eth"  + 0        "3c589" -> "3c" + 589
+   *   "wifipi" -> "wifipi" + 0      "3"     -> ""   + 3
+   */
+  {
+    int n, b;
+
+    for (n = 0; n < IFNAMSIZ - 1 && ifname[n] != '\0'; n++)
+      ;
+    for (b = n; b > 0 && ifname[b - 1] >= '0' && ifname[b - 1] <= '9'; b--)
+      ;
+    for (i = 0; i < b; i++)
+      ssc.name[i] = ifname[i];
+    ssc.name[b] = '\0';
+    /* Clamped to what if_unit (a short) holds -- see ifunit(). */
+    for (ssc.unit = 0, i = b; i < n; i++) {
+      ssc.unit = ssc.unit * 10 + (ifname[i] - '0');
+      if (ssc.unit > 32767) {
+	ssc.unit = 32767;
+	break;
+      }
+    }
+  }
 
   ssc.flags = 0;			/* no ReadArgs RDArgs to free */
   ssc.args->a_name = (UBYTE *)ssc.name;
@@ -760,6 +1384,8 @@ sana_add_interface(char *ifname, char *devname, long devunit,
    */
   if (ipreq > 0) ssc.args->a_ipno    = &ipreq_val;
   if (wreq  > 0) ssc.args->a_writeno = &wreq_val;
+  /* Likewise bps=: 0 leaves the driver's reported S2_DEVICEQUERY BPS in place. */
+  if (bps   > 0) ssc.args->a_bps     = &bps_val;
   /* All other ssc_args fields remain 0/NULL => ssconfig() uses wire defaults. */
 
   return iface_make(&ssc);
@@ -773,7 +1399,7 @@ sana_add_interface(char *ifname, char *devname, long devunit,
  * Factored out of sana_remove_interface() so sana_offline_cleanup() can reuse it.
  */
 static void
-sana_scrub_inet(struct ifnet *ifp)
+sana_scrub_inet(struct ifnet *ifp, int notify)
 {
   struct ifaddr *ifa;
   struct in_ifaddr *ia, *oia, *p;
@@ -786,6 +1412,32 @@ sana_scrub_inet(struct ifnet *ifp)
       continue;
     }
     ia = (struct in_ifaddr *)ifa;
+    /*
+     * Tell this address's sockets before it is taken away -- once scrubbed there
+     * is nothing left to match them on. BSD raises PRC_IFDOWN here and discards
+     * it, leaving applications to find out when something eventually fails.
+     * Safe from this context: the caller holds splimp() throughout, which is what
+     * stops a concurrent soclose() freeing a pcb under the walk.
+     */
+    /*
+     * NOTIFY ONLY WHEN THE STACK IS STAYING UP.
+     *
+     * Waking a blocked reader is right when ONE interface goes away: the socket
+     * survives, the task returns with ENETDOWN, everything it touches is still
+     * there. It is wrong during a whole-stack teardown. A client that ignored the
+     * shutdown warnings is deliberately left with its base and sockets INTACT
+     * (see api_abandon_bases) precisely because it may be asleep inside recv();
+     * waking it here makes it runnable moments before mbdeinit() hands the whole
+     * mbuf pool -- its socket, its buffers -- back to Exec. It is priority 0 and
+     * the stack task is 5, so it cannot run until the stack task next blocks, and
+     * when it does it resumes reading memory about to be freed underneath it.
+     * Asleep and wedged is survivable; awake and reading freed pool memory, with
+     * no MMU, is not.
+     */
+    if (notify) {
+      extern void in_ifdown_notify(struct in_addr laddr, int error, int match_any);
+      in_ifdown_notify(IA_SIN(ia)->sin_addr, ENETDOWN, 0);
+    }
     in_ifscrub(ifp, ia);
     ifp->if_addrlist = ifa->ifa_next;		/* always the head here */
     oia = ia;
@@ -830,7 +1482,9 @@ sana_collect_ifroute(struct radix_node *rn, struct walkarg *wa)
     struct rtentry *rt = (struct rtentry *)rn;
     if (rn->rn_flags & RNF_ROOT)		/* tree sentinel, not a route */
       continue;
-    if (rt->rt_ifp != w->ifp)
+    /* w->ifp == NULL means EVERY route, whatever it exits through -- used by the
+     * whole-stack teardown sweep, where nothing in the table may outlive us. */
+    if (w->ifp != NULL && rt->rt_ifp != w->ifp)
       continue;
     if (w->n < SANA_RTPURGE_MAX)
       w->rt[w->n++] = rt;
@@ -838,6 +1492,50 @@ sana_collect_ifroute(struct radix_node *rn, struct walkarg *wa)
       w->overflow = 1;
   }
   return (0);
+}
+
+/*
+ * Report a route table that arrived non-empty from a previous stack instance.
+ *
+ * The table is bsd_malloc'd, so nothing frees it at teardown: it reaches the next
+ * stack exactly as the last one left it. sana_deinit() sweeps it, so anything
+ * still here means the sweep missed something -- and a missed route keeps rt_ifa
+ * and rt_ifp pointing into pool memory that has since been handed back, which
+ * ip_output() will follow on the next packet to that destination.
+ *
+ * Warn rather than delete: deleting would hide the teardown bug, and this runs
+ * before any interface exists, so there is nothing to lose by leaving them for
+ * the sweep to catch next time. A silent stale global is exactly how the loopback
+ * address gap stayed invisible.
+ */
+static void
+sana_warn_stale_routes(void)
+{
+  struct sana_rtpurge w;
+  struct radix_node_head *rnh;
+  spl_t s;
+
+  /* Every other walker of this tree holds splimp(); nothing can be mutating it
+   * at this point in bring-up, but matching the file's own stated invariant
+   * costs two instructions and keeps the helper safe if it is ever called from
+   * somewhere less quiet. */
+  s = splimp();
+  w.ifp = NULL; w.n = 0; w.overflow = 0;
+  for (rnh = radix_node_head; rnh != NULL; rnh = rnh->rnh_next)
+    if (rnh->rnh_af == AF_INET)
+      rt_walk(rnh->rnh_treetop, sana_collect_ifroute, (struct walkarg *)&w);
+  splx(s);
+  /*
+   * PROVEN TO WORK, not assumed. Called either side of the teardown sweep with a
+   * temporary probe, this reported n=3 before and n=0 after, and n=0 again at the
+   * next stack start -- so its silence in normal running means the table really is
+   * empty, rather than meaning the walk never ran. A detector nobody has watched
+   * fire is not a detector.
+   */
+  if (w.n > 0 || w.overflow)
+    log(LOG_WARNING, "sana_init: route table was not empty at stack start "
+	"(%ld left%s) -- teardown missed them; they point at freed memory\n",
+	(long)w.n, w.overflow ? "+" : "");
 }
 
 /*
@@ -887,7 +1585,7 @@ sana_flush_iface_routes(struct ifnet *ifp)
   if (pass == 64)
     log(LOG_ERR, "sana_flush_iface_routes: route purge for %s hit the "
 	"pass cap; some routes may still be bound to the interface\n",
-	ifp->if_name ? ifp->if_name : "?");
+	ifp == NULL ? "(all)" : (ifp->if_name ? ifp->if_name : "?"));
 }
 
 /*
@@ -907,8 +1605,76 @@ sana_offline_cleanup(struct sana_softc *ssc)
 {
   struct ifnet *ifp = (struct ifnet *)ssc;
 
+  /*
+   * ROUTES FIRST, AND UNCONDITIONALLY.
+   *
+   * This used to flush the routes only when the interface had CLAIMED them
+   * (Roadshow's IFC_AssociatedRoute), on the reasoning that taking a device
+   * offline is not a licence to delete a default route an operator added by
+   * hand. Decent intent, impossible in practice: the scrub below frees this
+   * interface's ifaddrs, and every route that exits through this interface
+   * points at one of them through rt_ifa. Keeping such a route does not preserve
+   * it -- it leaves it in the table with rt_ifa dangling.
+   *
+   * That is not a passive leak. rtrequest(RTM_DELETE) reads rt->rt_ifa and CALLS
+   * ifa->ifa_rtrequest through it (net/route.c), so the next thing to delete that
+   * route -- an interface removal, a stack teardown, the sweep in sana_deinit() --
+   * takes a function pointer out of freed mbuf memory and jumps through it. With
+   * no MMU, whatever has since reused that mbuf decides what happens. ip_output()
+   * following rt_ifp on the next packet to that destination is the same story.
+   *
+   * A statically-configured interface with a hand-added route is exactly the case
+   * that took this path, because it never sets ss_assoc_route.
+   *
+   * So the choice was never "keep the operator's route or delete it". It was
+   * "delete it, or leave a landmine addressed to whoever deletes it next".
+   */
   sana_flush_iface_routes(ifp);
-  sana_scrub_inet(ifp);
+  sana_scrub_inet(ifp, 1);
+
+  sana_notify_if_last_gone();
+}
+
+/*
+ * Was that the last one? A socket bound to INADDR_ANY is not tied to any single
+ * interface, so it is left alone while another still carries an address -- but
+ * once none do, there is no network left for it to wait on and it would otherwise
+ * block for ever.
+ *
+ * Loopback does not count: it is always there, so counting it would mean this
+ * never fires at all.
+ *
+ * Called from BOTH paths that strip an interface's addresses -- going offline and
+ * being removed outright. Removal matters more, not less: an offlined interface
+ * may reconfigure itself when its device returns, while a removed one never will,
+ * so a socket left blocked there is stuck for good.
+ *
+ * Caller must hold splimp(): this walks the interface and address lists.
+ */
+static void
+sana_notify_if_last_gone(void)
+{
+  extern void in_ifdown_notify(struct in_addr laddr, int error, int match_any);
+  extern struct ifnet *ifnet;
+  struct ifnet *p;
+  struct ifaddr *ifa;
+  struct in_addr none;
+  int live = 0;
+
+  for (p = ifnet; p != NULL && !live; p = p->if_next) {
+    if (p->if_flags & IFF_LOOPBACK)
+      continue;
+    for (ifa = p->if_addrlist; ifa != NULL; ifa = ifa->ifa_next)
+      if (ifa->ifa_addr != NULL && ifa->ifa_addr->sa_family == AF_INET) {
+	live = 1;
+	break;
+      }
+  }
+  if (!live) {
+    none.s_addr = 0;
+    in_ifdown_notify(none, ENETDOWN, 1);
+    log(LOG_NOTICE, "no network interface is configured any more");
+  }
 }
 
 /*
@@ -968,11 +1734,15 @@ sana_remove_interface(struct ifnet *ifp, int force)
    * freed memory. Then scrub every AF_INET address (mirrors in_control()'s
    * SIOCDIFADDR). */
   sana_flush_iface_routes(ifp);
-  sana_scrub_inet(ifp);
+  sana_scrub_inet(ifp, 1);
 
   /* Unlink from the interface list (no if_detach() exists). */
   for (q = &ifnet; *q != NULL; q = &(*q)->if_next)
     if (*q == ifp) { *q = ifp->if_next; break; }
+
+  /* Same duty as the offline path, and more pressing here: a removed interface
+   * never reconfigures itself, so anything still waiting on it waits for good. */
+  sana_notify_if_last_gone();
 
   /* Unlink from the SANA-II softc list. */
   for (pp = &ssq; *pp != NULL; pp = &(*pp)->ss_next)
@@ -1014,6 +1784,10 @@ sana_remove_interface(struct ifnet *ifp, int force)
     DeleteIOSana2Req(req);
   }
 
+  /* The ARP table BEFORE the softc that points at it -- freeing the softc
+   * first would take the only route to the table with it. */
+  free_arptable(ssc);
+
   /* Release the softc (it also carries the exec device-name string). */
   bsd_free(ssc, M_IFNET);
   return 0;
@@ -1035,12 +1809,27 @@ sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa)
    */
   if ((ssc->ss_if.if_flags & IFF_RUNNING) == 0) {
     struct IOSana2Req *req;
+    /*
+     * Every device command below is BOUNDED. This is interface bring-up -- the path
+     * AddNetInterface and the DHCP helper both come through -- and a driver that
+     * accepts a command and never completes it would hang whichever of them got
+     * here, for ever, with nothing said. That is not hypothetical: a bare DoIO()
+     * exactly like these ones wedged a machine in testing, and because the DHCP
+     * helper is what calls in, the symptom was AddNetInterface hanging with no
+     * output rather than anything pointing at the driver.
+     *
+     * Once a request has been abandoned it belongs to the driver and must not be
+     * reused for the next command, nor freed -- so each step checks and bails out.
+     */
+    int abandoned = 0;
 
     if ((req = CreateIOSana2Req(ssc))) {
       req->ios2_Req.io_Command = S2_CONFIGINTERFACE;
       bcopy(ssc->ss_hwaddr, req->ios2_SrcAddr, ssc->ss_if.if_addrlen);
 
-      DoIO((struct IORequest*)req);
+      (void)sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_CONFIGINTERFACE",
+			      (const char *)ssc->ss_name, &abandoned);
+      if (abandoned) goto req_gone;
       /* An "already configured" reply is success (see the test below), not an error
        * worth logging -- only log a genuine configuration failure. */
       if (req->ios2_Req.io_Error &&
@@ -1060,7 +1849,9 @@ sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa)
 	 * no-op for them.) An already-online driver returns S2ERR_BAD_STATE and one that
 	 * does not distinguish the states returns S2ERR_NOT_SUPPORTED -- both are fine. */
 	req->ios2_Req.io_Command = S2_ONLINE;
-	DoIO((struct IORequest*)req);
+	(void)sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_ONLINE",
+				(const char *)ssc->ss_name, &abandoned);
+	if (abandoned) goto req_gone;
 	if (req->ios2_Req.io_Error &&
 	    req->ios2_Req.io_Error != S2ERR_BAD_STATE &&
 	    req->ios2_Req.io_Error != S2ERR_NOT_SUPPORTED &&
@@ -1077,7 +1868,9 @@ sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa)
 	   * without tracking). Only a genuine, unexpected failure is logged. */
 	  req->ios2_Req.io_Command = S2_TRACKTYPE;
 	  req->ios2_PacketType = ssc->ss_ip.type;
-	  DoIO((struct IORequest*)req);
+	  (void)sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_TRACKTYPE",
+				  (const char *)ssc->ss_name, &abandoned);
+	  if (abandoned) goto req_gone;
 	  /* It is *not* safe to turn tracking off */
 	  if (req->ios2_Req.io_Error &&
 	      req->ios2_Req.io_Error != S2ERR_NOT_SUPPORTED &&
@@ -1087,7 +1880,9 @@ sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa)
 	  if (ssc->ss_arp.reqno) {
 	    req->ios2_Req.io_Command = S2_TRACKTYPE;
 	    req->ios2_PacketType = ssc->ss_arp.type;
-	    DoIO((struct IORequest*)req);
+	    (void)sana_doio_bounded(req, NG_DEVCMD_SECS, "S2_TRACKTYPE",
+				    (const char *)ssc->ss_name, &abandoned);
+	    if (abandoned) goto req_gone;
 	    if (req->ios2_Req.io_Error &&
 		req->ios2_Req.io_Error != S2ERR_NOT_SUPPORTED &&
 		req->ios2_Req.io_Error != IOERR_NOCMD &&
@@ -1098,6 +1893,14 @@ sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa)
 	}
       }
       DeleteIOSana2Req(req);
+      goto req_done;
+    req_gone:
+      /* The driver kept it. It is still holding our memory, so it is not freed --
+       * see sana_doio_bounded(): the reply port has been neutralised so a late
+       * reply cannot signal anybody. */
+      ;
+    req_done:
+      ;
     }
   }
 
@@ -1165,7 +1968,56 @@ sana_unrun(struct sana_softc *ssc)
 
   for ( next = ssc->ss_reqs; (req = next) ;) {
     next = req -> ioip_next;
-    WaitIO((struct IORequest *)req);
+
+    /*
+     * BOUNDED. This was a bare WaitIO(), on the stated assumption that sana_down()
+     * had already aborted every request here so completion would be prompt. That
+     * assumption rests entirely on the driver honouring AbortIO -- and this file
+     * carries an A3-passing AbortSanaIO() workaround precisely BECAUSE several
+     * SANA-II drivers (wifipi.device among them) ignore a plain one. When that
+     * assumption fails the wait never ends, and because SanaPortSem is held across
+     * this whole loop it does not merely hang the removal: sana_poll() stops for
+     * EVERY interface on the machine. One driver refusing to answer took the whole
+     * stack down with it.
+     *
+     * So: wait a bounded time, and if the request still has not come back, leave it
+     * with the driver rather than blocking here for ever. It is not freed and its
+     * mbufs are not freed -- the driver may still write into both -- which leaks,
+     * deliberately, and says so. A bounded leak on a broken driver beats a machine
+     * that has to be reset.
+     */
+    if (!CheckIO((struct IORequest *)req)) {
+      int spin;
+      AbortSanaIO((struct IORequest *)req);	/* ask again; sana_down already did */
+      for (spin = 0; spin < NG_UNRUN_GRACE_TICKS &&
+		     !CheckIO((struct IORequest *)req); spin++)
+	Delay(2);				/* ~40 ms per turn */
+    }
+
+    if (!CheckIO((struct IORequest *)req)) {
+      log(LOG_ERR, "%s: driver will not return a request on teardown -- leaving it "
+	  "and its buffers allocated rather than waiting for ever\n", ssc->ss_name);
+      /*
+       * CUT IT LOOSE PROPERLY. Leaving the request allocated is not enough: it still
+       * carries ioip_if, a pointer to the softc that sana_remove_interface() is about
+       * to bsd_free(), and ioip_dispatch, a function pointer. Its reply port is the
+       * SHARED SanaPort, so if the driver ever does answer, sana_poll() picks the
+       * message up on behalf of some OTHER live interface and, before it checks
+       * anything, does get_time(&io->ioip_if->ss_if.if_lastchange) and then calls
+       * through ioip_dispatch -- a write into freed memory followed by a jump through
+       * whatever now occupies it. With no MMU that is not a crash you get to debug.
+       *
+       * sana_doio_bounded() solves the same problem by neutralising its reply port,
+       * but it can only do that because its port is private to one call; SanaPort is
+       * shared with every interface on the machine and must keep signalling. So the
+       * REQUEST is neutralised instead, and sana_poll() skips one that has been.
+       */
+      req->ioip_if       = NULL;
+      req->ioip_dispatch = NULL;
+      continue;
+    }
+
+    WaitIO((struct IORequest *)req);		/* it is complete; this cannot block */
     /* Free the mbufs this request still holds. The normal completion path
      * (sana_read()/free_written_packet()) frees these, but teardown bypasses it,
      * so a posted read leaks ioip_reserved and an in-flight write leaks ioip_packet.
@@ -1316,7 +2168,7 @@ sana_send_read(struct sana_softc *ssc, WORD count, ULONG type, ULONG mtu,
     req->ioip_s2.ios2_Req.io_Flags = flags;
     if (!ioip_alloc_mbuf(req, mtu))
       goto no_resources;
-    BeginIO((struct IORequest*)req);
+    sana_submit(req);
   }
   return i;
 
@@ -1450,6 +2302,17 @@ sana_watchdog(struct ifnet *ifp)
    * port.
    */
   Signal(SanaPort->mp_SigTask, 1L << SanaPort->mp_SigBit);
+
+  /*
+   * And, for an interface whose device went away on its own, one step of the
+   * probe that looks for it coming back. This runs while the interface is DOWN,
+   * which is the whole reason it lives here: if_slowtimo() calls a watchdog on
+   * if_timer alone and does not care about IFF_UP, and nothing but
+   * sana_remove_interface() ever stops the timer -- so this tick keeps arriving
+   * when every other part of the receive path has gone quiet.
+   */
+  sana_probe_step(ssc);
+
   ssc->ss_if.if_timer = 1;		/* keep firing every if_slowtimo tick */
   return 0;
 }
@@ -1496,6 +2359,277 @@ AbortSanaIO(struct IORequest *ioRequest)
 #endif
 
 /*
+ * ---------------------------------------------------------------------------
+ * The watchdog probe: noticing a device that came back without saying so.
+ * ---------------------------------------------------------------------------
+ *
+ * When a SANA-II device drops out from under a live interface -- a cable pulled,
+ * a WiFi radio de-associating -- we find out because the pending CMD_READs
+ * complete with S2ERR_OUTOFSERVICE (sana_read). We then ask to be told when it
+ * returns, with S2_ONEVENT, and sana_online() puts the interface back together.
+ *
+ * That is the only mechanism there was, and it fails two ways. A driver may
+ * refuse S2_ONEVENT outright (handled: ss_noevents). Worse, a driver may ACCEPT
+ * S2_ONEVENT and then never complete it, even though the hardware is back --
+ * which is silent, indistinguishable from a device that really is still gone, and
+ * is the reported behaviour on real hardware. Neither event handling nor better
+ * event masks can fix a driver that never posts the event, so we have to go and
+ * look for ourselves.
+ *
+ * WHAT WE LOOK WITH. The SANA-II specification, S2_OFFLINE, NOTES:
+ *
+ *     While the interface is offline, all read, writes and any other command
+ *     that touches interface hardware will be rejected with ios2_Error set to
+ *     S2ERR_OUTOFSERVICE.
+ *
+ * So a CMD_READ is a hardware-touching command: rejected while the device is
+ * offline, accepted while it is online. That makes an ordinary read the probe,
+ * with no side effects and nothing special asked of the driver.
+ *
+ * WHAT WE DELIBERATELY DO NOT DO. We never send S2_ONLINE to find out. S2_ONLINE
+ * is a command, not a question -- the spec has it reinitialise the hardware and
+ * reset the unit's statistics -- so using it as a probe would both destroy
+ * counters and force back up a device somebody else may have offlined on purpose.
+ * S2_ONLINE is sent only when an operator asks for it, from the IFC_State
+ * SM_Online path. Nor do we probe with S2_GETGLOBALSTATS, S2_DEVICEQUERY or
+ * S2_GETSTATIONADDRESS: those can be answered from software or cached state, so
+ * they are not required to fail while offline and prove nothing.
+ *
+ * THE VERDICT IS ONLY EVER DECLARED WITH THE REQUEST IN HAND. The tempting
+ * shortcut -- "the read has not been rejected in five seconds, so the device must
+ * be back" -- decides while the very request that constitutes the evidence is
+ * still outstanding on the driver, and that is what makes it wrong: the same
+ * request may simultaneously be being aborted by an operator taking the interface
+ * down, so the interface gets resurrected seconds after somebody deliberately
+ * downed it. Instead the timeout ABORTS the probe, and the verdict is reached in
+ * sana_probe_read() where the request has actually come back:
+ *
+ *     completed, io_Error == 0            a frame arrived: the device is carrying
+ *                                         traffic. Online.
+ *     completed IOERR_ABORTED, by US      the driver held our read for a full
+ *                                         interval rather than rejecting it, and
+ *                                         gave it back when asked. Online.
+ *     completed S2ERR_OUTOFSERVICE        still offline. Wait and probe again.
+ *     completed IOERR_ABORTED, not by us  something else is taking this interface
+ *                                         down. Not our business; do nothing.
+ *
+ * Only an interface with ss_wantback set is probed at all, and that flag is set
+ * in exactly one place: sana_read()'s S2ERR_OUTOFSERVICE branch, which is reached
+ * only while IFF_UP is still set -- i.e. the device went away without being asked.
+ * An operator-requested offline clears IFF_UP before the device is offlined, so it
+ * never sets the flag, and sana_down() clears the flag outright. An interface that
+ * was put down on purpose is never brought back up by this code.
+ */
+
+/*
+ * Post one probe read. Returns 1 if it went to the driver, 0 if there was no free
+ * request or no mbuf to receive into -- in which case the caller simply tries
+ * again on the next tick. MUST be called at splimp().
+ */
+static int
+sana_post_probe(struct sana_softc *ssc)
+{
+  struct IOIPReq *req;
+
+  if (!(req = (struct IOIPReq *)RemHead((struct List *)&ssc->ss_freereq)))
+    return 0;
+
+  req->ioip_dispatch		 = sana_probe_read;
+  req->ioip_s2.ios2_PacketType	 = ssc->ss_ip.type;
+  req->ioip_Command		 = CMD_READ;
+  req->ioip_s2.ios2_Req.io_Flags = 0;
+
+  if (!ioip_alloc_mbuf(req, ssc->ss_if.if_mtu)) {
+    req->ioip_dispatch = NULL;
+    AddHead((struct List *)&ssc->ss_freereq, (struct Node *)req);
+    return 0;
+  }
+
+  ssc->ss_probe_req   = req;
+  ssc->ss_probing     = 1;
+  ssc->ss_probe_abort = 0;
+  sana_submit(req);
+  return 1;
+}
+
+/*
+ * One tick of the probe state machine, driven by sana_watchdog(). Runs at
+ * splimp() (if_slowtimo holds it across the whole interface walk).
+ */
+static void
+sana_probe_step(struct sana_softc *ssc)
+{
+  if (!ssc->ss_wantback || ssc->ss_removing ||
+      (ssc->ss_if.if_flags & IFF_UP))
+    return;
+
+  if (ssc->ss_probe_wait) {
+    ssc->ss_probe_wait--;
+    return;
+  }
+
+  if (!ssc->ss_probing) {
+    if (sana_post_probe(ssc))
+      ssc->ss_probe_wait = NG_PROBE_SECS;
+    return;				/* no resources: retry on the next tick */
+  }
+
+  if (!ssc->ss_probe_abort) {
+    /*
+     * The read has been with the driver for a full interval without being
+     * rejected. Ask for it back; whether and how it returns is the answer.
+     */
+    ssc->ss_probe_abort = 1;
+    ssc->ss_probe_wait  = NG_PROBE_ABORT_SECS;
+    AbortSanaIO((struct IORequest *)ssc->ss_probe_req);
+    return;
+  }
+
+  /*
+   * The driver was asked for the request back and has not returned it. There is
+   * no further evidence to gather and nothing safe to assume: guessing "online"
+   * here would bring the interface up over a device that may be dead, and
+   * guessing "offline" would leak the request on every cycle. Say so once -- a
+   * driver that ignores AbortIO breaks interface teardown too, so this names a
+   * real fault rather than hiding it -- and stop probing this interface.
+   */
+  if (!ssc->ss_probe_stuck) {
+    ssc->ss_probe_stuck = 1;
+    log(LOG_ERR, "%s: driver did not return an aborted read, so whether its "
+	"device is back cannot be told\n", ssc->ss_name);
+  }
+
+  /*
+   * Keep asking, rather than giving up for good. A wedged driver may come back to
+   * itself -- and returning that request is the only thing that lets the probe
+   * resume, so a one-shot complaint would leave the interface permanently stuck
+   * AND permanently one request short. Do NOT post a fresh probe instead: the
+   * request pool is finite and a driver that swallowed one read will swallow
+   * every one it is given. One AbortIO per interval is cheap.
+   */
+  ssc->ss_probe_wait = NG_PROBE_SECS;
+  AbortSanaIO((struct IORequest *)ssc->ss_probe_req);
+}
+
+/*
+ * A probe read came back. This is the ONLY place the probe declares a verdict,
+ * and it has the request in hand when it does. Called from sana_poll().
+ */
+static void
+sana_probe_read(struct sana_softc *ssc, struct IOIPReq *req)
+{
+  spl_t s = splimp();
+  LONG  err	   = req->ioip_Error;
+  UBYTE weaborted  = ssc->ss_probe_abort;
+
+  /*
+   * Retire the request. Both mbuf fields can be set at once -- the driver copies
+   * a frame into ioip_packet and leaves whatever it did not need on
+   * ioip_reserved -- and m_freem(NULL) is a no-op, so free both unconditionally.
+   */
+  m_freem(req->ioip_packet);
+  req->ioip_packet = NULL;
+  m_freem(req->ioip_reserved);
+  req->ioip_reserved = NULL;
+  req->ioip_dispatch = NULL;
+  AddHead((struct List *)&ssc->ss_freereq, (struct Node *)req);
+
+  if (ssc->ss_probe_req == req) {
+    ssc->ss_probe_req	= NULL;
+    ssc->ss_probing	= 0;
+    ssc->ss_probe_abort = 0;
+    ssc->ss_probe_stuck = 0;
+    ssc->ss_probe_wait	= NG_PROBE_SECS;	/* pace the next probe */
+  }
+  splx(s);
+
+  /*
+   * IOERR_ABORTED counts only if WE asked for it back. sana_down() aborts every
+   * outstanding request when an interface is taken down, and it clears
+   * ss_probe_abort in the same breath, so an abort that came from there cannot
+   * be read as the device announcing itself.
+   */
+  if (err == 0)
+    sana_back_online(ssc, "watchdog probe: its driver delivered a frame");
+  else if (err == IOERR_ABORTED && weaborted)
+    sana_back_online(ssc, "watchdog probe: its driver accepted a read");
+}
+
+/*
+ * The device is usable again: put the interface back. Shared by the S2_ONEVENT
+ * path (sana_online) and the watchdog probe, so the two cannot drift apart.
+ *
+ * Guarded and idempotent, which is the point of it being one function. Both
+ * routes can reach here for the same return -- a driver that posts its event
+ * just as a probe wins -- and doing this work twice means a second sana_up() and,
+ * far worse, a second ss_reconfig: sana_reconfig_poll() leaves ss_reconfig set
+ * when a reconfigure is already running, so the duplicate is not dropped, it is
+ * merely deferred into a second DHCP client for the same interface. ss_wantback
+ * is the interlock: the first caller through clears it and the second finds
+ * nothing to do.
+ *
+ * Does NOT send S2_ONLINE. Whoever got here did so by watching the device accept
+ * work, so it is already online; and if it were not, forcing it would override an
+ * operator who offlined it on purpose.
+ */
+static void
+sana_back_online(struct sana_softc *ssc, const char *how)
+{
+  spl_t s = splimp();
+
+  if (!ssc->ss_wantback || ssc->ss_removing) {
+    splx(s);
+    return;
+  }
+
+  /*
+   * Reclaim the LOSER. Two watchers can be armed at once -- the S2_ONEVENT armed
+   * when the device dropped, and the probe read posted a few seconds later -- and
+   * whichever gets here first ends the watch for both. The probe read must be
+   * asked back explicitly, because nothing else will ever look at it again:
+   * sana_probe_step() returns immediately once ss_wantback is clear, so a probe
+   * left outstanding here stays outstanding until the interface is torn down,
+   * holding a request out of a finite pool and swallowing the next frame that
+   * arrives on it.
+   *
+   * (When the PROBE is the winner this is a no-op -- sana_probe_read() has already
+   * cleared ss_probing and has the request in hand. The reverse case, an
+   * S2_ONEVENT left armed after the probe won, needs nothing: any driver that
+   * completes events at all will complete it on this very transition, and
+   * sana_online() retires it properly. A driver that never completes it was never
+   * going to return it whatever we did -- that is the fault being worked around.)
+   */
+  if (ssc->ss_probing && ssc->ss_probe_req != NULL)
+    AbortSanaIO((struct IORequest *)ssc->ss_probe_req);
+
+  ssc->ss_wantback    = 0;
+  ssc->ss_probing     = 0;
+  ssc->ss_probe_abort = 0;
+  ssc->ss_probe_stuck = 0;
+  ssc->ss_probe_wait  = 0;
+  ssc->ss_eventfails  = 0;		/* it answered: forget earlier refusals */
+  splx(s);
+
+  /*
+   * Say WHICH mechanism found the device, because on a machine that is misbehaving
+   * that is the useful half of the message. "the driver said so" and "we had to go
+   * and look, because the driver never said anything" describe two very different
+   * systems, and telling them apart from the log is otherwise impossible.
+   */
+  log(LOG_NOTICE, "%s is online again (%s).\n", ssc->ss_name, how);
+  sana_up(ssc);
+  /*
+   * sana_up() only re-raises the DEVICE. Everything that made this a usable
+   * interface -- address, net mask, default route, name servers -- was scrubbed
+   * when it went offline, so without this the interface comes back unnumbered and
+   * silent. Ask sana_poll() to configure it again; not here, because this may run
+   * in the IO completion path and reconfiguration takes semaphores, opens sockets
+   * and may spawn the DHCP client.
+   */
+  ssc->ss_reconfig = 1;
+}
+
+/*
  * sana_down(): Mark interface as down, abort all pending requests
  */
 static BOOL
@@ -1510,6 +2644,27 @@ sana_down(struct sana_softc *ssc)
    * which frees the tag AND its chained real packet. Idempotent: a no-op if the
    * offline path already flushed via if_down(). */
   if_qflush(&ssc->ss_if.if_snd);
+
+  /*
+   * Stop watching for the device's return, NOW, synchronously, before a single
+   * request is aborted.
+   *
+   * This is what keeps an operator's decision from being undone. sana_down() is
+   * the one choke point every deliberate down goes through, and the abort below
+   * is asynchronous -- it returns long before the driver replies. Leaving
+   * ss_wantback set until those replies were processed would leave a window in
+   * which the watchdog still believes it is chasing a device that vanished on its
+   * own, and an interface an operator has just taken down could be brought back
+   * up, with a fresh DHCP lease, seconds later. Clearing it here closes the window
+   * completely: if_slowtimo() runs the watchdog under the same splimp()/Forbid
+   * this holds, so the next tick cannot see a half-updated state.
+   */
+  ssc->ss_wantback    = 0;
+  ssc->ss_probing     = 0;
+  ssc->ss_probe_abort = 0;
+  ssc->ss_probe_stuck = 0;
+  ssc->ss_probe_wait  = 0;
+  ssc->ss_probe_req   = NULL;
 
   /* Completed, Remove()'d requests are not aborted */
   while (req) {
@@ -1587,16 +2742,41 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
        * defer it to sana_poll(), which runs in the network task. */
       ssc->ss_offcleanup = 1;
 
+      /*
+       * This branch is reached ONLY with IFF_UP still set, which is precisely
+       * what makes it the involuntary case: an operator-requested offline clears
+       * IFF_UP first and so never lands here. So this, and only this, is where we
+       * take on the job of watching for the device to come back -- see the probe
+       * block comment above sana_post_probe(). The watchdog is (re-)armed
+       * explicitly because the probe is driven by it and by nothing else.
+       */
+      ssc->ss_wantback	     = 1;
+      ssc->ss_probe_stuck    = 0;
+      ssc->ss_probe_wait     = NG_PROBE_SECS;	/* settle first; do not probe instantly */
+      ssc->ss_if.if_watchdog = sana_watchdog;
+      ssc->ss_if.if_timer    = 1;
+
       /* Free mbufs allocated for packet */
       m_freem(req->ioip_reserved);
       req->ioip_reserved = NULL;
 
-      /* Order an notify when driver is put back online */
-      ssc->ss_eventsent++;
-      req->ioip_s2.ios2_Req.io_Command = S2_ONEVENT;
-      req->ioip_s2.ios2_WireError = S2EVENT_ONLINE;
-      req->ioip_dispatch = sana_online;
-      BeginIO((struct IORequest*)req);
+      /*
+       * Ask to be told when the driver comes back -- unless we already learned it
+       * cannot tell us. ss_noevents is remembered across cycles on purpose: a
+       * driver that refused S2_ONEVENT once will refuse it every time, and a
+       * flapping link would otherwise replay the whole wide-then-narrow-then-give-up
+       * negotiation, with its log line, on every single drop.
+       */
+      if (ssc->ss_noevents) {
+	req->ioip_dispatch = NULL;	/* nothing will ever complete it */
+	AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
+      } else {
+	ssc->ss_eventsent++;
+	req->ioip_s2.ios2_Req.io_Command = S2_ONEVENT;
+	req->ioip_s2.ios2_WireError = NG_S2_BACK_EVENTS;
+	req->ioip_dispatch = sana_online;
+	sana_submit(req);
+      }
       req = NULL;
     }
     ssc->ss_if.if_flags &= ~IFF_UP;
@@ -1617,7 +2797,7 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
     /* Return request to the Sana-II driver */
     if (ioip_alloc_mbuf(req, mtu)) {
       req->ioip_s2.ios2_Req.io_Flags = flags;
-      BeginIO((struct IORequest*)req); 
+      sana_submit(req);
       splx(s);
       return m;
     }
@@ -1765,21 +2945,69 @@ sana_online(struct sana_softc *ssc, struct IOIPReq *req)
   LONG events = req->ioip_s2.ios2_WireError;
 
   if (req->ioip_s2.ios2_Req.io_Error == 0 &&
-      events & S2EVENT_ONLINE) {
+      (events & NG_S2_BACK_EVENTS)) {
     ssc->ss_eventsent--;
     req->ioip_dispatch = NULL;
     AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
-    log(LOG_NOTICE, "%s is online again.", ssc->ss_name);
-    sana_up(ssc);
+    /*
+     * Retiring the request is this path's own business and is done above,
+     * unconditionally, so the accounting balances whatever happens next. Putting
+     * the INTERFACE back is shared with the watchdog probe, and is guarded: if a
+     * probe already won the race for this same return, or an operator has taken
+     * the interface down since, sana_back_online() does nothing.
+     */
+    sana_back_online(ssc, "reported by its driver");
     return;
   }
 
-  /* An error? */
-  if (debug_sana && req->ioip_Error != IOERR_ABORTED) { 
-    sana2perror("sana_online", (struct IOSana2Req *)req);
+  /*
+   * An error, or an event we did not ask for.
+   *
+   * Re-arming is RECOVERY, so it must not depend on a debug setting -- with
+   * DEBUG_SANA off this used to fall straight through to the abort branch, drop
+   * the request and leave the interface with nothing watching for its device
+   * ever again. Only the LOGGING is debug-gated now.
+   *
+   * A driver that will not accept the wider mask (S2ERR_NOT_SUPPORTED, or no
+   * S2_ONEVENT at all) is told apart here: retry once with ONLINE alone, and if
+   * even that is refused give up on events for this interface and let the
+   * watchdog probe find the device instead.
+   */
+  if (req->ioip_Error != IOERR_ABORTED) {
+    if (debug_sana)
+      sana2perror("sana_online", (struct IOSana2Req *)req);
+    if (req->ioip_s2.ios2_Req.io_Error == S2ERR_NOT_SUPPORTED ||
+	req->ioip_s2.ios2_Req.io_Error == IOERR_NOCMD) {
+      if (ssc->ss_noevents) {		/* already tried the narrow mask: give up */
+	ssc->ss_eventsent--;
+	req->ioip_dispatch = NULL;
+	AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
+	log(LOG_NOTICE, "%s: driver reports no online events; watching for its "
+	    "return instead", ssc->ss_name);
+	return;
+      }
+      ssc->ss_noevents = 1;		/* fall back to the narrow mask once */
+      req->ioip_s2.ios2_WireError = S2EVENT_ONLINE;
+    } else if (++ssc->ss_eventfails > NG_S2_EVENT_MAXFAIL) {
+      /*
+       * A driver answering S2_ONEVENT with the same error immediately, for ever,
+       * would have us re-arm just as fast -- on the shared network task, which
+       * every interface depends on. Re-arming used to be gated behind debug_sana
+       * (so with logging off the request was silently dropped instead); ungating
+       * it fixed the leak but made an unbounded retry the default. Bound it.
+       */
+      ssc->ss_eventsent--;
+      ssc->ss_noevents = 1;		/* stop asking on later cycles too */
+      req->ioip_dispatch = NULL;
+      AddHead((struct List*)&ssc->ss_freereq, (struct Node*)req);
+      log(LOG_NOTICE, "%s: driver keeps refusing online events; watching for its "
+	  "return instead", ssc->ss_name);
+      return;
+    } else {
+      req->ioip_s2.ios2_WireError = NG_S2_BACK_EVENTS;
+    }
     req->ioip_s2.ios2_Req.io_Command = S2_ONEVENT;
-    req->ioip_s2.ios2_WireError = S2EVENT_ONLINE;
-    BeginIO((struct IORequest*)req);
+    sana_submit(req);
   } else {
     /* Aborted -- probably because "ifconfig xxx/0 down" */
     ssc->ss_eventsent--;
@@ -2129,7 +3357,7 @@ sana_start(struct sana_softc *ssc)
     req->ioip_packet   = m;
     req->ioip_s2.ios2_DataLength = m->m_pkthdr.len;
 
-    BeginIO((struct IORequest*)req);
+    sana_submit(req);
 
     ifp->if_obytes += m->m_pkthdr.len;
     if (m->m_flags & M_BCAST)

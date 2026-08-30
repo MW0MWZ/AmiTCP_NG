@@ -107,6 +107,13 @@ RCS_ID_C="$Id: sana2copybuff.c,v 1.15 1993/12/20 18:06:41 jraja Exp $";
 
 #include <net/if_sana.h>
 #include <api/amiga_raf.h>
+/* Payload copies use ng_bcopy_dev(): CopyMemQuick when both ends are longword
+ * aligned, CopyMem otherwise. NOT ng_bcopy() -- that adds a MOVE16 path, and these
+ * buffers are driver-owned memory whose caching and bus behaviour we do not know. */
+
+#if NG_RX_CSUM
+#include <netinet/in_cksum_copy_protos.h>
+#endif
 
 /*
  * allocate mbufs for the size MTU at free_chain for read request
@@ -282,13 +289,145 @@ static BOOL copy_from_mbuf_body(to, from, n)
       return FALSE;
     }
     count = MIN(m->m_len, n);
-    bcopy(mtod(m, caddr_t), to, count);
+    ng_bcopy_dev(mtod(m, caddr_t), to, count);
     n -= count;
     to += count;
     m = m->m_next;
   }
   return TRUE;
 }
+
+#if NG_RX_CSUM
+/*
+ * Fuse the receive copy with the Internet checksum.
+ *
+ * The driver hands us a whole frame; today we copy it into mbufs and something later
+ * reads every byte back to checksum it. Accumulating the sum DURING the copy removes
+ * that second pass. Two things make it tractable, and both are easy to get wrong:
+ *
+ * WE NEVER SUM THE IP HEADER. Only [hlen, ip_len) goes into the accumulator, so what
+ * lands in the mbuf is a TRANSPORT-ONLY sum from the moment it exists. Nothing has to
+ * subtract the header later -- an earlier design tried that and could not work, because
+ * by the time tcp_input runs, ipintr has overwritten ip_sum and built the pseudo-header
+ * over the bytes it would have needed. Excluding the header also makes
+ * ip_stripoptions() irrelevant (it relocates transport bytes without changing them, and
+ * hlen is always a multiple of 4 so the summed region's start parity never moves), and
+ * bounding at ip_len rather than the frame length drops any link-layer padding.
+ *
+ * THE HEADER IS PARSED BYTE BY BYTE. This runs at DEVICE INTERRUPT time on untrusted
+ * wire data with no MMU. A `struct ip *` cast would read u_shorts, which faults on a
+ * 68000 if the driver ever hands us an odd buffer -- measured hardware always gives an
+ * aligned one, but "always" is not a guarantee worth an Address Error at interrupt
+ * level. Byte reads are also explicit about network byte order.
+ */
+static int
+ng_rx_csum_parse(from, n, phlen, piplen)
+     const BYTE      *from;
+     ULONG            n;
+     ULONG           *phlen;
+     ULONG           *piplen;
+{
+  register const u_char *p = (const u_char *)from;
+  ULONG hlen, iplen, frag;
+
+  if (n < (ULONG)sizeof (struct ip))
+    return 0;
+  if ((p[0] >> 4) != IPVERSION)
+    return 0;
+
+  hlen = (ULONG)(p[0] & 0x0f) << 2;		/* ip_hl counts 32-bit words */
+  if (hlen < (ULONG)sizeof (struct ip) || hlen > n)
+    return 0;
+
+  /*
+   * ip_len. Read as two bytes rather than through the struct: the field is a SIGNED
+   * short on the wire (netinet/ip.h says so deliberately), and this tree has twice
+   * been bitten by sign-extension on wire values. Assembling it from bytes into a
+   * ULONG cannot be negative, and the `iplen > n` bound below is what makes any
+   * oversized value harmless -- that check is load-bearing, not decoration.
+   */
+  iplen = ((ULONG)p[2] << 8) | (ULONG)p[3];
+  if (iplen < hlen || iplen > n)
+    return 0;
+
+  /*
+   * Fragments are excluded outright: reassembly does mbuf surgery, and combining
+   * partial sums across it is a separate project. 0x2000 is MF, 0x1fff the offset;
+   * DF (0x4000) is fine.
+   */
+  frag = ((ULONG)p[6] << 8) | (ULONG)p[7];
+  if (frag & 0x3fff)
+    return 0;
+
+  *phlen  = hlen;
+  *piplen = iplen;
+  return 1;
+}
+
+/*
+ * Copy ONE destination chunk, summing only the part of it that falls inside
+ * [hlen, iplen). `off` is this chunk's offset within the frame.
+ *
+ * ALWAYS performs the whole copy. The return value says only whether the SUM is still
+ * trustworthy -- so a chunk that cannot take the fused path still gets copied
+ * correctly, and the caller simply declines to publish the checksum.
+ *
+ * The caller must have already truncated `len` to the bytes that really exist. Slicing
+ * a chunk against its allocated CAPACITY instead of its truncated length would read
+ * past the end of the driver's buffer -- on a short frame in a 96-byte chunk that is
+ * dozens of bytes of whatever sits next to it in the driver's DMA memory, copied into
+ * an mbuf and handed onward.
+ */
+static int
+ng_rx_csum_chunk(src, dst, len, off, hlen, iplen, csum, odd)
+     const BYTE      *src;
+     BYTE            *dst;
+     ULONG            len;
+     ULONG            off;
+     ULONG            hlen;
+     ULONG            iplen;
+     u_long          *csum;
+     int             *odd;
+{
+  ULONG end = off + len;
+  ULONG b_beg, b_end;
+  ULONG a_len, b_len;
+  int   ok = 1;
+
+  /* The summed slice of this chunk, in frame coordinates. Either side may be empty. */
+  b_beg = (off  > hlen)  ? off  : hlen;
+  b_end = (end  < iplen) ? end  : iplen;
+
+  if (b_end <= b_beg) {			/* nothing of this chunk is summed */
+    ng_bcopy_dev(src, dst, len);
+    return 1;
+  }
+
+  a_len = b_beg - off;			/* header bytes, or padding before... n/a */
+  b_len = b_end - b_beg;
+
+  if (a_len)				/* below hlen: copied, never summed */
+    ng_bcopy_dev(src, dst, a_len);
+
+  /*
+   * The fused primitive needs both pointers EVEN -- the 68000 traps on odd addresses
+   * only, so that is the whole requirement (mod-4 is a 68020+ speed matter, not a
+   * correctness one). Measured hardware satisfies it on every frame; if it ever does
+   * not, copy plainly and drop the checksum rather than risk an Address Error.
+   */
+  if ((((ULONG)(src + a_len) | (ULONG)(dst + a_len)) & 1) == 0) {
+    *csum = in_cksum_copy_asm(src + a_len, dst + a_len, b_len, *csum, odd);
+  } else {
+    ng_bcopy_dev(src + a_len, dst + a_len, b_len);
+    ok = 0;				/* copy is fine; the sum is not */
+  }
+
+  if (end > b_end)			/* at/after iplen: padding, never summed */
+    ng_bcopy_dev(src + (b_end - off), dst + (b_end - off), end - b_end);
+
+  return ok;
+}
+#endif /* NG_RX_CSUM */
 
 /*
  * Copy data from an continuous buffer 'from' to preallocated mbuf chain
@@ -306,6 +445,16 @@ static BOOL copy_to_mbuf_body(to, from, n)
 {
   register struct mbuf *f, *m = to->ioip_reserved;
   unsigned totlen = n;
+#if NG_RX_CSUM
+#if NG_RX_CSUM_VERIFY
+  const BYTE *from0 = from;		/* the frame start, kept for the verify pass */
+#endif
+  ULONG   hlen = 0, iplen = 0;		/* the summed region, [hlen, iplen)          */
+  ULONG   off  = 0;			/* this chunk's offset within the frame      */
+  u_long  csum = 0;
+  int     codd = 0;			/* cross-chunk parity, threaded by the asm   */
+  int     fused;
+#endif
 
   to->ioip_if->ss_copyin++;		/* SANA2CopyStats: byte CopyToBuff (RX) */
 
@@ -327,6 +476,12 @@ static BOOL copy_to_mbuf_body(to, from, n)
   }
 #endif
 
+#if NG_RX_CSUM
+  /* Decided once, before a single byte moves. A frame we cannot parse simply gets
+   * copied exactly as it always was, with no checksum published. */
+  fused = ng_rx_csum_parse(from, n, &hlen, &iplen);
+#endif
+
   while (n > 0) {
     /*
      * PORT (AmiTCP_NG) security fix: as in m_copy_from_mbuf, this guard MUST be
@@ -346,11 +501,30 @@ static BOOL copy_to_mbuf_body(to, from, n)
 #endif
       return FALSE;
     }
+    /*
+     * Truncate to what really exists BEFORE anything slices this chunk up. The
+     * fused path carves three sub-ranges out of m_len, so a stale full-capacity
+     * m_len here would make it read past the end of the driver's buffer.
+     */
     if (n < m->m_len)
       m->m_len = n;
-    bcopy(from, mtod(m, caddr_t), m->m_len);
+#if NG_RX_CSUM
+    if (fused) {
+      fused = ng_rx_csum_chunk(from, mtod(m, caddr_t), (ULONG)m->m_len,
+			       off, hlen, iplen, &csum, &codd);
+      off += (ULONG)m->m_len;
+    } else
+#endif
+      ng_bcopy_dev(from, mtod(m, caddr_t), m->m_len);
     from += m->m_len;
     n -= m->m_len;
+    /*
+     * DELIBERATELY CONDITIONAL. `m` must be left pointing at the LAST MBUF ACTUALLY
+     * WRITTEN, because the chain is split at `m->m_next` immediately below. Advancing
+     * unconditionally here would hand the packet one extra, never-written mbuf whose
+     * m_len is still at full capacity -- an inconsistent chain, where anything walking
+     * m_next to NULL reads uninitialised cluster memory.
+     */
     if (n > 0)
       m = m->m_next;
   }
@@ -365,6 +539,66 @@ static BOOL copy_to_mbuf_body(to, from, n)
   to->ioip_packet = to->ioip_reserved;
   to->ioip_packet->m_pkthdr.len = totlen; /* set packet length */
   to->ioip_reserved = f;		/* leftover mbufs */
+
+#if NG_RX_CSUM
+  if (fused) {
+#if NG_RX_CSUM_VERIFY
+    /*
+     * TEMPORARY: prove the chunked accumulation against a flat single-pass reference
+     * over the driver's own buffer, which is still intact. Counted as well as logged --
+     * logging is compiled in but OFF unless LOGGING=ON and LOGLEVEL=7 are configured,
+     * so a validation run that forgot them would report success while checking nothing.
+     * The counter is visible regardless.
+     */
+    {
+      register const u_char *p = (const u_char *)from0;
+      register u_long ref = 0, got = csum;
+      register ULONG  i;
+
+      for (i = hlen; i + 1 < iplen; i += 2)
+	ref += ((u_long)p[i] << 8) | (u_long)p[i + 1];
+      if (i < iplen)
+	ref += (u_long)p[i] << 8;
+      while (ref >> 16)
+	ref = (ref & 0xffffUL) + (ref >> 16);
+      while (got >> 16)			/* fold, do NOT complement */
+	got = (got & 0xffffUL) + (got >> 16);
+
+      if (ref != got) {
+	register ULONG bad = ++to->ioip_if->ss_csumbad;
+
+	fused = 0;			/* never publish a sum we just disproved */
+	/*
+	 * Throttled like the success path: a systematic fault would otherwise log on
+	 * every frame at interrupt priority. The first few carry the diagnosis; the
+	 * counter carries the scale, and is readable with logging off entirely.
+	 */
+	if (bad <= 8 || (bad & 0xff) == 0)
+	  log(LOG_ERR, "rxcsum: mismatch #%lu len=%lu hlen=%lu got=%04lx want=%04lx",
+	      bad, (ULONG)iplen, (ULONG)hlen, (ULONG)got, (ULONG)ref);
+      } else {
+	/*
+	 * Say so periodically, not only on failure. A verify pass that is silent when
+	 * healthy is indistinguishable from one that never ran -- and "it didn't
+	 * complain" is exactly the evidence that should not be trusted here. Report
+	 * the FIRST one so even a two-minute run proves it executed, then thin out.
+	 */
+	register ULONG ok = ++to->ioip_if->ss_csumok;
+
+	if (ok == 1 || ok == 64 || ok == 1024 || (ok & 0xfff) == 0)
+	  log(LOG_DEBUG, "rxcsum ok=%lu bad=%lu",
+	      ok, (ULONG)to->ioip_if->ss_csumbad);
+      }
+    }
+#endif /* NG_RX_CSUM_VERIFY */
+  }
+
+  if (fused) {
+    to->ioip_packet->m_pkthdr.csum = csum;
+    to->ioip_packet->m_flags |= M_CSUM_DONE;
+  } else
+    to->ioip_packet->m_flags &= ~M_CSUM_DONE;
+#endif /* NG_RX_CSUM */
 
   /*
    * More mbuf flags and interface pointer must be set later

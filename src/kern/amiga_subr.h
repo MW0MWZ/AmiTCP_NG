@@ -57,6 +57,8 @@
  * the SANA driver-buffer copies stay on CopyMem (see ng_copy.c). Declared before the
  * __SASC/gcc split so both toolchains see it. */
 void ng_bcopy(const void *src, void *dst, long len);
+/* ng_bcopy_dev(): same, minus MOVE16 -- safe against driver-owned buffers. */
+void ng_bcopy_dev(const void *src, void *dst, long len);
 
 #if __SASC
 /*

@@ -83,6 +83,42 @@ struct tcphdr {
 	u_short	th_urp;			/* urgent pointer */
 };
 
+/*
+ * TH_SET_OFF() -- write the data-offset nibble as a BYTE.
+ *
+ * th_off:4 and th_x2:4 share one byte, so assigning th_off on its own is a
+ * bitfield access: at -m68020 and above that is a literal BFINS into MEMORY on
+ * the transmit path and a BFEXTU from memory on the receive path, once per TCP
+ * segment. The 68000 build cannot encode either and gets ordinary byte work --
+ * which is how the "tuned" archives ended up doing MORE per packet than the
+ * plain one. Same reasoning, and same fix, as IP_SET_VHL in netinet/ip.h.
+ *
+ * Writing the whole byte also zeroes th_x2, which is correct: RFC 793 reserves
+ * those bits and requires them to be zero, this stack never reads the field, and
+ * the only code that touched it set it to 0 explicitly anyway.
+ *
+ * The byte is addressed as "the one immediately before th_flags" rather than by
+ * a hardcoded offset, so it stays anchored to a real member if the header is
+ * ever re-ordered. `hl` is a length in BYTES, converted to words here, so call
+ * sites read the way the RFC does.
+ *
+ * WRITES ONLY, and that is not an oversight. A matching TH_GET_OFF was tried and
+ * removed: reading the nibble as a byte and shifting it produces IDENTICAL code,
+ * because "extract the top four bits" is exactly what BFEXTU means and gcc
+ * canonicalises it straight back. Reads are also the cheaper direction -- BFEXTU
+ * is a read, where BFINS is a read-modify-write. Do not re-add a getter
+ * expecting a gain; measure first, as this did.
+ */
+#if BYTE_ORDER == BIG_ENDIAN
+#define	TH_SET_OFF(th, hl) \
+	(*((u_char *)&(th)->th_flags - 1) = (u_char)((((hl) >> 2) & 0x0f) << 4))
+#else
+/* Little-endian puts the nibbles the other way up; this stack never builds for
+ * it, so keep the plain assignments rather than encode a second layout. */
+#define	TH_SET_OFF(th, hl) \
+	do { (th)->th_off = (u_char)(((hl) >> 2) & 0x0f); (th)->th_x2 = 0; } while (0)
+#endif
+
 #define	TCPOPT_EOL	0
 #define	TCPOPT_NOP	1
 #define	TCPOPT_MAXSEG	2

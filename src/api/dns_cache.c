@@ -148,6 +148,43 @@ ng_dnscache_init(void)
   dns_ready = 1;
 }
 
+/*
+ * Discard every cached answer.
+ *
+ * Called whenever the set of name servers changes -- one added, one removed, an
+ * interface withdrawing the servers it supplied, or an ARexx RESET reloading the
+ * database. The cache is keyed on the QUESTION only, never on which server
+ * answered it, so an entry outlives the resolver that produced it; and the whole
+ * reason the server set changed is usually that the machine is now on a
+ * different network, where the same name legitimately resolves to a different
+ * address. Split-horizon DNS makes that routine rather than exotic: a laptop
+ * moving between home and office gets different answers for the same names from
+ * each site's resolver.
+ *
+ * Entries expire on their own TTL, so this is not needed for correctness of a
+ * steady-state cache -- it exists because a TTL measures how long the ANSWER is
+ * good for, not how long the RESOLVER that gave it is the right one to ask.
+ * Waiting out a TTL of up to an hour after changing networks would look exactly
+ * like a broken stack.
+ *
+ * Flushing the lot rather than only the affected entries is deliberate: nothing
+ * records which server an entry came from, and a cache this small (8-128 entries)
+ * refills in a few queries. Cheap to do, and cheap to be wrong about.
+ */
+void
+ng_dnscache_flush(void)
+{
+  int i;
+
+  if (!dns_ready || dns_tab == NULL)
+    return;
+
+  ObtainSemaphore(&dns_lock);
+  for (i = 0; i < dns_tab_n; i++)
+    ent_clear(&dns_tab[i]);
+  ReleaseSemaphore(&dns_lock);
+}
+
 struct hostent *
 ng_dnscache_get(struct SocketBase *libPtr, const char *name, int type, int *neg)
 {

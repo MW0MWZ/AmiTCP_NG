@@ -283,10 +283,19 @@ if_attach(ifp)
  */
 
 /*
- * Find an interface address suitable for host id. If no suitable interface
- * address is found, the *id is not touched.
+ * Find an interface address suitable for host id.
  *
- * This routine stops after the first non-loopback AF_INET address is found.
+ * *id IS ALWAYS WRITTEN: the address on success, 0 when there is no suitable
+ * one. This used to say "the *id is not touched" if nothing was found, and that
+ * is no longer true -- a caller that pre-loaded *id with a fallback and expected
+ * a miss to leave it alone would now have it cleared. Said plainly here because
+ * the old wording invited exactly that assumption.
+ *
+ * Loopback does not count and neither does INADDR_ANY: an interface can be
+ * IFF_UP before it has been configured, and stopping at it would hide a good
+ * address further down the list.
+ *
+ * This routine stops after the first usable non-loopback AF_INET address.
  *
  * This routine is specially made for the gethostid() system call.
  */
@@ -298,15 +307,39 @@ findid(unsigned long *id)
 
   spl_t s = splimp();
 
-  for (ifp = ifnet; ifp; ifp = ifp->if_next)
-    if (ifp->if_flags & IFF_UP)
-      for (ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next)
-	if (ifa->ifa_addr->sa_family == AF_INET) {
-	  *id = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
-	  if (!(ifp->if_flags & IFF_LOOPBACK))
-	    goto ret;
+  /*
+   * PORT (AmiTCP_NG): the loopback address is NOT this host's address, and
+   * "no interface is up" must report no address at all rather than 127.0.0.1.
+   *
+   * The original preferred a non-loopback address but ASSIGNED whatever it
+   * found first, so a machine whose only live interface was lo0 -- exactly what
+   * NetShutdown leaves behind -- still handed out 127.0.0.1. Every application
+   * that decides "am I online?" by asking for the host address then concluded
+   * it was, which is issue #4: Roadshow gives you a socket but no address after
+   * NetShutdown, and we gave both.
+   *
+   * An address of 0.0.0.0 is skipped rather than accepted: an interface can be
+   * IFF_UP before it has been configured, and stopping there would hide a
+   * perfectly good address on an interface later in the list.
+   */
+  *id = 0;
+
+  for (ifp = ifnet; ifp; ifp = ifp->if_next) {
+    if ((ifp->if_flags & IFF_UP) == 0)
+      continue;
+    if (ifp->if_flags & IFF_LOOPBACK)
+      continue;
+    for (ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next)
+      if (ifa->ifa_addr->sa_family == AF_INET) {
+	unsigned long a = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
+	if (a != INADDR_ANY) {
+	  *id = a;
+	  splx(s);
+	  return;
 	}
- ret:
+      }
+  }
+
   splx(s);
 }
 
@@ -317,6 +350,22 @@ ifa_ifwithaddr(addr)
 {
 	register struct ifnet *ifp;
 	register struct ifaddr *ifa;
+
+	/*
+	 * PORT (AmiTCP_NG): same guard as ifa_ifwithnet()/ifaof_ifpforaddr() below,
+	 * and reachable by the same dead-today route_output() RTM_CHANGE chain
+	 * (ifa_ifwithroute -> ifa_ifwithaddr(gateway) with a NULL gateway).
+	 *
+	 * WORTH MORE ATTENTION THAN ITS SIBLINGS if a wild read ever needs chasing:
+	 * this one's first touch of a NULL is `equal(addr, ...)`, which reads
+	 * ((struct sockaddr *)addr)->sa_len -- OFFSET 0 -- and then bcmp()s from
+	 * there. That faults at address 0 exactly, which is the signature an Enforcer
+	 * report of "BYTE-READ from 00000000" describes. The sa_family tests in the
+	 * other three fault at address 1 instead, so they cannot produce that report.
+	 * Offsets discriminate; use them before theorising.
+	 */
+	if (addr == (struct sockaddr *)0)
+		return ((struct ifaddr *)0);
 
 #define	equal(a1, a2) \
   (bcmp((caddr_t)(a1), (caddr_t)(a2), ((struct sockaddr *)(a1))->sa_len) == 0)
@@ -343,7 +392,12 @@ ifa_ifwithdstaddr(addr)
 	register struct ifnet *ifp;
 	register struct ifaddr *ifa;
 
-	for (ifp = ifnet; ifp; ifp = ifp->if_next) 
+	/* PORT (AmiTCP_NG): as ifa_ifwithaddr() above -- same dead-today chain, and
+	 * this one also reaches equal(), i.e. a read at offset 0 of a NULL. */
+	if (addr == (struct sockaddr *)0)
+		return ((struct ifaddr *)0);
+
+	for (ifp = ifnet; ifp; ifp = ifp->if_next)
 	    if (ifp->if_flags & IFF_POINTOPOINT)
 		for (ifa = ifp->if_addrlist; ifa; ifa = ifa->ifa_next) {
 			if (ifa->ifa_addr->sa_family != addr->sa_family)
@@ -364,7 +418,26 @@ ifa_ifwithnet(addr)
 {
 	register struct ifnet *ifp;
 	register struct ifaddr *ifa;
-	u_int af = addr->sa_family;
+	u_int af;
+
+	/*
+	 * PORT (AmiTCP_NG): a NULL addr read sa_family and then walked addr->sa_data
+	 * byte-by-byte against each ifaddr below -- a wild read with no MMU to stop it.
+	 *
+	 * NOT merely hypothetical: route_output()'s RTM_CHANGE handler (net/rtsock.c)
+	 * passes `gate` down through ifa_ifwithroute() to here, and RTM_CHANGE does not
+	 * require RTA_GATEWAY -- unlike RTM_ADD, which refuses a NULL gate outright.
+	 * A `route change` that only alters flags on a directly-connected route
+	 * produces exactly that. It cannot fire TODAY only because route_output is
+	 * #define'd to NULL under AMITCP and socreate() refuses PF_ROUTE; the day that
+	 * is reactivated, this becomes live. Guard it now, while it is free.
+	 *
+	 * Note this is NOT the Enforcer hit being chased: sa_family is at offset 1 of
+	 * struct sockaddr, so a NULL here faults at address 1, and that report says 0.
+	 */
+	if (addr == (struct sockaddr *)0)
+		return ((struct ifaddr *)0);
+	af = addr->sa_family;
 
 	if (af >= AF_MAX)
 		return (0);
@@ -407,7 +480,13 @@ ifaof_ifpforaddr(addr, ifp)
 	register char *cp, *cp2, *cp3;
 	register char *cplim;
 	struct ifaddr *ifa_maybe = 0;
-	u_int af = addr->sa_family;
+	u_int af;
+
+	/* PORT (AmiTCP_NG): same guard as ifa_ifwithnet() above, same reason -- this
+	 * one also walks addr->sa_data in lockstep against ifa_addr/ifa_netmask. */
+	if (addr == (struct sockaddr *)0)
+		return ((struct ifaddr *)0);
+	af = addr->sa_family;
 
 	if (af >= AF_MAX)
 		return (0);
@@ -566,9 +645,6 @@ ifunit(name)
 	unsigned len;
 	char *ep, c;
 
-	for (cp = name; cp < name + IFNAMSIZ && *cp; cp++)
-		if (*cp >= '0' && *cp <= '9')
-			break;
 	/*
 	 * PORT (AmiTCP_NG): stock ifunit() REQUIRED a trailing digit and returned
 	 * NULL for a name without one -- so an interface named e.g. "wifipi" (a
@@ -578,9 +654,39 @@ ifunit(name)
 	 * whole base with unit 0 (the code below already null-terminates at cp and
 	 * parses zero digits, so it Just Works). Only a name that fills IFNAMSIZ with
 	 * no terminator is still rejected.
+	 *
+	 * PORT (AmiTCP_NG): the unit is the TRAILING run of digits, not the first
+	 * digit found. Splitting at the first digit assumed a name never STARTS with
+	 * one, which is not true of the names people actually use: a 3Com PCMCIA card
+	 * config file called "3c589" split into base "" + unit 3, so the interface
+	 * came out named "3" (github issue #6). Trailing-run splitting round-trips
+	 * every name -- "3c589" -> "3c"+589 -> "3c589", "eth0" -> "eth"+0, "wifipi"
+	 * -> "wifipi"+0 -- and MUST match sana_add_interface() in net/if_sana.c, or an
+	 * interface is created under a name this cannot find.
 	 */
+	/*
+	 * PORT (AmiTCP_NG): refuse a NULL name instead of walking from address 0.
+	 * The loop below dereferences `name` with no check, so a NULL argument reads
+	 * bytes from location 0 -- on a machine with no MMU that is a silent read of
+	 * the exception vector table, and Enforcer reports it as
+	 * "BYTE-READ from 00000000 ... MOVE.B (A1)+,D1".
+	 *
+	 * Every caller found today either passes an embedded ifr_name array (which
+	 * cannot be NULL) or guards first -- ng_canon_ifname() in the Roadshow layer
+	 * does exactly that, one call above this one. So this is hardening, not a
+	 * known live bug. It is worth having anyway: a lookup helper this widely
+	 * called should not depend on every caller remembering, and the same class of
+	 * omission in vcsprintf()'s %s was a real hole.
+	 */
+	if (name == NULL)
+		return ((struct ifnet *)0);
+
+	for (cp = name; cp < name + IFNAMSIZ && *cp; cp++)
+		;
 	if (cp == name + IFNAMSIZ)
 		return ((struct ifnet *)0);
+	while (cp > name && cp[-1] >= '0' && cp[-1] <= '9')
+		cp--;
 	/*
 	 * Save first char of unit, and pointer to it,
 	 * so we can put a null there to avoid matching
@@ -589,8 +695,20 @@ ifunit(name)
 	len = cp - name + 1;
 	c = *cp;
 	ep = cp;
-	for (unit = 0; *cp >= '0' && *cp <= '9'; )
+	/*
+	 * Clamped to what if_unit (a short) can actually hold. Both this and
+	 * sana_add_interface() clamp the same way: if one stored a truncated unit and
+	 * the other compared the full value, the interface would be unfindable.
+	 */
+	for (unit = 0; *cp >= '0' && *cp <= '9'; ) {
 		unit = unit * 10 + *cp++ - '0';
+		if (unit > 32767) {
+			unit = 32767;
+			while (*cp >= '0' && *cp <= '9')
+				cp++;
+			break;
+		}
+	}
 	*ep = 0;
 
 	for (ifp = ifnet; ifp; ifp = ifp->if_next) {

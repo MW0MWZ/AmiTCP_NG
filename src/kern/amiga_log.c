@@ -237,14 +237,16 @@ static int GetLogMsgFail;
  * compile-time constants because both are settable at runtime -- from
  * AmiTCP.config at bring-up (LOGGING=, LOGLEVEL=) and over ARexx thereafter.
  *
- * log_enabled is the master switch (LOGGING=ON|OFF), and it is OFF by default in
- * every build. It is separate from the level on purpose: turning logging off and
- * back on must not lose the verbosity you had chosen, and "off" must not be
- * expressible as a priority number that also means something else (0 is
- * LOG_EMERG, what panic() logs at).
+ * log_enabled is the master switch (LOGGING=ON|OFF). It is separate from the
+ * level on purpose: turning logging off and back on must not lose the verbosity
+ * you had chosen, and "off" must not be expressible as a priority number that
+ * also means something else (0 is LOG_EMERG, what panic() logs at).
  *
- * ON by default -- but see log_console_enabled below, which is what makes that
- * acceptable. The two used to be one switch, and the console is the intrusive
+ * ON by default -- an earlier version of this comment said "OFF by default in
+ * every build" two paragraphs above the sentence that says the opposite, and the
+ * code has always agreed with this one (log_enabled = 1). It is safe to default
+ * on because of log_console_enabled below, which is what makes that acceptable.
+ * The two used to be one switch, and the console is the intrusive
  * half: it opens a window that puts itself in front of whatever the user is
  * doing. Tying the log FILE to that meant the only way to stop the window was to
  * stop recording anything, so a machine that hit a panic had nothing to show for
@@ -340,9 +342,39 @@ log_init(void)
 	/*
 	 * Start the NETTRACE process
 	 */
+	/*
+	 * NP_StackSize is NOT optional here, despite this being "just" the log
+	 * process. NETTRACE also runs the ARexx/RoadshowControl port, and that
+	 * path is deep: rexx_poll() (rbuf[REPLYBUFLEN], 255 bytes of locals) ->
+	 * parseline() -> setvalue() -> a per-setting handler, several of which
+	 * carry their own buffers -- rexx_sethostname()'s is MAXHOSTNAMELEN+1,
+	 * which is 256 bytes now that the host-name store holds an FQDN. Worse,
+	 * `SET SETS <file>` re-enters parsefile()/parseline(), so a client (or a
+	 * chained config file) can nest the whole chain.
+	 *
+	 * Spawned without this tag the process took the AmigaDOS default, and a
+	 * stack overrun here has no MMU to catch it -- it quietly corrupts
+	 * whatever sits below the stack and surfaces later as something
+	 * unrelated.
+	 *
+	 * WHERE 16384 COMES FROM, honestly: it is NOT derived from that chain.
+	 * Adding up the locals above (255 + 24 + 24 + 256) plus call overhead
+	 * comes to well under 1 KB, so almost any explicit size would do. 16 KB
+	 * is borrowed from ng_stack_process (kern/amiga_main.c) because a
+	 * consistent, obviously-ample number is worth more here than a tight one:
+	 * there is no stack-check to catch a near miss, and `SET SETS <file>` can
+	 * re-enter parsefile()/parseline() to an unbounded depth (each level is
+	 * only a small frame -- parsefile's line buffer is AllocMem'd, not stack
+	 * -- but the depth is attacker-chosen by whoever writes the config file).
+	 *
+	 * The cost is not quite zero: log_init() failing is fatal to stack
+	 * bring-up (see its callers in amiga_main.c), so this allocation has to
+	 * succeed. 16 KB against the 1 MB floor the A600 tier tests is noise.
+	 */
 	if (CreateNewProcTags(NP_Entry, (LONG)&log_task,
 			      NP_Name, (LONG)LOG_TASK_NAME,
 			      NP_Priority, LOG_TASK_PRI,
+			      NP_StackSize, 16384,
 			      TAG_DONE, NULL)) {
 	  for (;;) {
 	    /*
@@ -632,6 +664,10 @@ static BOOL fileopenfail = FALSE, conopenfail = FALSE;
  * failure to write the log to, so that failure is deliberately silent.
  */
 static BOOL filewritefail = FALSE, conwritefail = FALSE;
+/* One-shot: CONSOLENAME= names something that is not a console. Reset with the
+ * other console latches whenever the name changes, so a corrected setting is not
+ * silently un-reported and a re-broken one is reported again. */
+static BOOL connotconsole = FALSE;
 
 /*
  * PORT (AmiTCP_NG): validate the log destination at NETTRACE bring-up.
@@ -729,6 +765,60 @@ static void log_console_problem(char *what, STRPTR name)
   FPuts(logfile, name);
   FPuts(logfile, (STRPTR)"' -- logging to file only\n");
   Flush(logfile);
+}
+
+/*
+ * PORT (AmiTCP_NG): the same reporter for something that is not a failure -- the
+ * console opened fine, the user just needs to know what they configured. Separate
+ * from log_console_problem() only because that one ends "logging to file only",
+ * which would be untrue here.
+ */
+static void log_console_note(char *what, STRPTR name)
+{
+  if (logfile == NULL)
+    return;
+  FPuts(logfile, (STRPTR)"log: ");
+  FPuts(logfile, (STRPTR)what);
+  FPuts(logfile, (STRPTR)" '");
+  FPuts(logfile, name);
+  FPuts(logfile, (STRPTR)"'\n");
+  Flush(logfile);
+}
+
+/*
+ * Does this destination look like a console rather than a file?
+ *
+ * CONSOLENAME is opened with a plain DOS Open(), so ANY path works -- and a plain
+ * file works silently, giving a second near-duplicate log that no tool shows
+ * (NetLogViewer follows LOGFILENAME, which is the complete record, banner and
+ * all). The variable is inherited from AmiTCP, where it is documented as
+ * "Filename for the log console", so this has always been possible.
+ *
+ * A prefix test, deliberately: the alternative -- try to Lock() it and see -- is
+ * wrong, because the file we just opened for writing cannot be Lock()ed anyway
+ * and a console that has not been created yet cannot either. This only drives an
+ * advisory line, so a custom console handler being mistaken for a file costs one
+ * inaccurate sentence, once, and nothing else.
+ */
+static BOOL log_name_is_console(STRPTR name)
+{
+  static char *devs[] = { "con:", "raw:", "nil:", "aux:", NULL };
+  int d, i;
+
+  if (name == NULL)
+    return TRUE;			/* nothing to complain about */
+  for (d = 0; devs[d]; d++) {
+    for (i = 0; devs[d][i]; i++) {
+      char c = name[i];
+      if (c >= 'A' && c <= 'Z')
+	c = (char)(c - 'A' + 'a');
+      if (c != devs[d][i])
+	break;
+    }
+    if (devs[d][i] == '\0')
+      return TRUE;
+  }
+  return FALSE;
 }
 
 static char *months =
@@ -905,18 +995,34 @@ struct log_msg *log_poll()
 	   * next CONSOLENAME= would FreeVec() memory Exec never allocated. See the
 	   * note on log_dest_name. */
 	  con_dest_name = consoledefname;
-	  conopenfail = conwritefail = FALSE;
+	  conopenfail = conwritefail = connotconsole = FALSE;
 	}
       }
       if (confile != NULL) {
-	int error =
-	  FPuts(confile, buffer) == -1 ||
+	/*
+	 * PORT (AmiTCP_NG): say it once, here, because this is the only place
+	 * that knows. Not an error and not a refusal -- the setting is honoured
+	 * exactly as configured; the user is simply told that what they pointed
+	 * the log CONSOLE at is a file, and that they now have two logs. It was
+	 * silent before, and a second near-identical log appearing with no
+	 * explanation is a genuinely confusing thing to find.
+	 */
+	if (!connotconsole && !log_name_is_console(con_dest_name)) {
+	  connotconsole = TRUE;
+	  log_console_note("CONSOLENAME is not a console device, so log messages "
+			   "are being duplicated into the file", con_dest_name);
+	}
+	{
+	  int error =
+	    FPuts(confile, buffer) == -1 ||
 	    FWrite(confile, msg->string, msg->chars, 1) != 1 ||
-	      FPutC(confile, '\n') == -1;
-	Flush(confile);
-	if (error && !conwritefail) {	/* To avoid loops */
-	  conwritefail = TRUE;
-	  log_console_problem("write failed to console", con_dest_name);
+	    FPutC(confile, '\n') == -1;
+
+	  Flush(confile);
+	  if (error && !conwritefail) {	/* To avoid loops */
+	    conwritefail = TRUE;
+	    log_console_problem("write failed to console", con_dest_name);
+	  }
 	}
       }
     }
@@ -950,10 +1056,29 @@ static
 void log_close(struct log_msg *msg)
 {
   rexx_deinit();
-  if (confile)
+  /*
+   * NULL them, do not merely close them.
+   *
+   * These are file handles, and every other place in this file that closes one
+   * clears it in the same breath (logname_changed()). This path -- the only one
+   * that runs at SHUTDOWN -- did not, leaving two stale BPTRs behind.
+   *
+   * That is harmless right up until the stack is started AGAIN in the same session,
+   * which the self-starting library does on the next OpenLibrary() after a
+   * NetShutdown. Bring-up parses AmiTCP.config, a LOGFILENAME= or CONSOLENAME= line
+   * calls logname_changed(), and it dutifully does Close() on a handle that was
+   * closed when the previous NETTRACE exited. Closing an already-closed file handle
+   * hangs DOS, and it hangs it before logging exists -- so the stack wedged during
+   * restart with not one line written to say why.
+   */
+  if (confile) {
     Close(confile);
-  if (logfile)
+    confile = NULL;
+  }
+  if (logfile) {
     Close(logfile);
+    logfile = NULL;
+  }
   if (logUtilityBase) {
     CloseLibrary(logUtilityBase);
     logUtilityBase = NULL;
@@ -1056,7 +1181,7 @@ int logname_changed(void *p, LONG new)
       confile = NULL;
     }
     con_dest_name = NULL;	/* re-read consolename on the next message */
-    conopenfail = conwritefail = FALSE;
+    conopenfail = conwritefail = connotconsole = FALSE;
     /*
      * setvalue() (who called this) will set the new value when we return 
      * TRUE.

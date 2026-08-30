@@ -319,6 +319,113 @@ m_valid(struct mbuf *m)
   return ok;
 }
 
+/*
+ * PORT (AmiTCP_NG): mbuf free-list poisoning -- MBUFCHECK= in AmiTCP.config.
+ *
+ * This pool had NO integrity checking of any kind. MFREE linked an mbuf onto
+ * the free list unconditionally, so freeing one twice put it on the list TWICE:
+ * two later allocations hand out the same 128 bytes, two owners write through
+ * it, and with no MMU nothing traps. The damage surfaces later, somewhere else,
+ * as corrupted packets or a severed free list -- which from outside looks like
+ * throughput sagging and then transmit dying, with nothing logged.
+ *
+ * When enabled, a freed mbuf is marked MT_FREE and its data area stamped with a
+ * pattern. That converts three silent failures into named ones, AT THE MOMENT
+ * THEY HAPPEN rather than hours later:
+ *
+ *   double free       m_type is already MT_FREE when it is freed again. The
+ *                     free is REFUSED -- relinking is what corrupts the list,
+ *                     so declining to do it keeps the pool consistent and lets
+ *                     the machine stay up long enough to read the log.
+ *   use after free    the poison has been altered by the time the mbuf is
+ *                     handed out again; the offset says where it was written.
+ *   list corruption   an mbuf comes off the free list NOT marked MT_FREE, so
+ *                     something reached it by a route other than MFREE.
+ *
+ * It also closes the gap m_valid() documents above: that check "CANNOT detect a
+ * pointer to an mbuf that was genuinely ours but has since been freed ...
+ * catching that would need per-mbuf generation tags". MT_FREE is exactly that
+ * tag, so with MBUFCHECK on, a freed mbuf handed back through the mbuf_* API
+ * vectors is caught rather than recycled under the caller.
+ *
+ * Cost is why it is a runtime switch and OFF by default: poisoning writes MLEN
+ * bytes per free and verifying reads them per allocation, on the hot path. But
+ * it is a CONFIG switch, not a build flag -- a diagnostic that needs a special
+ * binary cannot diagnose a machine you cannot reach (the same reasoning that
+ * put the API tracer in every build; see netinclude/sys/syslog.h).
+ */
+LONG  ng_mbufcheck        = 0;	/* MBUFCHECK=ON in AmiTCP.config           */
+LONG  ng_mbufcheck_active = 0;	/* latched from it by mbinit() -- see below */
+ULONG ng_mbuf_doublefree  = 0;	/* freed while already on the free list    */
+ULONG ng_mbuf_useafterfree= 0;	/* written while on the free list          */
+ULONG ng_mbuf_listcorrupt = 0;	/* left the free list not marked MT_FREE   */
+
+#define NG_MBUF_POISON	0xDFDFDFDFUL
+#define NG_MBUF_REPORTS	5	/* log this many of each, then only count.
+				 * Corruption tends to repeat, and a log line
+				 * per event on a 68k writing to disk would
+				 * itself take the machine down. */
+
+/*
+ * Called from MFREE before anything is touched. Non-zero means "do not free
+ * this": the caller must leave the free list alone.
+ */
+int
+ng_mbuf_bad_free(struct mbuf *m)
+{
+  if (m->m_type != MT_FREE)
+    return 0;
+  if (++ng_mbuf_doublefree <= NG_MBUF_REPORTS)
+    log(LOG_ERR, "mbuf: DOUBLE FREE of 0x%lx -- refused, not relinked",
+	(ULONG)m);
+  return 1;
+}
+
+/*
+ * Called from MFREE with splimp held, AFTER the caller has saved m_next and
+ * released any cluster, and BEFORE the mbuf is linked onto the free list.
+ * m_next is deliberately left alone -- the caller overwrites it immediately as
+ * the free-list link.
+ */
+void
+ng_mbuf_poison(struct mbuf *m)
+{
+  register ULONG *p = (ULONG *)(void *)m->m_dat;
+  register int n = MLEN / sizeof(ULONG);	/* 108/4 -- exact */
+
+  m->m_type = MT_FREE;
+  while (n--)
+    *p++ = NG_MBUF_POISON;
+}
+
+/*
+ * Called from MGET with splimp held, after the mbuf is unlinked from the free
+ * list and before its type is set. Reports only -- the mbuf is handed over
+ * either way, because refusing an allocation here would turn a detected fault
+ * into an outage, and the point of this is to NAME the fault, not to police it.
+ */
+void
+ng_mbuf_alloc_check(struct mbuf *m)
+{
+  register ULONG *p = (ULONG *)(void *)m->m_dat;
+  register int i, n = MLEN / sizeof(ULONG);
+
+  if (m->m_type != MT_FREE) {
+    if (++ng_mbuf_listcorrupt <= NG_MBUF_REPORTS)
+      log(LOG_ERR, "mbuf: 0x%lx left the free list as type %ld, not MT_FREE "
+	  "-- free-list corruption", (ULONG)m, (long)m->m_type);
+    return;			/* header already wrong; poison check adds noise */
+  }
+  for (i = 0; i < n; i++) {
+    if (p[i] != NG_MBUF_POISON) {
+      if (++ng_mbuf_useafterfree <= NG_MBUF_REPORTS)
+	log(LOG_ERR, "mbuf: 0x%lx written at +%ld while free (0x%lx) "
+	    "-- use after free", (ULONG)m, (long)(i * sizeof(ULONG)), p[i]);
+      return;			/* one report per mbuf is enough to locate it */
+    }
+  }
+}
+
 LONG mb_read_stats(struct CSource *args, UBYTE **errstrp, struct CSource *res)
 {
   int i, total = 0;
@@ -418,6 +525,34 @@ mbinit(void)
 
   s = splimp();
   /*
+   * PORT (AmiTCP_NG): latch MBUFCHECK now, and use ONLY the latch from here on.
+   *
+   * VF_RCONF is weaker than it looks: setvalue() rejects a write only once the
+   * global `initialized` is TRUE, and that is not set until the whole stack is
+   * up -- long after this point, and after log_init() has already made the
+   * ARexx port public. So an ARexx `SET MBUFCHECK ON` can land mid-bring-up.
+   * If the macros tested the config variable directly, mbufs freed before that
+   * moment (unpoisoned, because checking was off) would be reported as
+   * free-list corruption the first time they were reallocated -- a false
+   * positive in the one tool that has to be trustworthy. Latching makes the
+   * documented promise ("read only at startup") actually true.
+   */
+  ng_mbufcheck_active = ng_mbufcheck;
+
+  /*
+   * Clear the report quotas with the latch. Each counter is capped at
+   * NG_MBUF_REPORTS so a storm of faults cannot flood the log, but the cap is
+   * lifetime-of-the-binary unless it is reset here -- so a stack that had
+   * already used its five reports would come back from a NetShutdown/Online
+   * restart silently, and the operator restarting it to reproduce a fault
+   * would see nothing at all. The counters are diagnostics, not state: a new
+   * stack session gets a new quota.
+   */
+  ng_mbuf_doublefree   = 0;
+  ng_mbuf_useafterfree = 0;
+  ng_mbuf_listcorrupt  = 0;
+
+  /*
    * Initialize the list headers to NULL
    */
   mfree = NULL;
@@ -431,7 +566,7 @@ mbinit(void)
      && m_clalloc(mbconf.clusterchunk, M_WAIT));
 
   splx(s);
-  
+
   if (!initialized) {
     log(LOG_ERR, "mbinit: Failed to allocate memory.");
     mbdeinit();
@@ -556,6 +691,14 @@ m_alloc(int howmany, int canwait)
    */
   m = dtom(((caddr_t)mh) + MSIZE - 1); /* first correctly aligned mbuf */
   while(howmany--) {
+    /*
+     * PORT (AmiTCP_NG): stamp every new mbuf, ALWAYS -- deliberately not gated
+     * on ng_mbufcheck. AllocMem() does not clear, so an mbuf entering the pool
+     * unmarked would be reported as free-list corruption the first time it was
+     * allocated with checking on. This runs once per pool growth, so the cost
+     * does not matter.
+     */
+    ng_mbuf_poison(m);
     m->m_next = mfree;
     mfree = m++;
   }
@@ -818,6 +961,20 @@ m_copym(m, off0, len, wait)
 	  log(LOG_ERR, "m_copym: Bad arguments");
 	  goto nospace;
 	}
+	/*
+	 * PORT (AmiTCP_NG): `m` may legitimately be NULL -- an empty socket send
+	 * buffer (so_snd.sb_mb == 0) is the ordinary state of an idle connection,
+	 * and tcp_output()'s SACK hole-retransmit path takes its length from the
+	 * scoreboard rather than clamping to sb_cc, so it can reach here with a
+	 * NULL chain. The m_flags test below dereferenced it BEFORE any of the
+	 * loops' own `m == 0` checks. With no MMU that read does not fault -- it
+	 * quietly returns whatever sits at address 0x12, the exception vectors --
+	 * so the bug was invisible rather than absent. Check first; the callers
+	 * already handle a NULL return (tcp_output degrades to a header-only
+	 * segment).
+	 */
+	if (m == NULL)
+		goto nospace;
 	if (off == 0 && m->m_flags & M_PKTHDR)
 		copyhdr = 1;
 	/*
@@ -1082,7 +1239,17 @@ m_pullup(n, len)
 		m->m_len = 0;
 		if (n->m_flags & M_PKTHDR) {
 			M_COPY_PKTHDR(m, n);
-			n->m_flags &= ~M_PKTHDR;
+			/*
+			 * PORT (AmiTCP_NG): demote the old head, and strip the flags that
+			 * only mean anything ON a head. M_CSUM_DONE says "this packet's
+			 * pkthdr.csum is valid" -- on a mbuf that is no longer a head, that
+			 * claim refers to a pkthdr nobody will read, so leaving the bit set
+			 * is meaningless at best. Nothing today looks at flags on a non-head
+			 * link, so this is inert; it is cleared because a bit that is only
+			 * harmless by convention is exactly the kind that stops being
+			 * harmless later.
+			 */
+			n->m_flags &= ~(M_PKTHDR | M_CSUM_DONE);
 		}
 	}
 	space = &m->m_dat[MLEN] - (m->m_data + m->m_len);

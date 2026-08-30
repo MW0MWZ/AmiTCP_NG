@@ -1,3 +1,10 @@
+/*
+ * AmiTCP_NG -- a modernised, open fork of AmiTCP/IP 3.0b2.
+ * Modifications for AmiTCP_NG Copyright (C) 2026 Andy Taylor (MW0MWZ).
+ * Licensed under the GNU General Public License, version 2 (see COPYING).
+ * The original AmiTCP/IP and BSD copyright notices are retained below.
+ */
+
 RCS_ID_C="$Id: uipc_socket2.c,v 1.23 1993/12/18 15:28:09 jraja Exp $";
 /*
  * Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>
@@ -186,6 +193,7 @@ RCS_ID_C="$Id: uipc_socket2.c,v 1.23 1993/12/18 15:28:09 jraja Exp $";
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/synch.h>
+#include <sys/syslog.h>			/* LOG_ERR, for the MBUFCHECK report below */
 
 #include <api/amiga_api.h>
 #include <kern/amiga_includes.h>
@@ -1113,6 +1121,53 @@ sbdrop(sb, len)
 {
 	register struct mbuf *m, *mn;
 	struct mbuf *next;
+	/*
+	 * PORT (AmiTCP_NG): "this mbuf was ALREADY on the free list when we came
+	 * to free it" -- see sb_corrupt below. Tested immediately before each
+	 * MFREE, so it describes THIS mbuf in THIS walk. An earlier attempt used
+	 * the global refused-double-free counter and compared it across the walk;
+	 * that was both imprecise (another task's unrelated refusal could land in
+	 * the window and mask a genuine accounting bug here) and unnecessary,
+	 * since the condition is readable directly off the mbuf.
+	 */
+	int sb_corrupt = 0;
+#define	SB_WAS_FREED(mm)	(ng_mbufcheck_active && (mm)->m_type == MT_FREE)
+
+	/*
+	 * PORT (AmiTCP_NG): arrive here with an EMPTY head but accounting still
+	 * outstanding and there is no walk to do -- only a panic to avoid.
+	 *
+	 * MFREE hands back NULL rather than a continuation when MBUFCHECK
+	 * refuses a double free, so any caller doing the standard
+	 * `MFREE(m, sb->sb_mb); m = sb->sb_mb;` leaves sb_mb NULL while sb_cc
+	 * and sb_mbcnt still count whatever was queued behind it. soreceive()
+	 * does exactly that at three sites. The recovery below already handles
+	 * the case where THIS walk meets the bad mbuf; this handles the case
+	 * where somebody else met it first and left the wreckage for us.
+	 *
+	 * Both ways it would otherwise be fatal, and in two different ways:
+	 * sbflush() loops `while (sb_mbcnt) sbdrop(sb, sb_cc)`, so with sb_cc
+	 * still set the walk below reaches `m == 0 && next == 0` and panics,
+	 * and with sb_cc zeroed but sb_mbcnt not, len is 0, the walk does
+	 * nothing, and sbflush() spins forever on a count nothing decrements.
+	 * A socket close is the likeliest moment for either.
+	 *
+	 * Gated on MBUFCHECK because that is the only thing that can produce
+	 * this state: with the check off, MFREE always returns a real
+	 * continuation, and a NULL head with live accounting really would be
+	 * the accounting bug the original panic is there to catch. Do not
+	 * silence it then.
+	 */
+	if (ng_mbufcheck_active && sb->sb_mb == 0 && (sb->sb_cc || sb->sb_mbcnt)) {
+		log(LOG_ERR, "sbdrop: socket buffer is empty but still accounts "
+			     "for %ld bytes in %ld mbufs -- discarding it "
+			     "(MBUFCHECK)", (long)sb->sb_cc, (long)sb->sb_mbcnt);
+		sb->sb_mb     = 0;
+		sb->sb_mbtail = 0;
+		sb->sb_cc     = 0;
+		sb->sb_mbcnt  = 0;
+		return;
+	}
 
 	next = (m = sb->sb_mb) ? m->m_nextpkt : 0;
 	while (len > 0) {
@@ -1124,6 +1179,35 @@ sbdrop(sb, len)
 			continue;
 		}
 		if (m->m_len > len) {
+			/*
+			 * PORT (AmiTCP_NG): check BEFORE the partial consume, not
+			 * only before the MFREEs below. This branch frees nothing,
+			 * so it used to be the one path through sbdrop() with no
+			 * MBUFCHECK cover at all -- and it is the path ordinary
+			 * traffic takes most often (a partial ACK trimming the head
+			 * of a send buffer). An already-freed mbuf still carries its
+			 * stale m_len in the header, which poisoning does not touch,
+			 * so the test above can succeed and we would then write
+			 * m_len/m_data of an mbuf sitting on the free list -- or
+			 * already handed out to another connection.
+			 */
+			if (SB_WAS_FREED(m)) {
+				/*
+				 * Say so here. The shared cleanup below notes
+				 * that the fault is "already named by
+				 * ng_mbuf_bad_free()" -- true of the paths that
+				 * reach it via a refused MFREE, but NOT of this
+				 * one, which frees nothing. Without this the
+				 * buffer would silently empty itself with
+				 * nothing in the log to explain why.
+				 */
+				log(LOG_ERR,
+				    "sbdrop: mbuf on the free list is still "
+				    "queued in a socket buffer -- discarding "
+				    "the buffer (MBUFCHECK)");
+				sb_corrupt = 1;
+				break;
+			}
 			m->m_len -= len;
 			m->m_data += len;
 			sb->sb_cc -= len;
@@ -1131,14 +1215,57 @@ sbdrop(sb, len)
 		}
 		len -= m->m_len;
 		sbfree(sb, m);
+		sb_corrupt = SB_WAS_FREED(m);
 		MFREE(m, mn);
 		m = mn;
+		if (sb_corrupt)
+			break;
 	}
-	while (m && m->m_len == 0) {
+	while (!sb_corrupt && m && m->m_len == 0) {
 		sbfree(sb, m);
+		sb_corrupt = SB_WAS_FREED(m);
 		MFREE(m, mn);
 		m = mn;
 	}
+
+	if (sb_corrupt) {
+		/*
+		 * PORT (AmiTCP_NG): MBUFCHECK caught an mbuf that was already on
+		 * the free list while it was still linked into this sockbuf, and
+		 * MFREE refused to relink it. MFREE cannot hand back (m)->m_next
+		 * for such an mbuf -- on a freed one that field is the FREE-LIST
+		 * link, and following it here would feed every spare mbuf in the
+		 * pool to sbfree(). So the rest of this chain is unreachable and
+		 * is deliberately leaked.
+		 *
+		 * The accounting must then be forced consistent, not merely left
+		 * alone. sb_cc/sb_mbcnt still carry the orphaned mbufs, and
+		 * sbflush() loops `while (sb_mbcnt) sbdrop(...)` and then panics
+		 * on `sb_cc || sb_mb` -- so leaving them set turns one refused
+		 * free into a guaranteed panic the moment the socket is closed,
+		 * which is exactly where a stale mbuf is most likely to be walked.
+		 * Zeroing them makes the sockbuf consistently EMPTY so the
+		 * machine stays up and the log can be read; the fault itself is
+		 * already named there by ng_mbuf_bad_free().
+		 *
+		 * Be honest about the cost: this discards MORE than the corrupted
+		 * mbuf's own storage. Anything queued BEHIND it was probably
+		 * perfectly healthy -- it is lost because the chain is
+		 * unreachable past the refusal, not because it was bad. For a TCP
+		 * send buffer that means the peer will never receive a sequence
+		 * range we have already accounted for, so that ONE connection
+		 * stalls and is then dropped by the existing retransmit-giveup
+		 * path (TCP_MAXRXTSHIFT -> ETIMEDOUT). Bounded, self-terminating,
+		 * and confined to the affected connection -- which is the trade
+		 * being made against halting the whole stack behind a requester.
+		 */
+		sb->sb_mb     = 0;
+		sb->sb_mbtail = 0;
+		sb->sb_cc     = 0;
+		sb->sb_mbcnt  = 0;
+		return;
+	}
+#undef SB_WAS_FREED
 	if (m) {
 		sb->sb_mb = m;
 		m->m_nextpkt = next;

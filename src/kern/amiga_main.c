@@ -124,8 +124,20 @@ RCS_ID_C="$Id: amiga_main.c,v 3.2 1994/04/02 10:28:28 jraja Exp $";
 #include <bsdsocket.library_rev.h>
 
 ULONG sana_init(void);
+ULONG ng_netctl_init(void);	/* the "TCP/IP Control" port */
+int   ng_netctl_poll(void);
+int   ng_netctl_pending(void);
+int   ng_netctl_forced(void);
+void  ng_netctl_deinit(void);
 void sana_deinit(void);
 BOOL sana_poll(void);
+void sana_reconfig_poll(void);   /* apply config for devices that came back online */
+
+/* The two shared lifecycle helpers, defined below but used by main() above
+ * them. One copy each, deliberately -- see their definitions for what having
+ * had two copies cost. */
+static void ng_teardown_subsystems(void);
+static int  ng_stack_quiesce(void);
 
 
 #include <kern/amiga_main_protos.h>
@@ -152,7 +164,7 @@ extern WORD nthLibrary;
 
 static ULONG sanamask = 0, 
   sig = 0, sigmask = 0, timermask = 0, 
-  breakmask = 0;
+  breakmask = 0, netctlmask = 0;
 
 UBYTE *taskname = NULL;
 BOOL  initialized = FALSE;
@@ -282,7 +294,11 @@ main(int argc, char *argv[])
      * (sana_init/timer_init) during init_all().
      */
     breakmask = SIGBREAKF_CTRL_C;
-    sigmask = timermask | breakmask | sanamask;
+    /* The control port is OPTIONAL: if it could not be created the stack runs
+     * exactly as it did before it existed, just with no way to be asked to stop
+     * politely. Never a reason to refuse to start. */
+    netctlmask = ng_netctl_init();
+    sigmask = timermask | breakmask | sanamask | netctlmask;
 
     /*
      * Now when everything else is succesfully initialized,
@@ -309,6 +325,10 @@ main(int argc, char *argv[])
 	if (sig & sanamask) {
 	  if (!sana_poll())
 	    sig &= ~sanamask;
+	  /* At task level, OUTSIDE sana_poll()'s splnet(): reconfiguring an
+	   * interface whose device came back online opens sockets and may spawn
+	   * the DHCP client, neither of which can run under a Forbid(). */
+	  sana_reconfig_poll();
 	}
 
 	if (sig & timermask) {
@@ -316,33 +336,29 @@ main(int argc, char *argv[])
 	    sig &= ~timermask;
 	}
 
+	/* Unconditionally, not only when the port signalled: a shutdown already
+	 * granted its grace period has to be re-examined as time passes, and no
+	 * message arrives to prompt that. Returns TRUE when the clients are clear
+	 * and the requester has been told, at which point we stop exactly the way
+	 * CTRL-C stops us -- one teardown path, not two. */
+	if (ng_netctl_poll())
+	  Signal(FindTask(NULL), breakmask);
+	sig &= ~netctlmask;
+
 	sig |= SetSignal(0L, sigmask) & sigmask;
       } while (sig && sig != breakmask);
 
       if (sig & breakmask) {
-	int i;
 	/*
-	 * We got CTRL-C
-	 *
-	 * NETTRACE task keeps one base open, it is not counted.
+	 * CTRL-C. Stop only if nobody still holds the library open --
+	 * ng_stack_quiesce() hides the API, breaks blocked tasks, and puts the
+	 * API back if they will not let go. This WAS written out longhand here,
+	 * and the library build had no equivalent at all; both now run the one
+	 * copy, so the safety cannot be present in one build and absent in the
+	 * other again.
 	 */
-	api_hide();		/* hides the API from users */
-
-	/*
-	 * Try three times with a short delay
-	 */
-	for (i = 0; i < 3 && MasterSocketBase->lib_OpenCnt > 1; i++) {
-	  api_sendbreaktotasks(); /* send brk to all tasks w/ SBase open */ 
-	  Delay(50);		  /* give tasks time to close socket base */
-	}
-	if (MasterSocketBase->lib_OpenCnt > 1) {
-	  log(LOG_ERR, "Got CTRL-C while %ld %s still open.\n",
-	      MasterSocketBase->lib_OpenCnt - 1,
-	      (MasterSocketBase->lib_OpenCnt == 2) ? "library" : "libraries");
-	  api_show(); /* stopping not successfull, show API to users */ 
-	} else {
+	if (ng_stack_quiesce())
 	  break;
-	}
       }
     }
     retval = 0;
@@ -433,6 +449,18 @@ ng_ram_tier(void)
 
   udp_sendspace = 9216;			/* max single datagram; baseline, raised on big-RAM tiers below */
 
+  /*
+   * The log message pool is tiered here too (log_cnf, kern/amiga_log.h): COUNT of
+   * in-flight messages and per-line LENGTH. Both were fixed at 4 x 128 bytes, which
+   * cut every log line at 127 characters without saying so and dropped whole
+   * messages during any burst -- see the note on LOG_BUFS. It belongs in this
+   * function because it is a RAM trade like the others: 64 x 512 is 32 KB of pinned
+   * pool, nothing on a PiStorm and unaffordable on a 512 KB A500, so the smallest
+   * tier stays deliberately lean rather than every machine paying the same price.
+   * Set BEFORE readconfig() and log_init(), on both the program and the library
+   * init path, so log_init() allocates from the tiered values.
+   */
+
   if (total == 0 || total <= 1024UL * 1024) {
     /* <= 1 MB (e.g. a 512 KB A500): lean, must still boot. Pool ceiling BELOW
      * the stock 256 KB; buffers small so one bulk conn (~2*buf of pool) fits.
@@ -442,6 +470,7 @@ ng_ram_tier(void)
     tcp_sendspace = tcp_recvspace = 11 * 1460;	/* 16060, MSS-aligned */
     udp_recvspace = 16 * 1024;
     ng_dns_cache_max = DNS_CACHE_ENTRIES_1MB;
+    log_cnf.log_bufs = 8; log_cnf.log_buf_len = 256;	/* 2 KB of log pool */
   } else if (total <= 4UL * 1024 * 1024) {
     /* 2-4 MB: stock buffers; sb_max 64 KB -> scaling shift 0 (no >64 KB windows). */
     mbconf.maxmem = 256;
@@ -449,6 +478,7 @@ ng_ram_tier(void)
     tcp_sendspace = tcp_recvspace = 42 * 1460;	/* 61320 */
     udp_recvspace = 41600;			/* 40*(1024+sizeof(sockaddr_in)) */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_4MB;
+    log_cnf.log_bufs = 16; log_cnf.log_buf_len = 512;	/* 8 KB */
   } else if (total <= 16UL * 1024 * 1024) {
     /* 8-16 MB: window scaling engaged -- ~128 KB buffers/windows. */
     mbconf.maxmem = 1024;
@@ -457,6 +487,7 @@ ng_ram_tier(void)
     udp_recvspace = 128UL * 1024;		/* ~90 full datagrams of burst absorption */
     udp_sendspace = 32UL * 1024;		/* allow larger single datagrams (e.g. NFS) */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_16MB;
+    log_cnf.log_bufs = 32; log_cnf.log_buf_len = 512;	/* 16 KB */
   } else if (total <= 64UL * 1024 * 1024) {
     /* 16-64 MB: ~256 KB buffers/windows. */
     mbconf.maxmem = 4096;
@@ -465,6 +496,7 @@ ng_ram_tier(void)
     udp_recvspace = 192UL * 1024;		/* ~130 full datagrams of burst absorption */
     udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
+    log_cnf.log_bufs = 48; log_cnf.log_buf_len = 512;	/* 24 KB */
   } else if (total <= 128UL * 1024 * 1024) {
     /* 64-128 MB: ~512 KB windows -- enough to fill ~100-150 Mbit at internet RTT (and a
      * gigabit link on a LAN). A single connection is capped at window/RTT, so the bigger
@@ -477,6 +509,7 @@ ng_ram_tier(void)
     udp_recvspace = 256UL * 1024;		/* ~170-250 datagrams; UDP has no window to fill, so this caps out */
     udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
+    log_cnf.log_bufs = 64; log_cnf.log_buf_len = 512;	/* 32 KB */
   } else {
     /* 128 MB+ (big PiStorm / Vampire, "memory to burn"): ~1 MB windows. Beyond this the
      * window exceeds the bandwidth-delay product of any realistic 68k link (bandwidth x
@@ -489,6 +522,7 @@ ng_ram_tier(void)
     udp_recvspace = 256UL * 1024;		/* ~170-250 datagrams; UDP has no window to fill, so this caps out */
     udp_sendspace = 65535;			/* full max-size UDP datagram */
     ng_dns_cache_max = DNS_CACHE_ENTRIES_32MB;
+    log_cnf.log_bufs = 64; log_cnf.log_buf_len = 512;	/* 32 KB */
   }
   ng_ram_ceiling = tcp_recvspace;	/* fixed ceiling for the link-speed auto-tune */
 
@@ -573,6 +607,10 @@ init_all(void)
    * explicit config-file tunables still override either default. */
   ng_ram_tier();
   ng_cpu_tune();
+  /* Saved tunables (AmiTCPControl SAVE -> ENVARC:AmiTCP_NG/...). AFTER the
+   * auto-tune so they override it, BEFORE readconfig() so AmiTCP.config still
+   * overrides them. See ng_apply_env_tunables(). */
+  { extern void ng_apply_env_tunables(void); ng_apply_env_tunables(); }
   ng_dnscache_init();		/* size the DNS cache from the RAM tier set above */
   ng_bpf_init();		/* reset the BPF capture channel table */
 
@@ -613,6 +651,20 @@ init_all(void)
    */
   log(LOG_NOTICE, "AmiTCP_NG %s starting, logging to '%s' at level %ld",
       AMITCP_NG_VER, log_dest_name, log_level);
+  /*
+   * PORT (AmiTCP_NG): announce MBUFCHECK here, NOT in mbinit(). mbinit() runs
+   * before timer_init() on both init paths, and the queued log path timestamps
+   * via GetSysTime() -- the same ordering that once made logging die silently
+   * mid-boot. Saying it matters: a diagnostic that runs silently is
+   * indistinguishable from one that never started ("no faults" reads the same
+   * as "never ran"), and this mode costs speed, so any throughput measured on
+   * this machine has to be read in that light.
+   */
+  { extern LONG ng_mbufcheck_active;
+    if (ng_mbufcheck_active)
+      log(LOG_NOTICE, "mbuf: MBUFCHECK is ON -- pool poisoned on free and "
+	  "verified on allocation. This costs speed; turn it off when done."); }
+  { extern void ng_env_report(void); ng_env_report(); }
 
   /*
    * initialize API
@@ -652,6 +704,129 @@ init_all(void)
 }
 
 /*
+ * Bring every subsystem down, in dependency order.
+ *
+ * THIS EXISTS SO THERE IS EXACTLY ONE COPY. There used to be two: this list,
+ * and a hand-written duplicate inside ng_stack_process() for the self-starting
+ * library. They drifted, repeatedly and silently, and always in the same
+ * direction -- the library build (the one that actually ships) was the one
+ * missing things. reapReleasedSockets() was absent from it for a whole
+ * revision; ng_bpf_shutdown() was absent until the review round that prompted
+ * this refactor; and the two copies had even come to disagree about whether
+ * netdb or BPF went first. Each was found and patched individually, which fixed
+ * the instance and left the mechanism intact to do it again.
+ *
+ * So the duplicate is gone. Both callers run these lines, in this order, and
+ * the only thing either may do differently is the api_* bracket around them --
+ * which is one line at each call site, where it can be seen.
+ *
+ * Order matters and is not arbitrary:
+ *   reapReleasedSockets  frees sockets, which return buffers to the mbuf pool,
+ *                        so it must precede mbdeinit()
+ *   ng_bpf_shutdown      detaches capture channels from interfaces, so it must
+ *                        precede sana_deinit()
+ *   log_deinit           last, so everything above can still report failures
+ */
+static void
+ng_teardown_subsystems(void)
+{
+  /*
+   * A SECOND code anchor, on the shutdown path.
+   *
+   * The one in ng_stack_process() is printed at startup and locates the library;
+   * this one brackets the teardown itself. Together they answer two questions from
+   * one log: an Enforcer PC minus either anchor gives an exact offset to look up by
+   * name, AND the presence or absence of this line says whether a hit that happens
+   * "during shutdown" arrived before or after teardown actually began -- which
+   * distinguishes a fault IN the teardown from one in ordinary packet handling that
+   * merely happened while a shutdown was running. That distinction matters: ARP and
+   * ICMP-redirect processing keep running from the service loop right up until the
+   * break is taken, so "reproducible on every NetShutdown" is not by itself evidence
+   * that the teardown is what faulted.
+   *
+   * LOG_DEBUG, so it costs a line only when the log is turned up to find something.
+   */
+  log(LOG_DEBUG, "code anchor: ng_teardown_subsystems is at 0x%08lx, starting\n",
+      (unsigned long)(APTR)&ng_teardown_subsystems);
+
+  ng_netctl_deinit();		/* replies anything still queued before we vanish */
+  reapReleasedSockets();
+  netdb_deinit();
+  ng_bpf_shutdown();
+  sana_deinit();
+  timer_deinit();
+  mbdeinit();
+  log_deinit();
+}
+
+/*
+ * Try to make it safe to shut the stack down. Returns 1 if the API is now
+ * quiet and teardown may proceed, 0 if clients are still holding it open --
+ * in which case the API has been shown again and the caller MUST keep running.
+ *
+ * This is not "what the standalone build happens to do". It is the correct
+ * protocol for stopping a shared library that other programs have open, and
+ * the library build needs it MORE than the program build does, because that is
+ * the build where clients genuinely exist. It was the build that did not have
+ * it: ng_stack_process() went straight from CTRL-C to mbdeinit(), freeing the
+ * mbuf pool out from under live sockets and never waking anything asleep in
+ * tsleep(). An ARexx KILL reaches that path at any time.
+ *
+ * NETTRACE holds one base open permanently and is not counted, hence > 1.
+ */
+static int
+ng_stack_quiesce(void)
+{
+  int i;
+
+  api_hide();			/* no NEW openers from here on */
+
+  /* Ask politely, three times: break every task blocked inside a vector and
+   * give it a moment to close its base. */
+  for (i = 0; i < 3 && MasterSocketBase->lib_OpenCnt > 1; i++) {
+    api_sendbreaktotasks();
+    Delay(50);
+  }
+
+  /*
+   * An explicit network shutdown that has already given its warning goes ahead even
+   * if somebody is still holding on. The breaks are a courtesy, not a veto: an
+   * operator who asked for the network to stop has asked for it to stop, and one
+   * application that ignores the warning -- or is wedged and cannot answer it -- must
+   * not be able to keep the machine's networking up indefinitely. The refusal below
+   * is for a stray CTRL-C, where nobody has been warned and nothing was promised.
+   */
+  if (MasterSocketBase->lib_OpenCnt > 1 && ng_netctl_forced()) {
+    extern VOID api_abandon_bases(void);
+    log(LOG_NOTICE, "Shutting down anyway: %ld %s still open.\n",
+	MasterSocketBase->lib_OpenCnt - 1,
+	(MasterSocketBase->lib_OpenCnt == 2) ? "library base is" : "library bases are");
+    /* Going down past a program that would not let go. Neutralise its base before
+     * anything it refers to is freed, so its next call fails cleanly instead of
+     * reaching into a stack that is no longer there. */
+    api_abandon_bases();
+  }
+
+  if (MasterSocketBase->lib_OpenCnt > 1 && !ng_netctl_forced()) {
+    log(LOG_ERR, "Refusing to shut down: %ld %s still open.\n",
+	MasterSocketBase->lib_OpenCnt - 1,
+	(MasterSocketBase->lib_OpenCnt == 2) ? "library base is" : "library bases are");
+    /*
+     * Put it back -- unless a netctl shutdown request is still inside its grace
+     * period, in which case IT hid the API and it is the only thing entitled to show
+     * it again. api_hide()/api_show() are one un-owned flag, so an unrelated CTRL-C
+     * landing mid-request would otherwise re-admit new openers behind that request's
+     * back, and it would then report a client count including one it was promised
+     * could not appear.
+     */
+    if (!ng_netctl_pending())
+      api_show();
+    return 0;
+  }
+  return 1;
+}
+
+/*
  * clean up everything
  */
 void
@@ -664,46 +839,14 @@ deinit_all(void)
 
   api_hide();			/* hides the API from users */
 
-  /*
-   * Close any socket that was released for hand-off but never claimed. Must
-   * happen HERE -- after api_hide() has stopped new releases, but while the
-   * interfaces, timers and mbuf pool are all still alive, since closing a
-   * socket frees its buffers back into that pool. By the time api_deinit()
-   * runs at the end of this function, mbdeinit() has already freed it.
-   */
-  reapReleasedSockets();
-
-  /*
-   * Deinitialize network database.
-   */
-  netdb_deinit();
-
-  /*
-   * Close any open BPF capture channels (frees their buffers and detaches them
-   * from interfaces) BEFORE the interfaces themselves are torn down.
-   */
-  ng_bpf_shutdown();
-
-  /*
-   * Deinitialize network interfaces
-   */
-  sana_deinit();
-
-  /*
-   * Deinitialize timers
-   */
-  timer_deinit();
-
-  /*
-   * Free all resources allocated by mbufs.
-   */
-  mbdeinit();
-
-  log_deinit();
+  /* The subsystems themselves -- shared with the self-starting library's
+   * shutdown, so the two cannot drift apart again. */
+  ng_teardown_subsystems();
 
   /*
    * Check that there are no libraries open (to our API). We can continue only
-   * if all bases are closed.
+   * if all bases are closed. The library build does NOT do this: there the
+   * loader owns the library and its Close/Expunge handle that side.
    */
   api_deinit();  /* NOTICE: this waits until every api user has exited */
 }
@@ -801,6 +944,7 @@ static void ng_stack_process(void)
   malloc_init();		/* init_all() does this too -- MUST precede bsd_malloc() */
   ng_ram_tier();		/* size memory to installed RAM before config overrides */
   ng_cpu_tune();		/* gate RFC 1323 timestamps on the CPU, likewise */
+  { extern void ng_apply_env_tunables(void); ng_apply_env_tunables(); }
   ng_dnscache_init();		/* size the DNS cache from the RAM tier set above */
   { extern BOOL ng_readconfig_noargs(void);
     if (!ng_readconfig_noargs())	goto fail; }
@@ -811,7 +955,22 @@ static void ng_stack_process(void)
    * and note it MUST follow timer_init() (vlog() timestamps via GetSysTime()). */
   log(LOG_NOTICE, "AmiTCP_NG %s starting, logging to '%s' at level %ld",
       AMITCP_NG_VER, log_dest_name, log_level);
+  /*
+   * PORT (AmiTCP_NG): announce MBUFCHECK here, NOT in mbinit(). mbinit() runs
+   * before timer_init() on both init paths, and the queued log path timestamps
+   * via GetSysTime() -- the same ordering that once made logging die silently
+   * mid-boot. Saying it matters: a diagnostic that runs silently is
+   * indistinguishable from one that never started ("no faults" reads the same
+   * as "never ran"), and this mode costs speed, so any throughput measured on
+   * this machine has to be read in that light.
+   */
+  { extern LONG ng_mbufcheck_active;
+    if (ng_mbufcheck_active)
+      log(LOG_NOTICE, "mbuf: MBUFCHECK is ON -- pool poisoned on free and "
+	  "verified on allocation. This costs speed; turn it off when done."); }
+  { extern void ng_env_report(void); ng_env_report(); }
   if ((sanamask  = sana_init())  == 0L)	goto fail;
+  ng_bpf_init();		/* reset the BPF capture channel table */
   domaininit();
   if (init_netdb() != 0)		goto fail;
   if (Nettrace_Task)
@@ -823,8 +982,30 @@ static void ng_stack_process(void)
   AmiTCP_Task->tc_Node.ln_Name = "AmiTCP_NG";
   initialized = TRUE;
 
-  breakmask = SIGBREAKF_CTRL_C;			/* expunge signals us with this  */
-  sigmask   = timermask | breakmask | sanamask;
+  /*
+   * A CODE ANCHOR, so an Enforcer/CyberGuard hit can be turned back into a
+   * function name.
+   *
+   * A hit reports an absolute PC, and this library is loaded wherever there was
+   * room, so on its own that address says nothing -- an Enforcer report is a
+   * precise measurement of an unknown quantity. Trying to recover the load
+   * address by arithmetic on the register dump does not work either: it needs a
+   * guess about which value on the stack is a return address, and a wrong guess
+   * gives a plausible, checkable, WRONG answer (tried on 2026-08-24; the
+   * instruction at the derived offset did not match what Enforcer disassembled,
+   * which is the only reason the mistake was caught).
+   *
+   * With this line in the log the arithmetic is exact: subtract this address from
+   * the reported PC, add the address of ng_stack_process in the unstripped
+   * library's symbol table, and look it up. LOG_DEBUG, so it costs a line only
+   * when somebody has turned the log up to find something.
+   */
+  log(LOG_DEBUG, "code anchor: ng_stack_process is at 0x%08lx\n",
+      (unsigned long)(APTR)&ng_stack_process);
+
+  breakmask  = SIGBREAKF_CTRL_C;		/* expunge signals us with this  */
+  netctlmask = ng_netctl_init();		/* optional; 0 if unavailable    */
+  sigmask    = timermask | breakmask | sanamask | netctlmask;
   timer_send();
 
   ng_stack_running = TRUE;
@@ -846,39 +1027,79 @@ static void ng_stack_process(void)
   for (;;) {
     sig = Wait(sigmask);
     do {
-      if (sig & sanamask) { if (!sana_poll())  sig &= ~sanamask; }
+      if (sig & sanamask) { if (!sana_poll())  sig &= ~sanamask;
+			    sana_reconfig_poll(); }
       if (sig & timermask){ if (!timer_poll()) sig &= ~timermask; }
+      if (ng_netctl_poll()) Signal(FindTask(NULL), breakmask);
+      sig &= ~netctlmask;
       sig |= SetSignal(0L, sigmask) & sigmask;
     } while (sig && sig != breakmask);
-    if (sig & breakmask)
+    if (sig & breakmask) {
+      /*
+       * Asked to stop. Only actually stop if nobody is still using us.
+       *
+       * This used to break straight out and tear everything down, on the
+       * stated assumption that the only way here was the expunge path, by
+       * which time every base is closed. That assumption is false: the ARexx
+       * KILL command signals this task directly (sendbreak() in
+       * amiga_config.c), from a port that is running on this build too, at any
+       * moment. So a script could free the mbuf pool under live sockets and
+       * leave tasks asleep in tsleep() forever, with nothing woken and nothing
+       * warned.
+       *
+       * If clients remain, ng_stack_quiesce() has already shown the API again
+       * and we simply carry on serving -- NetShutdown is the supported way to
+       * take the network down without stopping the stack.
+       */
+      if (!ng_stack_quiesce())
+	continue;
       break;
+    }
   }
 
   initialized = FALSE;
   ng_stack_running = FALSE;
-  /* Subsystem teardown (deinit_all() MINUS the api_init/api_show/api_deinit
-   * calls -- the library's Close/Expunge own the library lifecycle). */
   spl0();
+
   /*
-   * PORT (AmiTCP_NG) fix: reclaim released-but-never-obtained sockets here
-   * too. This teardown was written as "deinit_all() minus the api_* calls" on
-   * the assumption that Close/Expunge would handle that side -- but neither
-   * ELL_Expunge() nor UL_Close() calls api_hide() or reapReleasedSockets(),
-   * and deinit_all() itself only runs from the standalone main() build and
-   * from panic(). So on the self-starting library build -- the one that
-   * actually ships -- nothing ever swept releasedSocketList, and each socket
-   * left on it leaked its struct socket plus an AllocMem'd SocketNode, the
-   * latter being system memory lost until reboot.
+   * The SAME subsystem teardown deinit_all() runs -- one copy, shared.
    *
-   * It must run BEFORE the subsystem teardown below: closing a socket returns
-   * its buffers to the mbuf pool that mbdeinit() is about to free.
+   * This was a hand-written duplicate of that list, and it drifted: it was
+   * missing reapReleasedSockets() for a whole revision (leaking a struct
+   * socket and an AllocMem'd SocketNode per released-but-unclaimed socket),
+   * then missing ng_bpf_shutdown(), and it had come to disagree with the
+   * original about whether netdb or BPF was torn down first. Each gap was
+   * found separately, by a review round, and patched separately -- which fixed
+   * the instance and left the mechanism to produce the next one.
+   *
+   * api_hide() has already run inside ng_stack_quiesce() above. api_deinit()
+   * deliberately does NOT run here: the loader created this library and its
+   * Close/Expunge own that side. Those two lines are the whole difference
+   * between the two shutdown paths, and they are now visible in one place.
    */
-  reapReleasedSockets();
-  netdb_deinit();
-  sana_deinit();
-  timer_deinit();
-  mbdeinit();
-  log_deinit();
+  ng_teardown_subsystems();
+
+  /*
+   * PUT THE LIBRARY BACK IN THE SYSTEM LIST.
+   *
+   * api_hide() does not merely stop new openers: it Remove()s MasterSocketBase from
+   * SysBase->LibList. In the PROGRAM build that is right -- the program made that
+   * base and is on its way out. Here it is not: this base is the resident
+   * LIBS:bsdsocket.library the loader created, and unlinking it without ever putting
+   * it back means the machine has no bsdsocket.library at all afterwards. The next
+   * OpenLibrary() cannot find it, so it either fails or loads a SECOND copy from disk
+   * alongside the one still sitting in memory.
+   *
+   * Nothing noticed for a long time because the only ways here were a console CTRL-C
+   * and an ARexx KILL. NetShutdown reaching this path is what exposed it: shut the
+   * network down, and the very next network command on the machine falls over.
+   *
+   * The stack really is down -- process gone, interfaces gone, memory returned, and
+   * ng_stack_running is FALSE. Being reachable is not the same as being up: the whole
+   * design of this library is that the next caller starts it again (NG_ENSURE_STACK),
+   * and that is exactly what should happen after a shutdown.
+   */
+  api_show();
   return;
 
 fail:

@@ -64,6 +64,11 @@ RESULT: EXTENSION VECTORS OK
 - **`udptest`** — sends a datagram to `127.0.0.1` and receives it back through
   the real socket layer: the definitive "packets flow through the stack" proof
   that does not need a NIC.
+- **`ugtest`** — 73 assertions against `LIBS:usergroup.library`, calling every
+  vector through its documented LVO so a wrong table entry shows up as a wrong
+  answer instead of silence. It needs no network and no stack. Note the boot
+  script **must assign `ENV:`**: `getuid()` reads an environment variable, and
+  without that assign DOS puts up a requester and the machine sits there.
 
 ## Rebuild-and-run cheat sheet
 

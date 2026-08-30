@@ -142,6 +142,14 @@ tcp_init()
 	tcp_isn_init();		/* seed the per-boot ISN secret */
 	tcp_now = 1;		/* RFC 1323 clock; non-zero (0 == "no ts_recent") */
 	tcb.inp_next = tcb.inp_prev = &tcb;
+	/*
+	 * PORT (AmiTCP_NG): reset the one-behind lookup cache with the list, for
+	 * the same reason as udp_last_inpcb in udp_init() -- tcp_input()
+	 * dereferences this unconditionally, with no walk and no bound, so a value
+	 * left over from a previous stack instance is read straight out of freed
+	 * pool memory by the first inbound segment.
+	 */
+	{ extern struct inpcb *tcp_last_inpcb; tcp_last_inpcb = &tcb; }
 	if (max_protohdr < sizeof(struct tcpiphdr))
 		max_protohdr = sizeof(struct tcpiphdr);
 	if (max_linkhdr + sizeof(struct tcpiphdr) > MHLEN)
@@ -179,8 +187,8 @@ tcp_template(tp)
 	n->ti_dport = inp->inp_fport;
 	n->ti_seq = 0;
 	n->ti_ack = 0;
-	n->ti_x2 = 0;
-	n->ti_off = 5;
+	/* TH_SET_OFF writes the whole byte, so it zeroes ti_x2 as well. */
+	TH_SET_OFF(&n->ti_t, sizeof (struct tcphdr));
 	n->ti_flags = 0;
 	n->ti_win = 0;
 	n->ti_sum = 0;
@@ -265,8 +273,7 @@ tcp_respond(tp, ti, m, ack, seq, flags)
 	ti->ti_x1 = 0;
 	ti->ti_seq = htonl(seq);
 	ti->ti_ack = htonl(ack);
-	ti->ti_x2 = 0;
-	ti->ti_off = sizeof (struct tcphdr) >> 2;
+	TH_SET_OFF(&ti->ti_t, sizeof (struct tcphdr));
 	ti->ti_flags = flags;
 	ti->ti_win = htons((u_short)win);
 	ti->ti_urp = 0;

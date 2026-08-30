@@ -36,7 +36,7 @@ struct sockaddr;
  *     : "=r"(_api_d0) : "r"(a6),"r"(d0) : ...clobbers...);
  *   return _api_d0;
  * The BASE_* macros below parameterise "the base is the first argument" so the same
- * template generates every stub. tmp/socktest.c and tmp/udptest.c hand-write this
+ * template generates every stub. The local socket test programs hand-write this
  * same jsr pattern for teaching purposes.
  *
  * PORT (AmiTCP_NG): under gcc 6.5 two mechanical fixes were needed here -- the d0
