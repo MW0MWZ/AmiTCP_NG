@@ -2289,12 +2289,18 @@ sana_rearm_reads(struct sana_softc *ssc)
  * diagnosed by GUESSWORK four times running, and every guess was wrong. The
  * three numbers below distinguish the remaining candidates outright:
  *
- *   posted == wanted, idle climbing   the drivers hold every read request we
- *                                     gave them and are completing none. The
- *                                     re-arm gate (sent < reqno) is correctly
- *                                     false, so nothing re-posts and nothing
- *                                     ever notices. This is the case with no
- *                                     recovery path in the code today.
+ *   posted == wanted, idle climbing   AMBIGUOUS, and reading it as a fault is
+ *                                     a mistake: a fully posted ring with a
+ *                                     climbing idle is exactly what a QUIET
+ *                                     LINK looks like. It only means the
+ *                                     drivers are holding every read and
+ *                                     completing none -- the case with no
+ *                                     recovery path in the code today, because
+ *                                     the re-arm gate (sent < reqno) is
+ *                                     correctly false -- when no packet has
+ *                                     ever been received, or when the peer is
+ *                                     known to be sending. Check if_ipackets
+ *                                     before blaming the driver.
  *   posted <  wanted, idle climbing   we retired reads and failed to re-arm --
  *                                     ours, in sana_rearm_reads()/the pool.
  *   posted == 0                       the ring bled to nothing; the watchdog

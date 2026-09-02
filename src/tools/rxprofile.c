@@ -105,6 +105,7 @@ struct sample {
   ULONG pcbmiss;			/* one-entry PCB cache misses */
   ULONG reassfull;			/* segments dropped: reassembly queue full */
   ULONG rxposted, rxwanted, rxidle;	/* receive-ring liveness */
+  ULONG rx_ever;			/* PacketsIn SINCE BOOT -- never differenced */
   ULONG cp32in, cp32out;		/* SANA-II R4 32-bit copy callbacks */
   ULONG dmain, dmaout;			/* SANA-II DMA: frames the driver moved itself */
   ULONG dmaask, dmaaskout;		/* ...and how often it ASKED, accepted or not */
@@ -258,6 +259,11 @@ static int take(char *ifname, struct sample *s)
   if (ng_queryif((void *)ifname, tg) != 0)
     return -1;
 
+  /* rx is differenced by delta() for the WATCH report; rx_ever is not. The ring
+   * verdict needs the LIFETIME count -- "no packet this session" and "no packet
+   * ever" are different claims, and only the second one accuses the driver. */
+  s->rx_ever = s->rx;
+
   take_tcp(s);
   return 0;
 }
@@ -316,23 +322,39 @@ static void fastpath(struct sample *s)
    * during a stall the interesting reading is often that everything here
    * is healthy, which rules out the whole receive path in one line.
    *
-   * Read posted/wanted together with idle -- neither means much alone.
-   * The verdicts below are the four cases in if_sana.c's ng_rx_posted()
-   * comment, spelled out here so the answer does not depend on whoever is
-   * reading the output knowing the code.
+   * Read posted/wanted together with idle -- neither means much alone, and a
+   * FULL ring with a climbing idle means nothing at all by itself: that is what
+   * a quiet link looks like. Only PacketsIn == 0 turns it into a driver
+   * verdict. The cases match if_sana.c's ng_rx_posted() comment, spelled out
+   * here so the answer does not depend on whoever is reading the output
+   * knowing the code.
    * ------------------------------------------------------------------ */
-  Printf((STRPTR)"  receive ring      = %ld posted of %ld, idle %ld s\n",
+  Printf((STRPTR)"  receive ring (whole stack) = %ld posted of %ld, idle %ld s\n",
          (LONG)s->rxposted, (LONG)s->rxwanted, (LONG)s->rxidle);
 
   if (s->rxidle >= 5) {
-    if (s->rxwanted && s->rxposted >= s->rxwanted)
-      Printf((STRPTR)"    <-- FULL ring, nothing completing: the DRIVER is holding\n"
-                     "        every read and returning none. Nothing re-posts,\n"
-                     "        because the re-arm gate only fires below the ring size.\n");
-    else if (s->rxposted == 0)
+    if (s->rxposted == 0)
       Printf((STRPTR)"    <-- ring EMPTY: every read was retired and none re-armed.\n"
                      "        The watchdog backstop is not recovering it.\n");
-    else
+    else if (s->rxwanted && s->rxposted >= s->rxwanted) {
+      /* A full ring that has been idle is the NORMAL state of a quiet link, and
+       * saying otherwise sent us after the driver on a reading taken while the
+       * peer was legitimately waiting on us. PacketsIn is what separates them:
+       * zero means no read has EVER come back, which no working driver does.
+       * rx_ever, not rx: in the WATCH report rx is a session delta, and a quiet
+       * session on a busy interface would otherwise print "never received a
+       * packet" directly above a since-boot count of millions. */
+      if (s->rx_ever == 0)
+        Printf((STRPTR)"    <-- ring FULL and NO packet has ever been received: the\n"
+                       "        driver is holding every read and completing none.\n"
+                       "        Nothing re-posts -- the re-arm gate only fires below\n"
+                       "        the ring size -- and nothing notices.\n");
+      else
+        Printf((STRPTR)"    (ring fully posted, link quiet for %ld s -- this is the\n"
+                       "     normal idle state. It is a fault only if the peer was\n"
+                       "     sending; confirm that before suspecting the driver.)\n",
+               (LONG)s->rxidle);
+    } else
       Printf((STRPTR)"    <-- ring PARTLY posted and idle: reads retired without\n"
                      "        being re-armed. Ours -- sana_rearm_reads/mbuf pool.\n");
   } else if (s->rxidle > 0) {
@@ -484,10 +506,14 @@ static void delta(struct sample *d, struct sample *b, struct sample *a)
    * many we want, how long since the last completion), not since-boot counters.
    * Differencing them would print 0 for a ring sitting permanently full -- the
    * exact state WATCH exists to catch -- and a negative idle as it recovers.
-   * Carry the CURRENT reading through. */
+   * Carry the CURRENT reading through. rx_ever rides along for the same
+   * reason: it is a lifetime figure and differencing it would let the ring
+   * verdict below say "never received a packet" about a quiet session on an
+   * interface that has carried gigabytes. */
   d->rxposted = b->rxposted;
   d->rxwanted = b->rxwanted;
   d->rxidle   = b->rxidle;
+  d->rx_ever  = b->rx_ever;
   d->cp32in   = DSUB(cp32in);
   d->cp32out  = DSUB(cp32out);
   d->dmain    = DSUB(dmain);
