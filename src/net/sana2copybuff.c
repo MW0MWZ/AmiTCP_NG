@@ -412,7 +412,7 @@ ng_rx_csum_chunk(src, dst, len, off, hlen, iplen, csum, odd)
   b_end = (end  < iplen) ? end  : iplen;
 
   if (b_end <= b_beg) {			/* nothing of this chunk is summed */
-    ng_bcopy_dev(src, dst, len);
+    ng_bcopy_dev((void *) src, dst, len);
     return 1;
   }
 
@@ -420,7 +420,7 @@ ng_rx_csum_chunk(src, dst, len, off, hlen, iplen, csum, odd)
   b_len = b_end - b_beg;
 
   if (a_len)				/* below hlen: copied, never summed */
-    ng_bcopy_dev(src, dst, a_len);
+    ng_bcopy_dev((void *) src, dst, a_len);
 
   /*
    * The fused primitive needs both pointers EVEN -- the 68000 traps on odd addresses
@@ -431,12 +431,12 @@ ng_rx_csum_chunk(src, dst, len, off, hlen, iplen, csum, odd)
   if ((((ULONG)(src + a_len) | (ULONG)(dst + a_len)) & 1) == 0) {
     *csum = in_cksum_copy_asm(src + a_len, dst + a_len, b_len, *csum, odd);
   } else {
-    ng_bcopy_dev(src + a_len, dst + a_len, b_len);
+    ng_bcopy_dev((void *)(src + a_len), dst + a_len, b_len);
     ok = 0;				/* copy is fine; the sum is not */
   }
 
   if (end > b_end)			/* at/after iplen: padding, never summed */
-    ng_bcopy_dev(src + (b_end - off), dst + (b_end - off), end - b_end);
+    ng_bcopy_dev((void *)(src + (b_end - off)), dst + (b_end - off), end - b_end);
 
   return ok;
 }

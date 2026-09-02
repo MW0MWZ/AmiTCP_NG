@@ -418,7 +418,7 @@ res_querydomain(struct SocketBase *	libPtr,
 		 */
 	        n = strlen(name) - 1;
 		if (name[n] == '.' && n < (2*MAXDNAME+2) - 1) {
-			bcopy(name, nbuf, n);
+			bcopy((void *) name, nbuf, n);
 		        nbuf[n] = '\0';
 		} else
 			longname = name;

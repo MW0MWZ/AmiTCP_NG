@@ -641,12 +641,12 @@ ng_gethostbyaddr_impl(struct SocketBase *libPtr, const UBYTE *addr, int len, int
     if (ptr != NULL) {
       if (HS->h_addr_count == 1) {
 	HS->h_addr_count++;
-	bcopy(addr, ptr, len);
+	bcopy((void *) addr, ptr, len);
 	HS->h_addr_ptrs[0] = ptr;
 	ptr += len;
       }      
       else
-	bcopy(addr, &HS->h_addr_ptrs[0], len);
+	bcopy((void *) addr, &HS->h_addr_ptrs[0], len);
       HS->h_addr_ptrs[1] = NULL;
       if ((anshost = makehostent(libPtr, HS, ptr)) != NULL) {
 	anshost->h_addrtype = type;

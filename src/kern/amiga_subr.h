@@ -52,13 +52,12 @@
 #ifndef AMIGA_SUBR_H
 #define AMIGA_SUBR_H
 
-/* ng_bcopy(): the single payload copy -- any length, any alignment, overlapping or
- * not. Hand-written 68k, contributed by Timm Mueller (src/kern/ng_bcopy.S).
- * ng_bcopy_dev() was the MOVE16-free variant kept for driver-owned buffers; there is
- * no MOVE16 any more, so the distinction is gone and the name is now an alias. Both
- * are declared before the __SASC/gcc split so either toolchain sees them. */
-void ng_bcopy(const void *src, void *dst, long len);
-#define ng_bcopy_dev(s,d,l) ng_bcopy(s,d,l)
+/* ng_memcopy is universal for any length, alignments, overlap */
+/* Register args are GNUC syntax; a SAS/C build would need its own form. */
+#define RARG(reg,arg) arg __asm(reg)
+void ng_memcopy( RARG("a0", void *), RARG("a1", void *), RARG("d0", long) );
+#define ng_bcopy(s,d,l) ng_memcopy(s,d,l)
+#define ng_bcopy_dev(s,d,l) ng_memcopy(s,d,l)
 
 #if __SASC
 /*
@@ -175,35 +174,8 @@ bzero(void *buf, register unsigned len)
     *s++ = '\0';
 }
 
-/*
- * ovbcopy() -- the overlap-safe copy. This was a byte-at-a-time C loop in both
- * directions; it now hands the whole job to ng_bcopy(), which picks the direction
- * the same way and then moves 64 bytes an iteration with movem.l instead of one
- * byte at a time.
- *
- * SAFE ONLY SINCE THE OVERLAP FIX. The routine Timm contributed peeled the odd
- * trailing byte BEFORE choosing a direction, which corrupted a forward
- * overlapping copy of odd length -- exactly what ovbcopy() exists to do. Do not
- * point anything else at ng_bcopy() for overlapping work without re-reading the
- * FIX 1 note in kern/ng_bcopy.S.
- *
- * Argument order already matches: both take (src, dst, len).
- */
-static inline void
-ovbcopy(const void *v1, void *v2, register unsigned len)
-{
-  ng_bcopy(v1, v2, (long)len);
-}
-
-static inline void
-bcopy(const void *v1, void *v2, register unsigned len)
-{
-  const register u_char *s1 = v1;
-  register u_char *s2 = v2;
-  
-  while (len--)
-    *s2++ = *s1++;
-}
+#define ovbcopy(s,d,l) ng_memcopy(s,d,l)
+#define bcopy(s,d,l) ng_memcopy(s,d,l)
 
 static inline int
 strlen(register const char *s1)
