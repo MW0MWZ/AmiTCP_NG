@@ -1558,6 +1558,15 @@ VOID SAVEDS RAF2(_ReleaseInterfaceList,
  * mean something else and which this stack honestly reports as 0. */
 #define NGIFQ_Copy32In		(TAG_USER + 0x004E4734)
 #define NGIFQ_Copy32Out		(TAG_USER + 0x004E4735)
+/* MUST match tools/ng_lvo.h -- the tools include no library headers, so these
+ * numbers are deliberately duplicated and a change here needs one there. */
+#define NGIFQ_DmaIn		(TAG_USER + 0x004E4736)
+#define NGIFQ_DmaOut		(TAG_USER + 0x004E4737)
+#define NGIFQ_DmaAsk		(TAG_USER + 0x004E4738)
+#define NGIFQ_DmaAskOut		(TAG_USER + 0x004E4739)
+#define NGIFQ_DmaNoBuf		(TAG_USER + 0x004E473A)
+#define NGIFQ_DmaNoLen		(TAG_USER + 0x004E473B)
+#define NGIFQ_DmaNoAlign		(TAG_USER + 0x004E473C)
 /* Per-interface I/O counters a monitor (NetMon) queries. This stack's ifnet/SANA softc
  * do not track most of them; we still answer with a plausible value (0, or the I/O
  * request-pool size) so a tool never reads its own uninitialised buffer as the result. */
@@ -1776,6 +1785,27 @@ LONG SAVEDS RAF3(_QueryInterfaceTagList,
       break;
     case NGIFQ_Copy32Out:
       *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_copyout32 : 0;
+      break;
+    case NGIFQ_DmaIn:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmato32 : 0;
+      break;
+    case NGIFQ_DmaOut:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmafrom32 : 0;
+      break;
+    case NGIFQ_DmaAsk:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmaask : 0;
+      break;
+    case NGIFQ_DmaAskOut:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmaaskout : 0;
+      break;
+    case NGIFQ_DmaNoBuf:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmano_buf : 0;
+      break;
+    case NGIFQ_DmaNoLen:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmano_len : 0;
+      break;
+    case NGIFQ_DmaNoAlign:
+      *(ULONG *)d = (ssc != NULL) ? (ULONG)ssc->ss_dmano_align : 0;
       break;
     case IFQ_Overruns:
     case IFQ_UnknownTypes:
@@ -3239,9 +3269,9 @@ extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 struct ng_rsd_opt { const char *name; UWORD flags; void *data; };
 static const struct ng_rsd_opt ng_rsd_opts[] = {
   /*
-   * Names Roadshow publishes that we can honestly back. Roadshow lists 21 options
-   * and a script may ask for any of them by name; one it cannot find is another way
-   * for it to give up. Only options with a real variable behind them are added --
+   * The option names the Roadshow-compatible configuration tools ask for, limited
+   * to those we can honestly back. Twenty-one names are in circulation and a script
+   * may ask for any of them; one it cannot find is another way for it to give up. Only options with a real variable behind them are added --
    * publishing a knob that controls nothing would be worse than not having it.
    *
    * Still absent, for want of anything to point at: tcp.rttdflt, tcp.random,

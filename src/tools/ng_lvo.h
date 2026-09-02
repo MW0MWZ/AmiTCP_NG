@@ -76,6 +76,15 @@ extern struct Library *SocketBase;
  * the original two functions -- which is the measurement). */
 #define NGIFQ_Copy32In		(NG_TU + 0x004E4734)
 #define NGIFQ_Copy32Out		(NG_TU + 0x004E4735)
+/* SANA-II DMA: frames the driver moved itself instead of calling a copy hook.
+ * Non-zero means DMA is genuinely in use on this interface. */
+#define NGIFQ_DmaIn		(NG_TU + 0x004E4736)
+#define NGIFQ_DmaOut		(NG_TU + 0x004E4737)
+#define NGIFQ_DmaAsk		(NG_TU + 0x004E4738)
+#define NGIFQ_DmaAskOut		(NG_TU + 0x004E4739)
+#define NGIFQ_DmaNoBuf		(NG_TU + 0x004E473A)
+#define NGIFQ_DmaNoLen		(NG_TU + 0x004E473B)
+#define NGIFQ_DmaNoAlign		(NG_TU + 0x004E473C)
 /* AmiTCP_NG-private: the stack-computed effective TCP MSS for the interface
  * (override-aware). MUST match NGIFQ_TcpMss in src/api/amiga_roadshow_compat.c. */
 #define NGIFQ_TcpMss		(NG_TU + 0x004E4730)
@@ -253,6 +262,9 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
 #define NG_SBTC_TCP_PREDDAT	0x2006	/* TCP fast-path hits, in-seq data    */
 #define NG_SBTC_TCP_RCVTOTAL	0x2007	/* all TCP segments received          */
 #define NG_SBTC_TCP_PCBMISS	0x2008	/* one-entry PCB cache misses         */
+/* MUST match SBTC_NG_TCP_REASSFULL in netinclude/amitcp/socketbasetags.h --
+ * the tools include no library headers, so the value is duplicated here. */
+#define NG_SBTC_TCP_REASSFULL	0x200A	/* segs dropped: reass queue full     */
 #define NG_SBTC_TCP_PREDWIN	0x2009	/* fast-path hits, window updates     */
 #define NG_SBTC_SOWK_CALLS	0x2020
 #define NG_SBTC_SOWK_RCV	0x2021

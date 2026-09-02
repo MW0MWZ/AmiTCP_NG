@@ -798,7 +798,7 @@ extern unsigned long ng_detected_ram;			/* kern/amiga_main.c   */
 extern unsigned long tcp_sendspace, tcp_recvspace;	/* netinet/tcp_usrreq.c */
 extern unsigned long sb_max;				/* kern/uipc_socket2.c  */
 extern unsigned long ng_last_if_baudrate;		/* api/amiga_roadshow_compat.c */
-extern int tcppredack, tcppreddat, tcppcbcachemiss, tcppredwin;
+extern int tcppredack, tcppreddat, tcppcbcachemiss, tcppredwin, tcpreassfull;
 /* Socket wakeup accounting -- defined in kern/uipc_socket2.c, NOT tcp_input.c. */
 extern unsigned long ng_sowk_calls, ng_sowk_rcv, ng_sowk_wait, ng_sowk_sel, ng_sowk_async;	/* netinet/tcp_input.c  */
 extern u_long ng_tcp_rcvtotal();			/* netinet/tcp_input.c  */
@@ -1250,6 +1250,7 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	break;
 
       CASE_NG_GET( SBTC_NG_TCP_PCBMISS, tcppcbcachemiss );
+      CASE_NG_GET( SBTC_NG_TCP_REASSFULL, tcpreassfull );
       CASE_NG_GET( SBTC_NG_TCP_PREDWIN, tcppredwin      );
 
       CASE_NG_GET( SBTC_NG_SOWK_CALLS,  ng_sowk_calls );

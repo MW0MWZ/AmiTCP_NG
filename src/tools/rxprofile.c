@@ -103,7 +103,11 @@ struct sample {
   LONG  bps, mtu, state;
   ULONG predack, preddat, predwin, rcvtotal; /* TCP header-prediction accounting */
   ULONG pcbmiss;			/* one-entry PCB cache misses */
+  ULONG reassfull;			/* segments dropped: reassembly queue full */
   ULONG cp32in, cp32out;		/* SANA-II R4 32-bit copy callbacks */
+  ULONG dmain, dmaout;			/* SANA-II DMA: frames the driver moved itself */
+  ULONG dmaask, dmaaskout;		/* ...and how often it ASKED, accepted or not */
+  ULONG dmanobuf, dmanolen, dmanoalign;	/* why we declined */
   ULONG wkcalls, wkrcv, wkwait, wksel, wkasync;	/* socket wakeup accounting */
   ULONG miss[NMISS];			/* why prediction rejected a segment */
 };
@@ -144,7 +148,7 @@ static void take_tcp(struct sample *s)
 {
   /* +11 = 5 base counters + 5 sowakeup counters + TAG_END. Adding a tag before
    * the miss loop means bumping this AND the miss base index below. */
-  struct TagItem tg[NMISS + 11];
+  struct TagItem tg[NMISS + 12];
   int i, n = 0;
 
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_PREDACK);  tg[n++].ti_Data = 0;
@@ -157,6 +161,7 @@ static void take_tcp(struct sample *s)
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_WAIT);    tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_SEL);     tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_ASYNC);   tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_REASSFULL);tg[n++].ti_Data = 0;
   for (i = 0; i < NMISS; i++) {
     tg[n].ti_Tag = NG_SBTM_GETVAL(missdef[i].tag);     tg[n++].ti_Data = 0;
   }
@@ -172,8 +177,9 @@ static void take_tcp(struct sample *s)
   s->wkcalls  = tg[5].ti_Data;  s->wkrcv   = tg[6].ti_Data;
   s->wkwait   = tg[7].ti_Data;  s->wksel   = tg[8].ti_Data;
   s->wkasync  = tg[9].ti_Data;
+  s->reassfull= tg[10].ti_Data;
   for (i = 0; i < NMISS; i++)
-    s->miss[i] = tg[10 + i].ti_Data;
+    s->miss[i] = tg[11 + i].ti_Data;
 }
 
 /* Percentage of `total` that `part` represents, rounded, 0 when total is 0.
@@ -214,7 +220,7 @@ static int ci_eq(const char *a, const char *b)
 
 static int take(char *ifname, struct sample *s)
 {
-  struct TagItem tg[14];
+  struct TagItem tg[21];
 
   /* Zero everything: an untouched buffer reads back as stack garbage, which is
    * exactly the class of bug that made ShowNetStatus print impossible figures. */
@@ -233,7 +239,14 @@ static int take(char *ifname, struct sample *s)
   tg[10].ti_Tag = IFQ_GetSANA2CopyStats;tg[10].ti_Data = (ULONG)&s->cs;
   tg[11].ti_Tag = NGIFQ_Copy32In;       tg[11].ti_Data = (ULONG)&s->cp32in;
   tg[12].ti_Tag = NGIFQ_Copy32Out;      tg[12].ti_Data = (ULONG)&s->cp32out;
-  tg[13].ti_Tag = TAG_END;              tg[13].ti_Data = 0;
+  tg[13].ti_Tag = NGIFQ_DmaIn;          tg[13].ti_Data = (ULONG)&s->dmain;
+  tg[14].ti_Tag = NGIFQ_DmaOut;         tg[14].ti_Data = (ULONG)&s->dmaout;
+  tg[15].ti_Tag = NGIFQ_DmaAsk;         tg[15].ti_Data = (ULONG)&s->dmaask;
+  tg[16].ti_Tag = NGIFQ_DmaAskOut;      tg[16].ti_Data = (ULONG)&s->dmaaskout;
+  tg[17].ti_Tag = NGIFQ_DmaNoBuf;       tg[17].ti_Data = (ULONG)&s->dmanobuf;
+  tg[18].ti_Tag = NGIFQ_DmaNoLen;       tg[18].ti_Data = (ULONG)&s->dmanolen;
+  tg[19].ti_Tag = NGIFQ_DmaNoAlign;     tg[19].ti_Data = (ULONG)&s->dmanoalign;
+  tg[20].ti_Tag = TAG_END;              tg[20].ti_Data = 0;
 
   if (ng_queryif((void *)ifname, tg) != 0)
     return -1;
@@ -285,6 +298,11 @@ static void fastpath(struct sample *s)
          (LONG)slow, (LONG)pct(slow, s->rcvtotal));
   Printf((STRPTR)"    PCB cache miss  = %-10ld (%ld%%)\n",
          (LONG)s->pcbmiss, (LONG)pct(s->pcbmiss, s->rcvtotal));
+  /* Non-zero means segments were REFUSED admission to the reassembly queue.
+   * A handful is survivable; a climbing count during a stall is the cause. */
+  if (s->reassfull)
+    Printf((STRPTR)"  reassembly queue FULL, segments dropped = %ld  <-- transfer will stall\n",
+           (LONG)s->reassfull);
 
   if (slow == 0)
     return;
@@ -334,6 +352,22 @@ static void absolute(struct sample *s)
    * pair always works; a non-zero 32-bit count means the driver understands
    * SANA-II R4, which is what decides whether the DMA variants are worth
    * building. Zero here is a real answer, not a missing feature. */
+  /* THE ONE THAT ANSWERS "is DMA actually being used?". These count frames the
+   * driver moved itself, so non-zero is proof, not inference. Zero with the hooks
+   * offered means the driver looked and declined -- which is the common case. */
+  /* ASKED and ACCEPTED are reported separately because a zero accept count on its
+   * own is ambiguous -- "never asked" and "asks constantly, refused every time"
+   * look identical, and they call for opposite responses. */
+  Printf((STRPTR)"  DMA asked in/out = %ld/%ld   accepted in/out = %ld/%ld\n",
+         (LONG)s->dmaask, (LONG)s->dmaaskout, (LONG)s->dmain, (LONG)s->dmaout);
+  if (s->dmain || s->dmaout)
+    Printf((STRPTR)"    <-- DMA IS IN USE\n");
+  else if (s->dmaask || s->dmaaskout)
+    Printf((STRPTR)"    <-- driver ASKS but we refuse every time; declined:"
+                   " no-buffer %ld  bad-length %ld  misaligned %ld\n",
+           (LONG)s->dmanobuf, (LONG)s->dmanolen, (LONG)s->dmanoalign);
+  else
+    Printf((STRPTR)"    (driver never asks -- it copies; DMA costs nothing here)\n");
   Printf((STRPTR)"  R4 copy32 in = %-8ld R4 copy32 out = %ld%s\n",
          (LONG)s->cp32in, (LONG)s->cp32out,
          (LONG)((s->cp32in || s->cp32out) ? "  <-- driver is R4-aware"
@@ -410,8 +444,16 @@ static void delta(struct sample *d, struct sample *b, struct sample *a)
   d->preddat  = DSUB(preddat);
   d->rcvtotal = DSUB(rcvtotal);
   d->pcbmiss  = DSUB(pcbmiss);
+  d->reassfull= DSUB(reassfull);
   d->cp32in   = DSUB(cp32in);
   d->cp32out  = DSUB(cp32out);
+  d->dmain    = DSUB(dmain);
+  d->dmaout   = DSUB(dmaout);
+  d->dmaask   = DSUB(dmaask);
+  d->dmaaskout= DSUB(dmaaskout);
+  d->dmanobuf = DSUB(dmanobuf);
+  d->dmanolen = DSUB(dmanolen);
+  d->dmanoalign=DSUB(dmanoalign);
   for (i = 0; i < NMISS; i++)
     d->miss[i] = (b->miss[i] > a->miss[i]) ? b->miss[i] - a->miss[i] : 0;
 

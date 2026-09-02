@@ -62,8 +62,20 @@ else
   CPU="${CPU:-0}"                                   # A600 is a 68000 -- leave it alone
 fi
 
+# fpu_model is NOT the same knob as cpu_model, and it does not take a CPU number.
+# Amiberry accepts 0 / 68881 / 68882 / 68040 / 68060 -- so "fpu_model=68020" is not a
+# valid FPU and the emulator never reaches the guest (empty phase.log, reads exactly
+# like the stack hanging). The 040/060 have the FPU on-chip and name themselves; a
+# bare 020/030 has no FPU unless one is fitted, which is the honest default for a
+# test rig. This only ever worked before because CPU was always 68040.
 CPUARG=()
-[ "$CPU" != "0" ] && CPUARG=(-s "cpu_model=$CPU" -s "fpu_model=$CPU")
+if [ "$CPU" != "0" ]; then
+  case "$CPU" in
+    68040|68060) FPUMODEL="$CPU" ;;   # on-chip FPU, named after the CPU
+    *)           FPUMODEL=0 ;;        # 68020/68030: no coprocessor fitted
+  esac
+  CPUARG=(-s "cpu_model=$CPU" -s "fpu_model=$FPUMODEL")
+fi
 
 docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
   Xvfb :99 -screen 0 1024x768x24 +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
@@ -72,10 +84,50 @@ docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
   sleep 2
   echo '>>> launching amiberry (model $MODEL, CPU=$CPU, NET=$NET, RAM=${RAM}MB Z3, timeout ${TIMEOUT}s)'
   cd /opt/amiberry
+  # STOP AS SOON AS THE GUEST IS DONE.
+  #
+  # This used to be a bare timeout+amiberry, so every run burned its whole
+  # timeout however quickly the guest finished -- the test scripts write
+  # done.marker as their last act and then the host just sat there. Over a
+  # three-tier smoke run that was minutes of pure waiting.
+  #
+  # The guest disk is a DIRECTORY mount, not an HDF, so guest writes land on this
+  # filesystem as they happen and the marker shows up here immediately. Poll for
+  # it and stop. TIMEOUT goes back to being the backstop it was meant to be, for a
+  # guest that hangs or never reaches the end.
+  rm -f '$HDD/done.marker'
   timeout ${TIMEOUT} ./build/amiberry --model $MODEL \
      -r '$ROM' \
      -s filesystem2=rw,DH0:System:'$HDD',0 \
      ${NETARG[*]} ${RAMARG[*]} ${CPUARG[*]} \
-     -G 2>&1 | grep -viE '^\s*$' | tail -30
+     -G >/tmp/ami.log 2>&1 &
+  amipid=\$!
+  waited=0
+  while [ \$waited -lt ${TIMEOUT} ]; do
+    if [ -s '$HDD/done.marker' ]; then
+      sleep 3                       # let the guest quiesce after its last write
+      kill \$amipid 2>/dev/null
+      echo \">>> guest finished after \${waited}s (timeout ${TIMEOUT}s)\"
+      break
+    fi
+    if ! kill -0 \$amipid 2>/dev/null; then
+      # The emulator stopped by itself. That is NOT the same as the guest
+      # hanging, and reporting it as one sends the reader hunting a stack bug
+      # that is not there. Say which happened and show the emulator's own output.
+      early=1; break
+    fi
+    sleep 1; waited=\$((waited+1))
+  done
+  wait \$amipid 2>/dev/null
+  if [ -s '$HDD/done.marker' ]; then
+    :
+  elif [ \"\${early:-0}\" = 1 ]; then
+    echo \">>> EMULATOR EXITED on its own after \${waited}s with no done.marker --\"
+    echo \">>> this is an emulator/host failure, NOT necessarily a guest hang:\"
+    tail -20 /tmp/ami.log
+  else
+    echo \">>> TIMEOUT after ${TIMEOUT}s with no done.marker -- the guest really did hang\"
+  fi
+  grep -viE '^[[:space:]]*\$' /tmp/ami.log | tail -30
   echo '>>> amiberry exited'
 "

@@ -4,7 +4,7 @@
 # TIERED smoke test. Run this before calling any stack change "done".
 #
 #   TIER 1  68000 build on an A600, loopback only.        <-- GATE
-#   TIER 2  68020 then 68040 build on the A4000 rig.      <-- only if tier 1 passed
+#   TIER 2  the SAME 68000 build, on 68020 and 68040 hosts. <-- only if tier 1 passed
 #
 # WHY TIERED, in this order. Tier 1 is the cheap, broad one: it is the only
 # machine in the harness that runs the plain 68000 multilib, and a fault in the
@@ -15,9 +15,9 @@
 # is a GATE: if it fails, tier 2 does not run at all, because a stack that
 # cannot do a UDP loopback round trip has nothing useful to say about DHCP.
 #
-# Tier 2 is the FIDELITY one: 68040 CPU and a link that claims 100 Mbit via the
-# bps= override -- an emulated A2065 reports 10 Mbit, which puts the stack on a
-# different auto-tune path than any real machine we care about.
+# Tier 2 is the FIDELITY one: an accelerated CPU and a link that claims 100 Mbit
+# via the bps= override -- an emulated A2065 reports 10 Mbit, which puts the stack
+# on a different auto-tune path than any real machine we care about.
 #
 # RAM is deliberately MID-LADDER (32 MB Z3 + the A4000's own ~9 MB = ~42 MB, the
 # 16-64MB tier), not a big-RAM machine. ng_ram_tier() installs a different set of
@@ -27,10 +27,17 @@
 # the RAM ceiling (262800) is BELOW the 100 Mbit link target (524140), so the
 # clamp is exercised, where on a big-RAM machine the link target simply wins.
 #
-# Both the 68020 and 68040 libraries run there because THE ARCH IS WHAT BIT US:
-# the 4.1.6 DHCP failure existed only in the 68040 build, and the harness ran the
-# 68000 one, so for weeks it "could not be reproduced". Never smoke one arch and
-# assume the others.
+# TIER 2 BUILDS NOTHING OF ITS OWN. It stages the 68000 library -- the only one
+# that ships -- and boots it on a 68020 host and then a 68040 host. It used to
+# build a -m68020 and a -m68040 library instead, which since the 020/040 archives
+# were dropped meant every smoke run tested two binaries that exist in no release
+# while the shipped one was only ever seen on the A600.
+#
+# Running it on both CPUs still matters, for the reason that bit us in 4.1.6: the
+# PROCESSOR selects code paths at run time. ng_cpu_tune() gates the RFC 1323
+# options on AFF_68020|...|AFF_68060, so a 68000 binary takes a different route
+# through the stack on an accelerated machine than it does on an A600. That is
+# also exactly how a user runs it -- one archive, every CPU.
 #
 #   ./docker/run-smoke.sh            # tier 1, then tier 2 if it passed
 #   ./docker/run-smoke.sh tier1      # gate only
@@ -115,6 +122,13 @@ pass=0; fail=0
 say()  { printf '%s\n' "$*"; }
 ok()   { pass=$((pass+1)); say "    PASS  $*"; }
 bad()  { fail=$((fail+1)); say "    FAIL  $*"; }
+# When a tier finishes without done.marker, say WHY the emulator stopped and how
+# far the guest actually got. Without this, an emulator that died on the host is
+# indistinguishable from a stack that hung, and the reader chases the wrong bug.
+emu_why() {
+  say "          emulator: $(LC_ALL=C grep -a 'EMULATOR EXITED\|TIMEOUT after\|guest finished' /tmp/ng-emu.log 2>/dev/null | head -1)"
+  say "          guest reached: $(gcat phase.log | tr '\n' ' ')"
+}
 
 # Guest files are written by the emulator running as root in the container, so
 # read them back through a container rather than fighting host permissions.
@@ -186,8 +200,15 @@ Wait 5
 EOF
 }
 
+# What stage() last built, so an "all" run does not build -m68000 twice (tier 1
+# stages it, then tier 2 wants the same library on a different HOST cpu).
+STAGED_ARCH=""
 stage() {   # stage <arch>
   local arch="$1"
+  if [ "$arch" = "$STAGED_ARCH" ]; then
+    say "  reusing the ${arch} library already staged"
+    return 0
+  fi
   say "  building library and tools at ${arch}"
   NG_ARCH="$arch" ./docker/build-lib.sh   >/dev/null 2>&1 || { bad "library build ($arch)"; return 1; }
   NG_ARCH="$arch" ./docker/build-tools.sh >/dev/null 2>&1 || { bad "tools build ($arch)";   return 1; }
@@ -196,6 +217,7 @@ stage() {   # stage <arch>
            CheckAmiTCPNGConfig ping; do
     [ -f "build/$t" ] && cp "build/$t" "$G/C/$t"
   done
+  STAGED_ARCH="$arch"
   say "  staged $(wc -c < build/bsdsocket.library) byte library"
 }
 
@@ -204,11 +226,12 @@ tier1() {
   say ""; say "=== TIER 1: 68000 build, A600, loopback (GATE) ==="
   stage -m68000 || return 1
   seq_tier1; gclean
-  TIMEOUT=150 ./docker/run-amiberry.sh >/dev/null 2>&1
+  TIMEOUT=150 ./docker/run-amiberry.sh >/tmp/ng-emu.log 2>&1
 
   local before=$fail
   [ -n "$(gcat done.marker)" ] && ok "boot completed (done.marker)" \
-                               || bad "no done.marker -- the sequence never finished (hang?)"
+                               || { bad "no done.marker -- the sequence never finished"
+                                    emu_why; }
   case "$(gcat firsttouchtest.log)" in
     *"FIRST TOUCH OK"*) ok "first-touch start-up" ;;
     *)                  bad "first-touch (lazy stack start)" ;;
@@ -242,16 +265,15 @@ tier1() {
 }
 
 # --- TIER 2 -----------------------------------------------------------------
-tier2_one() {   # tier2_one <arch>
-  local arch="$1"
-  say ""; say "=== TIER 2: ${arch} build, A4000/68040, ~42 MB, 100 Mbit link ==="
-  stage "$arch" || return 1
+tier2_one() {   # tier2_one <host cpu>   -- the library is staged by the caller
+  local host="$1"
+  say ""; say "=== TIER 2: 68000 build on A4000/${host}, ~42 MB, 100 Mbit link ==="
   seq_tier2; gclean
-  RAM=32 NET=1 CPU=68040 TIMEOUT=300 ./docker/run-amiberry.sh >/dev/null 2>&1
+  RAM=32 NET=1 CPU="$host" TIMEOUT=300 ./docker/run-amiberry.sh >/tmp/ng-emu.log 2>&1
 
   local before=$fail
   [ -n "$(gcat done.marker)" ] && ok "boot completed (done.marker)" \
-                               || bad "no done.marker -- sequence never finished (hang?)"
+                               || { bad "no done.marker -- sequence never finished"; emu_why; }
   # A lease, specifically. An APIPA 169.254 address is the shape the 4.1.6 bug
   # took, and it is NOT a pass -- the interface comes up either way.
   case "$(gcat pass1.log)" in
@@ -311,8 +333,13 @@ if [ "$WHICH" = "all" ] || [ "$WHICH" = "tier1" ]; then
   fi
 fi
 if [ "$WHICH" = "all" ] || [ "$WHICH" = "tier2" ]; then
-  tier2_one -m68020 || rc=1
-  tier2_one -m68040 || rc=1
+  # Stage ONCE: the shipped 68000 library is what both host CPUs run.
+  if stage -m68000; then
+    tier2_one 68020 || rc=1
+    tier2_one 68040 || rc=1
+  else
+    rc=1
+  fi
 fi
 
 say ""

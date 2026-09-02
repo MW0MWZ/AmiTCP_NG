@@ -191,6 +191,7 @@ sana_submit(struct IOIPReq *req)
 {
   req->ioip_s2.ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
   req->ioip_s2.ios2_Req.io_Flags &= ~IOF_QUICK;
+  req->ioip_dmaed = 0;			/* fresh cycle: no DMA promised yet */
   BeginIO((struct IORequest *)req);
 }
 
@@ -872,7 +873,15 @@ iface_make(struct ssconfig *ifc)
   if ((req = CreateIOSana2Req(NULL)) == NULL)
     log(LOG_ERR, "iface_find(): CreateIOSana2Req failed\n");
   else {
-    req->ios2_BufferManagement = buffermanagement;
+    /* Chosen once, here: a driver keeps the list it was opened with, so changing
+     * the setting can never swap hooks under a live interface. */
+    req->ios2_BufferManagement =
+      ng_sana_dma ? buffermanagement_dma : buffermanagement;
+    /* Say which list went out. Zero DMA counters mean "never offered" or "offered
+     * and the driver declined" -- opposite conclusions, and only the log separates
+     * them. */
+    if (ng_sana_dma)
+      log(LOG_INFO, "sana: offering S2_DMACopy{To,From}Buff32 to the driver\n");
 
     /* PORT (AmiTCP_NG): resolve the SANA-II driver robustly. A config just names the
      * driver (e.g. `device=wifipi.device`). Try it exactly as given FIRST -- a bare
@@ -1100,8 +1109,8 @@ iface_make(struct ssconfig *ifc)
  * one interface back: the calling task never returns, the semaphore is never
  * released, and every other task that needs it stops too. The whole library dies.
  *
- * That is not a theory. Crippling a driver so it swallows S2_ONLINE (MODE=hang in
- * docker/run-offline.sh) wedged the emulated machine exactly so: the
+ * That is not a theory. Crippling a driver so it swallows S2_ONLINE wedged an
+ * emulated machine exactly so: the
  * ONLINE command never returned, and an unrelated GetNetStatus issued afterwards
  * never returned either. The guest never reached the end of its own boot script.
  *
@@ -2712,6 +2721,59 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
 
   switch (req->ioip_Error) {
   case 0:
+    /*
+     * DMA'd frame: the driver wrote straight into our cluster and no copy hook
+     * ran, so nothing has built the packet. Do here what copy_to_mbuf_body()
+     * does at its end. Only inside case 0 -- on an error the buffer was never
+     * touched, and treating it as a frame would promote stale bytes.
+     */
+    if (req->ioip_dmaed && m == NULL) {
+      register struct mbuf *hdr = req->ioip_reserved;
+      register struct mbuf *cl  = hdr ? hdr->m_next : NULL;
+      register ULONG dlen = (ULONG)req->ioip_s2.ios2_DataLength;
+
+      req->ioip_dmaed = 0;
+      if (cl != NULL && dlen != 0 && dlen <= (ULONG)mtu &&
+	  dlen <= (ULONG)cl->m_ext.ext_size) {
+	/*
+	 * The CPU never saw these bytes, so on a 68040/060 copyback cache any
+	 * line we hold for this range is stale. A compliant driver flushes around
+	 * its own DMA; we cannot verify that per driver, so do it unconditionally.
+	 * No-op below a 68040. Legal here: sana_read() runs in task context (the
+	 * network task via sana_poll()), not at interrupt.
+	 *
+	 * SAFE BECAUSE OF THE FLUSH IN m_dma_to_mbuf32(). "Clear" on a copyback
+	 * cache is push-THEN-invalidate, so a dirty line surviving from this
+	 * recycled cluster's previous life would be written out ON TOP of the
+	 * frame the device just delivered. The hook flushes this exact range
+	 * before handing it over, so by here nothing is dirty and only the
+	 * invalidate half has any effect.
+	 *
+	 * That same pre-flush is why the paths which retire a read WITHOUT coming
+	 * through here (sana_probe_read, sana_unrun) need no cache handling: they
+	 * free the cluster back to the pool, and every consumer writes it before
+	 * reading it -- a re-used RX cluster is flushed again by the hook, and any
+	 * other use fills it by CPU first. Stale CLEAN lines cannot outlive that.
+	 */
+	CacheClearE((APTR)mtod(cl, caddr_t), dlen, CACRF_ClearD);
+
+	hdr->m_next = NULL;		/* detach the unused header mbuf   */
+	req->ioip_reserved = cl->m_next;	/* leftovers stay reserved   */
+	cl->m_next = NULL;
+	m_free(hdr);			/* NOT just detached: the refill path
+					 * tests the leftover chain for M_PKTHDR
+					 * and would stack a second header on it */
+	MCHTYPE(cl, MT_HEADER);		/* it is a packet head now; keeps mbstat honest */
+	cl->m_flags |= M_PKTHDR;	/* m_ext does not overlap m_pkthdr -- asserted
+					 * at compile time in sys/mbuf.h */
+	cl->m_len = (int)dlen;
+	cl->m_pkthdr.len = (int)dlen;
+	cl->m_pkthdr.rcvif = (struct ifnet *)ssc;
+	req->ioip_packet = NULL;
+	m = cl;
+      }
+      /* else: decline quietly -- the read is re-armed by the caller as usual. */
+    }
     /* A driver that completes a read with io_Error == 0 but never ran CopyToBuff
      * (m_copy_to_mbuf returned FALSE -- e.g. a rejected over/undersized or zero-
      * length frame) leaves ioip_packet, and so m, NULL. Writing m->m_flags then

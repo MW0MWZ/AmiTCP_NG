@@ -279,9 +279,9 @@ ULO=USELOOPBACK ;	1 ;	DEPRECATED and ignored -- local traffic always uses loopba
 extern LONG useloopback;
 { VAR_ENUM, VF_RW, NULL, &useloopback, boolean_enum }
 #
-MV16=USEMOVE16 ;	1 ;	Use the 68040/68060 MOVE16 burst copy for payload (default off).
-extern LONG ng_use_move16;
-{ VAR_ENUM, VF_RW, NULL, &ng_use_move16, boolean_enum }
+SDMA=SANADMA ;	1 ;	Let a capable driver DMA frames straight into our buffers (default on).
+extern LONG ng_sana_dma;
+{ VAR_ENUM, VF_RW, NULL, &ng_sana_dma, boolean_enum }
 #
 TCPSND=TCP_SENDSPACE ;	1 ;	Default size of the sending socket buffer (TCP).
 extern ULONG tcp_sendspace;

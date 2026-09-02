@@ -63,7 +63,7 @@ STRPTR KW_VARS = (STRPTR)
   "MBS=MBUF_STAT,MBTS=MBUF_TYPE_STATS,MBC=MBUF_CONF,LOG,TASKNAME,"
   "NTH=NTHBASE,DBSANA=DEBUGSANA,DBICMP=DEBUGICMP,DBIP=DEBUGIP,"
   "GTW=GATEWAY,REDIR=IPSENDREDIRECTS,USENS=USENAMESERVER,"
-  "ULO=USELOOPBACK,MV16=USEMOVE16,TCPSND=TCP_SENDSPACE,"
+  "ULO=USELOOPBACK,SDMA=SANADMA,TCPSND=TCP_SENDSPACE,"
   "TCPRCV=TCP_RECVSPACE,TCPMSS=TCP_MSSDFLT,"
   "TCPIW=TCP_INITIALWINDOW,CON=CONSOLENAME,LOGF=LOGFILENAME,"
   "LOGGING,LOGCON=LOGCONSOLE,LOGL=LOGLEVEL,MBCHK=MBUFCHECK";
@@ -92,7 +92,7 @@ extern LONG ipforwarding;
 extern LONG ipsendredirects;
 extern LONG usens;
 extern LONG useloopback;
-extern LONG ng_use_move16;
+extern LONG ng_sana_dma;
 extern ULONG tcp_sendspace;
 extern ULONG tcp_recvspace;
 extern int tcp_mssdflt;
@@ -128,7 +128,7 @@ struct cfg_variable variables[] = {
 { VAR_ENUM, VF_RW, NULL, &ipsendredirects, boolean_enum },
 { VAR_ENUM, VF_RW, NULL, &usens, (notify_f)"NO,FIRST,SECOND" },
 { VAR_ENUM, VF_RW, NULL, &useloopback, boolean_enum },
-{ VAR_ENUM, VF_RW, NULL, &ng_use_move16, boolean_enum },
+{ VAR_ENUM, VF_RW, NULL, &ng_sana_dma, boolean_enum },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_sendspace, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_recvspace, NULL },
 { VAR_LONG, VF_RW, NULL, (LONG*)&tcp_mssdflt, NULL },

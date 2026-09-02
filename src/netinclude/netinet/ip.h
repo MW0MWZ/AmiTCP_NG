@@ -105,8 +105,10 @@ struct ip {
  * NOT gated on the CPU target, deliberately. One byte store beats a read-modify-
  * write on EVERY 68k including the 68000, so there is nothing to choose between
  * targets and no reason to grow another build variant. Gating belongs to things
- * that are genuinely better on one CPU and worse on another (see ng_bcopy()'s
- * MOVE16); this is just a better way to write the same store everywhere.
+ * that are genuinely better on one CPU and worse on another (the fused receive
+ * checksum, NG_RX_CSUM in conf.h, is the live example -- ng_bcopy() used to be one
+ * too and no longer gates on anything); this is just a better way to write the same
+ * store everywhere.
  *
  * Written in C rather than assembly on purpose: the win here is NOT emitting a
  * slow instruction, not reaching for a clever one, and C says that portably while

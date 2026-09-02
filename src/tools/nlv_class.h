@@ -1,5 +1,17 @@
 #ifndef NLV_CLASS_H
 #define NLV_CLASS_H
+
+/* Defined in NetLogViewer.c, used here. The AmigaOS proto headers used to declare
+ * these for us; with __NOLIBBASE__ they declare none, so ours are the only ones.
+ * Types must match NetLogViewer.c exactly. */
+struct IntuitionBase;
+struct GfxBase;
+struct UtilityBase;
+
+extern struct IntuitionBase *IntuitionBase;
+extern struct GfxBase       *GfxBase;
+extern struct UtilityBase   *UtilityBase;
+
 /*
  * AmiTCP_NG. Copyright (C) 2026 Andy Taylor (MW0MWZ). GPL v2 (see COPYING).
  *

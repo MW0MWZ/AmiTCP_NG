@@ -12,7 +12,11 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CC="$ROOT/docker/cc.sh m68k-amigaos-gcc"
-CFLAGS="-noixemul -O2 ${NG_ARCH:--m68000} -Wall -Werror -Isrc/tools -Isrc"
+# __NOLIBBASE__ as for the library (docker/ccflags.sh). The protos then declare no
+# bases at all, so force-include the same header the library uses for the common
+# ones; each tool declares any others it opens.
+CFLAGS="-noixemul -O2 ${NG_ARCH:--m68000} -Wall -Werror -D__NOLIBBASE__ \
+        -include src/conf/amitcp_ng_bases.h -Isrc/tools -Isrc"
 
 echo ">>> building AmiTCP_NG tools ..."
 

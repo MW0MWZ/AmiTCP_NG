@@ -1,5 +1,15 @@
 #ifndef AMIGA_CONFIG_H
 #define AMIGA_CONFIG_H
+
+/* struct CSource is <dos/rdargs.h>. This used to arrive via the DOS protos; with
+ * __NOLIBBASE__ it does not, and the symptom is obscure -- gcc reports "'struct
+ * CSource' declared inside parameter list", having invented a new incomplete type
+ * per prototype. Must sit OUTSIDE any surrounding #ifndef, or files that already
+ * satisfy that guard skip it. */
+#ifndef DOS_RDARGS_H
+#include <dos/rdargs.h>
+#endif
+
 /* $Id: amiga_config.h,v 1.17 1994/01/18 02:27:22 jraja Exp $
  *
  * kern/amiga_config.h --- configuration declarations

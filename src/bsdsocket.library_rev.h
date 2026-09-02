@@ -17,8 +17,8 @@
  * and is NOT bumped for a patch. Bump AMITCP_NG_VER (and DATE) here for each
  * release -- this is the single source of truth (build-release.sh reads it too).
  */
-#define AMITCP_NG_VER   "4.1.6"
-#define DATE    "30.8.2026"
+#define AMITCP_NG_VER   "4.1.7-beta"
+#define DATE    "31.8.2026"
 #define VERS    "bsdsocket.library 4.1"
 #define VSTRING "bsdsocket.library 4.1 (AmiTCP_NG " AMITCP_NG_VER ")\n\r"
 #define VERSTAG "\0$VER: bsdsocket.library 4.1 (AmiTCP_NG " AMITCP_NG_VER ")"

@@ -11,7 +11,13 @@ GCCINC=/opt/m68k-amigaos/lib/gcc/m68k-amigaos/6.5.0b/include
 # RUNTIME: clib2's per-process crt state is absent in CreateNewProcTags-spawned
 # tasks (e.g. NETTRACE log_task), which hung the stack; libnix has no such need.
 NG_INC="-nostdinc -Isrc/netinclude -Isrc -Isrc/conf -Isrc/protos -isystem $NDK -isystem $LIBNIX -isystem $SYSINC -isystem $GCCINC"
-NG_DEF="-DAMITCP -DKERNEL -DTCPDEBUG -DDIRECTED_BROADCAST -DICMPPRINTFS"
+# __NOLIBBASE__: the AmigaOS proto headers each declare their own library base
+# (struct DosLibrary *DOSBase, struct Device *TimerBase, ...). We declare ours in
+# conf/amitcp_ng_bases.h, force-included into every TU, with the types this code
+# has always used. The two are incompatible and which one a file gets depends on
+# include order, so a newer NDK breaks the build. This makes ours the only ones --
+# what the codebase already assumed, just never stated.
+NG_DEF="-DAMITCP -DKERNEL -DTCPDEBUG -DDIRECTED_BROADCAST -DICMPPRINTFS -D__NOLIBBASE__"
 # NOTE: there is deliberately NO per-build diagnostic behaviour any more. A -DNG_BETA
 # used to make a pre-release default to LOG_DEBUG; that put what the binary reports in
 # the hands of a build flag instead of the user, and is how a beta once shipped with
@@ -21,7 +27,7 @@ NG_DEF="-DAMITCP -DKERNEL -DTCPDEBUG -DDIRECTED_BROADCAST -DICMPPRINTFS"
 # SOCKBUF_DEBUG enables the sbcheck() socket-buffer consistency validator, now called
 # from sbappend() -- it walks the whole buffer (O(n)) on every append, which would undo
 # the O(1) sb_mbtail append in a shipped build. So it is OFF by default (production) and
-# turned on only for validation runs:  NG_SOCKBUF_DEBUG=1 bash docker/run-bench.sh ...
+# turned on only for validation runs:  NG_SOCKBUF_DEBUG=1 ./docker/run-smoke.sh
 NG_SOCKBUF_DEBUG="${NG_SOCKBUF_DEBUG:-0}"
 [ "$NG_SOCKBUF_DEBUG" = 1 ] && NG_DEF="$NG_DEF -DSOCKBUF_DEBUG"
 # The API failure tracer (api/amiga_libcallentry.h) -- every library vector that

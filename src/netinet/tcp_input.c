@@ -172,6 +172,10 @@ int	tcppredack = 0;	/* XXX debugging: times hdr predict ok for acks */
 int	tcppredwin = 0;	/* times hdr predict ok for pure window updates */
 int	tcppreddat = 0;	/* XXX # times header prediction ok for data packets */
 int	tcppcbcachemiss = 0;
+/* Segments refused admission to the reassembly queue by its size bound. NOT a
+ * tcpstat field: that struct is copied out to Roadshow-compatible callers by
+ * offset, so a new member there would be read as one of THEIR fields. */
+int	tcpreassfull = 0;
 u_long	tcp_now;		/* RFC 1323 timestamp clock; ticks at PR_SLOWHZ (2 Hz) */
 /* RFC 5961: max challenge ACKs emitted per tcp_now window (~500 ms). Generous
  * for legitimate use (challenges are rare) while bounding a blind-RST/SYN
@@ -449,7 +453,42 @@ tcp_reass(tp, ti, m)
 	 * gapped-segment flood this cap exists to stop, so capping it is the
 	 * intended outcome rather than a regression.
 	 */
-	{
+	/*
+	 * NEVER APPLY THE BOUND TO THE IN-ORDER SEGMENT. This exemption is what
+	 * stops the bound deadlocking the connection.
+	 *
+	 * TCP_REASS only takes its fast path when the queue is EMPTY, so once
+	 * anything is queued, the segment that fills the hole comes through here
+	 * too. Lose one segment mid-burst on a lossy link and everything behind it
+	 * arrives and packs the queue up against `room`; the peer then retransmits
+	 * the missing one, it fails the same test, and it is dropped. Nothing
+	 * shrinks the backlog, because only `present:` below can do that and only
+	 * this segment can get us there. The peer retransmits for ever and we
+	 * refuse for ever -- while still ACKing (TCP_REASS sets TF_ACKNOW
+	 * unconditionally), so the connection looks alive from both ends and the
+	 * transfer simply stops. Silently: this was a bare m_freem().
+	 *
+	 * Admitting the in-order segment cannot run the queue away: it is
+	 * immediately followed by `present:`, which drains everything now
+	 * contiguous into the socket buffer, so accepting it can only SHRINK the
+	 * backlog. The bound still does its job against the case it was written
+	 * for -- a peer streaming gapped segments that never fill the hole.
+	 *
+	 * By the time we get here ti_seq is >= rcv_nxt (leading duplicates were
+	 * trimmed earlier in tcp_input), so this opens no hole for genuinely
+	 * out-of-order data.
+	 *
+	 * ONE PATH queues an exempted segment without draining it on the same call:
+	 * data arriving with the SYN on a freshly-accepted connection, where
+	 * present: bails on t_state == TCPS_SYN_RECEIVED. That is bounded to a
+	 * single segment -- a second packet on an embryonic connection either
+	 * carries SYN (diverted to the RFC 5961 challenge) or lacks ACK (dropped),
+	 * and neither reaches here -- and it is flushed by the tcp_reass(tp, 0, 0)
+	 * call that runs when the handshake completes, or freed by tcp_close() if
+	 * it never does. It predates this exemption; before the bound existed that
+	 * segment was admitted unconditionally anyway.
+	 */
+	if (ti->ti_seq != tp->rcv_nxt) {
 		register struct tcpiphdr *p;
 		long reasslen = 0;
 		long segs = 0;
@@ -468,6 +507,7 @@ tcp_reass(tp, ti, m)
 		}
 		if (reasslen + (long)(u_short)ti->ti_len > room ||
 		    segs + 1 > maxsegs) {
+			++tcpreassfull;		/* no longer a silent drop */
 			m_freem(m);
 			return (0);
 		}

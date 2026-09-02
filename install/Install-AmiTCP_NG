@@ -341,25 +341,29 @@
 	"#LOGLEVEL=7\n"
 ))
 
-(set #db-newusemove16 (cat
+(set #db-newsanadma (cat
 	"\n"
-	"# --- MOVE16 burst copy (68040/68060 only) --------------------------------------\n"
+	"# --- Let the network card write straight into memory ---------------------------\n"
 	"#\n"
-	"# The 68040 and 68060 have MOVE16, an instruction that moves a whole 16-byte cache\n"
-	"# line at once. In principle that makes bulk copying of packet payload faster on\n"
-	"# those processors, and nothing else.\n"
+	"# ON by default. This line only exists so you can turn it OFF.\n"
 	"#\n"
-	"# It is OFF, and the honest reason is that it has never been shown to help. The\n"
-	"# gain was measured once in a copy benchmark, not in the packet path, and real\n"
-	"# testing since has NOT shown faster transfers with it on. Every processor below\n"
-	"# an 040 ignores this setting completely -- the instruction does not exist there,\n"
-	"# and the stack never reaches it.\n"
+	"# Normally, when a frame arrives, your network card's driver copies the bytes into\n"
+	"# the stack one call at a time. SANA-II allows a second way: the driver asks for an\n"
+	"# address and moves the data itself, with no copying at all. For a card that can do\n"
+	"# this, that removes an entire pass over every packet received -- real work on a\n"
+	"# 68k.\n"
 	"#\n"
-	"# So this is here to be experimented with, not because it is recommended. If you\n"
-	"# have an 040 or 060 and want to try it, turn it on, move a large file, and\n"
-	"# compare against the same transfer with it off. If it makes no difference, that\n"
-	"# is the expected result and worth saying so.\n"
-	"#USEMOVE16=YES\n"
+	"# It is on because it costs nothing to offer. A driver that cannot do it ignores\n"
+	"# the offer and carries on copying exactly as before, which is what every driver\n"
+	"# did before this existed. Most Amiga drivers are in that group.\n"
+	"#\n"
+	"# If your machine misbehaves with a card that does use it, put:\n"
+	"#\n"
+	"#   SANADMA=NO\n"
+	"#\n"
+	"# and the stack goes back to copying every frame. Please say so if you need to --\n"
+	"# a driver that DMAs is rare enough that we would want to know.\n"
+	"#SANADMA=NO\n"
 ))
 
 (set #db-newlogconsole (cat
@@ -720,9 +724,9 @@
 	(P_MergeFile)
 
 	(set #mf-file "AmiTCP.config")
-	(set #mf-key  "USEMOVE16")
-	(set #mf-add  #db-newusemove16)
-	(set #mf-desc "the 68040/68060 MOVE16 burst copy switch")
+	(set #mf-key  "SANADMA")
+	(set #mf-add  #db-newsanadma)
+	(set #mf-desc "the driver-DMA receive switch")
 	(P_MergeFile)
 
 	(set #mf-file "AmiTCP.config")
@@ -850,11 +854,225 @@
 	)
 ))
 
+; ===========================================================================
+;  Ask which LAYOUT to install. Sets #want-self (1 = self-contained).
+;
+;  THE DEFAULT ALWAYS KEEPS THIS MACHINE DOING WHAT IT ALREADY DOES. That is not
+;  a style preference: at Novice level the Installer answers every question
+;  itself by taking the default and never shows this requester, so a hardcoded
+;  default would silently relocate somebody's install the first time they took a
+;  new release. Detected self-contained -> default self-contained. Anything else,
+;  including a fresh machine -> default standard.
+;
+;  ELEVEN LINES of prompt, and it has to stay that way: the requester shows about
+;  13 and has no scrollbar, so anything past the bottom is simply absent --
+;  including the question. Long lines are clipped, not wrapped.
+; ===========================================================================
+; ===========================================================================
+;  P_InstallSelfContained -- everything under the chosen drawer, nothing in
+;  LIBS: or C:.
+;
+;  ORDER MATTERS. The ownership marker is written BEFORE the payload, following
+;  the same discipline as the standard path (record the install before the
+;  commands are written). An abort after step 2 leaves an install that detection
+;  can still see and Uninstall can still clean; an abort before it leaves an
+;  empty drawer, which is harmless.
+;
+;  No .orig backups, no manifest and no Legacy list here, deliberately: all three
+;  exist to answer "which files in a SHARED directory are ours?", and this layout
+;  puts nothing in a shared directory. There is nothing to disambiguate and
+;  nothing of anyone else's to displace.
+; ===========================================================================
+(procedure P_InstallSelfContained
+(
+	(set #sc-libs (tackon #amitcp-dir "Libs"))
+	(set #sc-c    (tackon #amitcp-dir "C"))
+
+	(makedir #sc-libs (infos))
+	(makedir #sc-c    (infos))
+
+	; The ownership marker FIRST. This is what stops another assign-based stack's
+	; drawer being mistaken for ours, so it must exist before anything else does.
+	(textfile
+		(dest (tackon #sc-libs "AmiTCP_NG.version"))
+		(append (cat "$VER: AmiTCP_NG " #ng-version "\n"))
+	)
+
+	(copyfiles
+		(prompt "Installing bsdsocket.library into the AmiTCP_NG drawer")
+		(help @copyfiles-help)
+		(source #lib-source)
+		(dest #sc-libs)
+		(newname "bsdsocket.library")
+	)
+	(copyfiles
+		(prompt "Installing usergroup.library into the AmiTCP_NG drawer")
+		(help @copyfiles-help)
+		(source #ug-source)
+		(dest #sc-libs)
+		(newname "usergroup.library")
+	)
+	(copyfiles
+		(prompt "Installing the AmiTCP_NG network commands")
+		(help @copyfiles-help)
+		(source #tools-source)
+		(dest #sc-c)
+		(all)
+	)
+
+	; Shared with the standard layout on purpose: these are Roadshow-format files
+	; and we read them deliberately. Created if absent, used if already there.
+	(makedir "DEVS:NetInterfaces" (infos))
+
+	(P_SetupConfig)
+	; NO (P_WriteMarker) HERE. #ng-marker lives in LIBS:, and #have-std is
+	; "a library in LIBS: AND that marker" -- so writing it from this layout
+	; makes a machine whose LIBS: holds SOMEONE ELSE'S stack read as our own
+	; standard install. A later standard install then takes the "already ours,
+	; no backups needed" path and overwrites that stack, and its commands,
+	; with no .orig to restore from. This layout has its own marker at
+	; <dir>/Libs/AmiTCP_NG.version, written above, which is what #have-self
+	; reads. Writing nothing into LIBS: is also what the closing message
+	; promises the user.
+	(P_InstallStartup)
+	(P_ImportRoadshow)
+
+	; Every install path in this script ends by saying what happened and where
+	; things went -- (exit (quiet)) suppresses the Installer's own trailer, so a
+	; path without a message drops the user back to Workbench with no feedback
+	; at all.
+	; Lines are CLIPPED, not wrapped, at about 68 columns, so each rendered line
+	; is broken by hand. #sc-libs/#sc-c are used rather than bare (tackon ...)
+	; arguments: passing a nested call straight to (message) has no precedent in
+	; this script, and these variables are already to hand.
+	(message "AmiTCP_NG is installed in its own drawer:\n\n"
+		 "  " #amitcp-dir "\n\n"
+		 "Nothing was written into LIBS: or C:.\n"
+		 "These lines were added to 'S:User-Startup':\n\n"
+		 "  Assign AmiTCP: " #amitcp-dir "\n"
+		 "  Assign LIBS: " #sc-libs " ADD\n"
+		 "  Assign C: " #sc-c " ADD\n\n"
+		 "Reboot to pick them up.")
+))
+
+; ===========================================================================
+;  P_RemoveSelfContained -- take the self-contained layout back out.
+;
+;  FILE-LEVEL WORK ONLY, no messages: it is called both by Uninstall (which adds
+;  its own closing message afterwards) and mid-install when switching layout,
+;  where a "restored, now reboot" message would be a lie.
+;
+;  The user's configuration is deliberately LEFT ALONE, matching what the
+;  standard uninstall does. Only what we installed is removed.
+;
+;  REMOVES VIA "AmiTCP:", NOT #amitcp-dir. This matters and is not a style
+;  choice. #amitcp-dir is only ever set by P_AskDest, which runs on the INSTALL
+;  branch; the Uninstall branch goes straight to P_Uninstall, so #amitcp-dir is
+;  still its initial "SYS:AmiTCP" there. A default install lands in
+;  SYS:Programs/AmiTCP, so removing by #amitcp-dir deleted nothing, reported
+;  success, and destroyed the markers on the way out -- leaving an install that
+;  the installer could never remove again. Worse, on a machine with a classic
+;  AmiTCP 3.0b2 at SYS:AmiTCP it deleted THAT instead.
+;
+;  "AmiTCP:" is the path #have-self proved ownership of, so removal and the
+;  ownership check now look at the same drawer. It is correct in both callers:
+;  on Uninstall it is the install being removed, and on a mid-install switch to
+;  standard it still points at the OLD drawer, because P_SetupConfig's makeassign
+;  has not run yet.
+;
+;  Literal paths rather than (tackon ...) inside (foreach ...): a nested call as
+;  foreach's directory argument has no precedent in this script or in the 3.0b2
+;  reference, and foreach's arguments are positional rather than options.
+; ===========================================================================
+(procedure P_RemoveSelfContained
+(
+	; Guarded: everything below is a no-op without the assign, but (foreach) on
+	; a missing directory is the one form that could still put a requester up.
+	(if (>= (exists "AmiTCP:Libs/AmiTCP_NG.version" (noreq)) 1)
+	(
+		(delete "AmiTCP:Libs/bsdsocket.library"   (optional "force"))
+		(delete "AmiTCP:Libs/usergroup.library"   (optional "force"))
+		(delete "AmiTCP:Libs/AmiTCP_NG.version"   (optional "force"))
+		(delete "AmiTCP:Libs.info"                (optional "force"))
+		(delete "AmiTCP:C.info"                   (optional "force"))
+		(foreach "AmiTCP:C" "#?"
+			(delete (tackon "AmiTCP:C" @each-name) (optional "force")))
+		; ...and the now-empty drawers themselves, so nothing is left lying about.
+		(delete "AmiTCP:Libs" (optional "force"))
+		(delete "AmiTCP:C"    (optional "force"))
+	))
+))
+
+(procedure P_AskLayout
+(
+	(set #layout-default 0)
+	(if (= #have-self 1) (set #layout-default 1))
+
+	(set #want-self (askbool
+		(prompt "Where should AmiTCP_NG put its files?\n\n"
+			"STANDARD puts the library in LIBS: and the commands in C:,\n"
+			"replacing whatever stack is there. This is the normal\n"
+			"choice and what most people want.\n\n"
+			"SELF-CONTAINED keeps everything in one drawer and reaches\n"
+			"it with assigns, so another TCP/IP stack can stay\n"
+			"installed alongside it.\n\n"
+			"Use the self-contained layout?")
+		(help "STANDARD (No) is the ordinary install: LIBS:bsdsocket.library "
+			"and the commands in C:. Any stack already there is backed up "
+			"and replaced, and Uninstall puts it back.\n\n"
+			"SELF-CONTAINED (Yes) writes nothing into LIBS: or C:. "
+			"Everything lives under the drawer you chose, reached by "
+			"assigns added to S:User-Startup. Pick this only if you want "
+			"to keep another stack installed at the same time.\n\n"
+			"NOTE: an assign is searched AFTER the real LIBS:, so if a "
+			"bsdsocket.library is already sitting in LIBS: it will be "
+			"found first and used instead of this one. The self-contained "
+			"layout suits a machine where every stack is assign-based.\n\n"
+			"The default is whatever this machine already uses.")
+		(default #layout-default)))
+))
+
 (procedure P_InstallStartup
 (
+	; The two extra assigns exist ONLY for the self-contained layout, and are built
+	; into a variable rather than emitted unconditionally. A standard install never
+	; creates <dir>/Libs or <dir>/C, and whether AmigaDOS `Assign name: path ADD`
+	; against a path that does not exist fails quietly or halts the startup script
+	; is not something this project can verify -- so we simply do not write lines
+	; that point at nothing.
+	;
+	; ...and each is GUARDED BY `If EXISTS` at boot, not just at install time.
+	; Switching a machine back to the standard layout deletes <dir>/Libs and
+	; <dir>/C BEFORE the block gets rewritten; if the run is aborted or fails in
+	; between -- disk full, write error, the Stop button -- these lines survive
+	; pointing at drawers that no longer exist. Assign returns 10 on a bad path,
+	; the default FAILAT is 10, so the shell would ABORT S:User-Startup right
+	; there and silently stop everything the user has after this block. >NIL:
+	; would hide the error, on a machine with no networking to look it up with.
+	;
+	; They go AFTER the AmiTCP: assign and BEFORE the `If EXISTS C:GetNetStatus`
+	; test, because that test can only find the command once C: has been extended.
+	; LIBS: before C: so the library is reachable by the time anything runs.
+	(set #sc-assigns "")
+	(if (= #want-self 1)
+		(set #sc-assigns (cat
+			"If EXISTS " (tackon #amitcp-dir "Libs") "\n"
+			"  Assign >NIL: LIBS: " (tackon #amitcp-dir "Libs") " ADD\n"
+			"EndIf\n"
+			"If EXISTS " (tackon #amitcp-dir "C") "\n"
+			"  Assign >NIL: C: "    (tackon #amitcp-dir "C")    " ADD\n"
+			"EndIf\n")))
+
+	(set #sc-prompt "")
+	(if (= #want-self 1)
+		(set #sc-prompt (cat
+			"  Assign LIBS: " (tackon #amitcp-dir "Libs") " ADD\n"
+			"  Assign C: "    (tackon #amitcp-dir "C")    " ADD\n")))
+
 	(startup #app
 		(prompt "These lines will be added to 'S:User-Startup':\n\n"
 			"  Assign AmiTCP: " #amitcp-dir "\n"
+			#sc-prompt
 			"  (and a background touch that brings the loopback interface lo0 up)\n\n"
 			"NO hardware interface is brought up at boot -- for WiFi the link must "
 			"associate first. Bring your interface up yourself when ready with "
@@ -862,6 +1080,7 @@
 		(help @startup-help)
 		(command (cat
 			"Assign >NIL: AmiTCP: " #amitcp-dir "\n"
+			#sc-assigns
 			"; Start the stack in the background so the loopback interface (lo0) is up.\n"
 			"; Run detaches it -- if the stack ever stalled, the boot is NOT held up.\n"
 			"; No hardware NIC is touched here (that is done manually, once the link\n"
@@ -1305,66 +1524,23 @@
 ;  the original commands; else, if a full install of ours is detected, remove what it
 ;  added; otherwise change nothing (so a repeated Uninstall never harms restored files).
 ; ===========================================================================
-(procedure P_Uninstall
+; ===========================================================================
+;  P_RemoveStandard -- take the STANDARD layout back out of LIBS: and C:.
+;
+;  This is the body Uninstall has always had, lifted out unchanged so there is
+;  ONE copy of it. Two callers now: Uninstall, and the dispatch when a machine
+;  switches from standard to self-contained.
+;
+;  FILE WORK AND #undo-note/#undo-done ONLY -- no messages. Uninstall prints its
+;  own closing message after calling this; the layout switch prints nothing,
+;  because "your previous files have been restored, now reboot" is a lie in the
+;  middle of an install that is about to put AmiTCP_NG back in a drawer.
+;
+;  Reachable only when #have-std is 1, which already implies one of .orig or
+;  #fullinstall-marker is present, so the branch choice below stays correct.
+; ===========================================================================
+(procedure P_RemoveStandard
 (
-	; Did a branch below actually roll something back? Only then is the install
-	; manifest finished with (see the end of this procedure).
-	(set #undo-done 0)
-
-	; Which list of command names do we undo?
-	;
-	; The manifest -- the record of what THIS machine had installed -- whenever it
-	; is there, because it is the only list that stays right when you uninstall
-	; with a different version of the archive than you installed with.
-	;
-	; But it only exists from this revision onwards. Every machine running a
-	; released AmiTCP_NG has our marker and no manifest, and driving the loops
-	; straight off it made Uninstall a silent no-op on exactly those machines: not
-	; one command removed, not one <name>.orig renamed back, and a closing message
-	; claiming both had happened.
-	;
-	; The fallback must NOT be this archive's own payload. That distinction deletes
-	; user files: these loops do (delete C:<name>) for every name in the list, and
-	; this archive ships eight names v4.1.5 never installed; on a v4.1.5 machine
-	; those eight are the user's, carry no .orig because we never displaced them,
-	; and would be deleted outright by an Uninstall run straight from this archive.
-	;
-	; So Uninstall uses the very same #ours-list as the install paths, worked out in
-	; Main. It is the same question -- "what did we put here?" -- and it had drifted
-	; into two answers.
-	;
-	; Residual, stated honestly. The legacy list is a superset of what the oldest
-	; releases installed: v4.1.0-4.1.4 shipped 11 of its 17 names, and rxprofile
-	; only ever shipped in betas. So on one of those an Uninstall can still delete
-	; a user's own ftp, netstat, nslookup, sntp, tftp or rxprofile. That is much
-	; narrower than the released installer managed -- it enumerated whatever the
-	; archive in your hand happened to carry -- and the manifest ends it for good
-	; from this revision on.
-
-	; Nothing at all unless OUR marker is present.
-	;
-	; The branch used to be chosen by a stray LIBS:bsdsocket.library.orig, or by
-	; the full-install sentinel, and neither is written by every install path --
-	; P_Upgrade skips the library backup when there was no library to back up,
-	; and writes no sentinel. That state is reached by the most ordinary sequence
-	; there is: install, uninstall (which leaves S:Network-Startup behind), then
-	; install again -- the second install takes the upgrade path, records nothing
-	; either test can see, and the second Uninstall reported "nothing was
-	; removed" while leaving the library and every command in place. It then made
-	; it worse by deleting the version marker anyway, so the NEXT install backed
-	; up our own library as if it were the user's, and the one after that
-	; "restored" it to them.
-	;
-	; #ng-marker is written by every install path without exception, so it is the
-	; only honest test for "is this ours". The .orig files below now only choose
-	; restore-versus-delete per file; they no longer choose the branch.
-	(if (= (exists #ng-marker (noreq)) 0)
-	(
-		(message "No AmiTCP_NG installation was found on this machine, so "
-			 "nothing has been changed.")
-		(exit (quiet))
-	))
-
 	(if (>= (exists "LIBS:bsdsocket.library.orig" (noreq)) 1)
 	(
 		; --- undo an UPGRADE: restore the originals we backed up ---
@@ -1468,15 +1644,120 @@
 		; put back by the restore above -- mention it, or someone who forgot they
 		; had one years ago gets no hint that it reappeared.
 		(if (>= (exists "LIBS:usergroup.library" (noreq)) 1)
-			(set #undo-note "The AmiTCP_NG libraries and commands have been removed, and the usergroup.library that was here before was restored.")
-			(set #undo-note "The AmiTCP_NG libraries and commands have been removed.")
+			(set #undo-note (cat #undo-note "The AmiTCP_NG libraries and commands have been removed, and the usergroup.library that was here before was restored."))
+			(set #undo-note (cat #undo-note "The AmiTCP_NG libraries and commands have been removed."))
 		)
 		(set #undo-done 1)
 	)
 	(
-		; --- nothing of ours detected: change nothing (safe on a repeated Uninstall) ---
-		(set #undo-note "No AmiTCP_NG installation was detected, so nothing was removed.")
+		; --- detected, but nothing to roll back with ---
+		; NOT "no installation was detected": #have-std is 1 or we would not be
+		; here. What is missing is a .orig backup or the full-install sentinel --
+		; the install-uninstall-install-again machine, which the comment above
+		; documents. Saying "nothing was detected" here also contradicted the
+		; self-contained note appended after us, in the same requester.
+		; APPEND, like every other branch, so call order stops mattering.
+		(set #undo-note (cat #undo-note
+			"The files in LIBS: and C: were left alone: this machine has no "
+			"backup and no install manifest, so there was nothing to say what "
+			"belonged to whom."))
 	)))
+))
+
+(procedure P_Uninstall
+(
+	(set #undo-note "")		; appended to by the cleanup procedures, so it must start empty
+	; Did a branch below actually roll something back? Only then is the install
+	; manifest finished with (see the end of this procedure).
+	(set #undo-done 0)
+
+	; Which list of command names do we undo?
+	;
+	; The manifest -- the record of what THIS machine had installed -- whenever it
+	; is there, because it is the only list that stays right when you uninstall
+	; with a different version of the archive than you installed with.
+	;
+	; But it only exists from this revision onwards. Every machine running a
+	; released AmiTCP_NG has our marker and no manifest, and driving the loops
+	; straight off it made Uninstall a silent no-op on exactly those machines: not
+	; one command removed, not one <name>.orig renamed back, and a closing message
+	; claiming both had happened.
+	;
+	; The fallback must NOT be this archive's own payload. That distinction deletes
+	; user files: these loops do (delete C:<name>) for every name in the list, and
+	; this archive ships eight names v4.1.5 never installed; on a v4.1.5 machine
+	; those eight are the user's, carry no .orig because we never displaced them,
+	; and would be deleted outright by an Uninstall run straight from this archive.
+	;
+	; So Uninstall uses the very same #ours-list as the install paths, worked out in
+	; Main. It is the same question -- "what did we put here?" -- and it had drifted
+	; into two answers.
+	;
+	; Residual, stated honestly. The legacy list is a superset of what the oldest
+	; releases installed: v4.1.0-4.1.4 shipped 11 of its 17 names, and rxprofile
+	; only ever shipped in betas. So on one of those an Uninstall can still delete
+	; a user's own ftp, netstat, nslookup, sntp, tftp or rxprofile. That is much
+	; narrower than the released installer managed -- it enumerated whatever the
+	; archive in your hand happened to carry -- and the manifest ends it for good
+	; from this revision on.
+
+	; Nothing at all unless OUR marker is present.
+	;
+	; The branch used to be chosen by a stray LIBS:bsdsocket.library.orig, or by
+	; the full-install sentinel, and neither is written by every install path --
+	; P_Upgrade skips the library backup when there was no library to back up,
+	; and writes no sentinel. That state is reached by the most ordinary sequence
+	; there is: install, uninstall (which leaves S:Network-Startup behind), then
+	; install again -- the second install takes the upgrade path, records nothing
+	; either test can see, and the second Uninstall reported "nothing was
+	; removed" while leaving the library and every command in place. It then made
+	; it worse by deleting the version marker anyway, so the NEXT install backed
+	; up our own library as if it were the user's, and the one after that
+	; "restored" it to them.
+	;
+	; #ng-marker is written by every install path without exception, so it is the
+	; only honest test for "is this ours". The .orig files below now only choose
+	; restore-versus-delete per file; they no longer choose the branch.
+	; Gate on what is actually installed, not on the marker alone: a self-contained
+	; install writes the same marker but nothing into LIBS:/C:, and a stale marker
+	; on a machine with neither layout present is not an installation.
+	(if (and (= #have-std 0) (= #have-self 0))
+	(
+		(message "No AmiTCP_NG installation was found on this machine, so "
+			 "nothing has been changed.")
+		(exit (quiet))
+	))
+
+	; Clean whichever layouts are actually present. A machine carrying residue of
+	; both (an aborted switch) gets both cleaned rather than only the first found.
+	(if (= #have-std 1)  (P_RemoveStandard))
+	(if (= #have-self 1)
+	(
+		(P_RemoveSelfContained)
+		; APPEND. P_RemoveStandard may have just set its own #undo-note, and on a
+		; machine carrying both layouts a plain (set) here would throw that away --
+		; the user would be told about the drawer and never told their previous
+		; stack had been restored into LIBS:. This script has shipped exactly that
+		; bug once before (the backup-note/db-note assign-instead-of-append).
+		(set #undo-done 1)
+		; Separator only when there is something to separate FROM. On a
+		; self-contained-only uninstall #undo-note is still "", and an
+		; unconditional "\n\n" opened the final requester with two blank lines --
+		; two lines of a ~13-line budget that clips rather than scrolls.
+		;
+		; Keyed on #have-std rather than on the note's length: P_RemoveStandard
+		; runs iff #have-std is 1 and now leaves a note on ALL THREE of its
+		; branches, so this is exactly "did anything write a note before us".
+		; (strlen) would read better and is in the checker's function table, but
+		; it appears nowhere in this script nor in the 3.0b2 reference, and an
+		; unattested form is the kind of thing the Installer rejects at PARSE
+		; time -- i.e. before any of this has a chance to work.
+		(set #undo-sep "")
+		(if (= #have-std 1) (set #undo-sep "\n\n"))
+		(set #undo-note (cat #undo-note #undo-sep
+			 "The AmiTCP_NG files have been removed from its drawer. "
+			 "Your configuration was left in place."))
+	))
 
 	; Clear the install manifest -- HERE, at the point it has finished being read,
 	; and only when a branch above actually acted on it.
@@ -1639,7 +1920,11 @@
 		; paths there is no manifest of ours to consult, and consulting a stale
 		; one left behind by a removed install would under-report -- which is the
 		; exact failure this whole procedure exists to end.
-		(if (and (= #ours 1)
+		; #have-std, NOT #ours. #ours is 1 for a self-contained-only machine, which
+		; has never put a single file in C: -- so every name matched here would be
+		; the USER'S own file, skipped from the clash list, and then renamed .orig
+		; by an install that had just promised to move nothing of theirs aside.
+		(if (and (= #have-std 1)
 			 (>= (exists (tackon #ours-list @each-name) (noreq)) 1))
 			(set #cl-skip 1))
 
@@ -1676,7 +1961,11 @@
 (procedure P_Preview
 (
 	(P_CommandList)
-	(if #ours
+	; #have-std, NOT #ours: a self-contained-only machine sets #ours but would get
+	; a FULL standard install, not an update, so the UPDATE plan below describes
+	; the wrong thing entirely -- including "replace LIBS:bsdsocket.library" on a
+	; machine where we would be touching LIBS: for the first time.
+	(if #have-std
 		(set #plan (cat
 			"An AmiTCP_NG UPDATE would be performed (version " #ng-version "):\n\n"
 			"  * Replace LIBS:bsdsocket.library and LIBS:usergroup.library.\n"
@@ -1860,8 +2149,34 @@
 ; Is the existing stack OUR OWN AmiTCP_NG (vs a foreign stack such as Roadshow)? Our
 ; installer drops #ng-marker on every install, so its presence means "ours" -> a
 ; straight version upgrade rather than a foreign-stack replace.
+; SELF-CONTAINED detection. Two signals, deliberately: the library alone is not
+; proof, because AmiTCP: is the CLASSIC assign name -- the very layout this option
+; reproduces -- so another assign-based stack would otherwise look like ours and
+; get overwritten or deleted with no backup. The drawer must also carry OUR marker.
+;
+; Both probes go through the AmiTCP: assign, which may not exist (fresh machine)
+; or may point at unmounted media. (noreq) makes that fail to 0 -- a false
+; NEGATIVE, which is the safe direction: we treat the machine as fresh rather than
+; acting on a drawer we cannot see.
+(set #have-self 0)
+(if (and (>= (exists "AmiTCP:Libs/bsdsocket.library" (noreq)) 1)
+	 (>= (exists "AmiTCP:Libs/AmiTCP_NG.version"  (noreq)) 1)) (set #have-self 1))
+
+; STANDARD detection. Also two signals: a library in LIBS: is not proof it is
+; ours, and the marker alone is not proof the install is still there.
+(set #have-std 0)
+(if (and (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+	 (>= (exists #ng-marker (noreq)) 1)) (set #have-std 1))
+
+; #ours is now DERIVED from what is actually on disk, in this one place. Everything
+; downstream (#ours-gen/#ours-list, P_InstallUserGroup, P_CommandList, Preview, the
+; .orig restore loop) keeps reading #ours unchanged. NOTHING dispatches on it --
+; see the Main dispatch, which routes on #have-std/#have-self directly. A stale
+; marker with nothing else present now correctly reads 0 and gets a full install,
+; which is a fix: such a machine needs S:Network-Startup and the example configs
+; that the upgrade path never writes.
 (set #ours 0)
-(if (>= (exists #ng-marker (noreq)) 1) (set #ours 1))
+(if (or #have-std #have-self) (set #ours 1))
 
 ; Is there already an AmiTCP configuration drawer on this machine? We cannot ask
 ; WHERE it is -- the Installer will not turn an assign back into a path -- but the
@@ -1963,8 +2278,57 @@
 		(P_AskDest)
 		(if (= #action 2)
 			(P_Preview)
-			(if #ours (P_UpgradeOurs)
-			    (if #existing (P_Upgrade) (P_FullInstall)))
+			(
+				(P_AskLayout)
+				; ---------------------------------------------------------
+				;  DISPATCH. Routes on WHAT IS ON DISK (#have-std/#have-self)
+				;  crossed with WHAT THE USER CHOSE THIS RUN (#want-self).
+				;  It must NOT route on #ours: that now reads 1 for a
+				;  self-contained machine too, and sending one of those into
+				;  P_UpgradeOurs is exactly how a self-contained install gets
+				;  silently converted back to standard.
+				; ---------------------------------------------------------
+				(if (= #want-self 1)
+				(
+					; -> self-contained. Clear a standard install out first,
+					;    or its copies stay in LIBS:/C: and, because Assign
+					;    ADD appends, the OLD library is the one that loads.
+					(if (= #have-std 1) (P_RemoveStandard))
+					(P_InstallSelfContained)
+					; P_RemoveStandard restores whatever stack we originally
+					; displaced. If that put a library back into LIBS:, it is
+					; searched BEFORE our assign and will be the one that loads
+					; -- the opposite of what was just asked for. Say so rather
+					; than leave the user wondering why nothing changed.
+					(if (>= (exists "LIBS:bsdsocket.library" (noreq)) 1)
+						(message "AmiTCP_NG is installed in its own drawer.\n\n"
+							 "NOTE: there is still a bsdsocket.library in "
+							 "LIBS:. LIBS: is searched before the assign, "
+							 "so THAT library will be used, not this "
+							 "one.\n\n"
+							 "Move or remove it when you want AmiTCP_NG to "
+							 "be the active stack."))
+				)
+				(
+					; -> standard. Clear a self-contained drawer out first,
+					;    for the same reason in reverse.
+					; #existing counts DEVS:NetInterfaces, which a
+					; self-contained install creates and its removal
+					; deliberately leaves behind -- so a machine that has only
+					; ever been self-contained would look like "a stack is
+					; already here" and get P_Upgrade, which never installs
+					; S:Network-Startup or the example configs. Switching FROM
+					; self-contained with no standard install present is a
+					; first standard install, so treat it as one.
+					(if (= #have-self 1)
+					(
+						(P_RemoveSelfContained)
+						(if (= #have-std 0) (set #existing 0))
+					))
+					(if #have-std (P_UpgradeOurs)
+					    (if #existing (P_Upgrade) (P_FullInstall)))
+				))
+			)
 		)
 	)
 )

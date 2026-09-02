@@ -26,9 +26,11 @@ fi
 rm -f "$BUILD_LOG"
 docker run --rm -e NG_ARCH -e NG_DEF_EXTRA -v "$ROOT":/work -w /work "$IMG" bash -c '
   source docker/ccflags.sh
-  m68k-amigaos-gcc -c src/lib/bsdsocket_lib.c -o build/obj/bsdsocket_lib.o \
+  # Same per-arch object directory build.sh compiled into -- see the note there.
+  OBJ="build/obj${NG_ARCH:--m68000}"; OBJ="${OBJ// /}"
+  m68k-amigaos-gcc -c src/lib/bsdsocket_lib.c -o "$OBJ/bsdsocket_lib.o" \
       $NG_INC -Isrc $NG_DEF $NG_CFLAGS
-  cd build/obj
+  cd "$OBJ"
   m68k-amigaos-gcc -noixemul $NG_ARCH -nostartfiles -e _start \
       -o /work/build/bsdsocket.library *.o \
       -Wl,--allow-multiple-definition \

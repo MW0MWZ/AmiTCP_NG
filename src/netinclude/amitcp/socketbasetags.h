@@ -358,6 +358,7 @@ struct ErrorHookMsg
 #define SBTC_NG_TCP_RCVTOTAL		0x2007	/* ULONG: all TCP segments received      */
 #define SBTC_NG_TCP_PCBMISS		0x2008	/* ULONG: one-entry PCB cache misses     */
 #define SBTC_NG_TCP_PREDWIN		0x2009	/* ULONG: fast-path hits, window updates */
+#define SBTC_NG_TCP_REASSFULL		0x200A	/* ULONG: segs dropped, reass queue full */
 
 /* Socket wakeup accounting -- is the per-segment sorwakeup() doing real work? */
 #define SBTC_NG_SOWK_CALLS		0x2020	/* ULONG: sowakeup() calls, all sockets  */

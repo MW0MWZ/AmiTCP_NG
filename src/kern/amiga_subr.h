@@ -52,13 +52,13 @@
 #ifndef AMIGA_SUBR_H
 #define AMIGA_SUBR_H
 
-/* ng_bcopy(): non-overlapping payload copy -- MOVE16 fast path on 68040/060 for a
- * 16-aligned bulk, else CopyMem. Used on the user<->mbuf socket copies (uiomove) only;
- * the SANA driver-buffer copies stay on CopyMem (see ng_copy.c). Declared before the
- * __SASC/gcc split so both toolchains see it. */
+/* ng_bcopy(): the single payload copy -- any length, any alignment, overlapping or
+ * not. Hand-written 68k, contributed by Timm Mueller (src/kern/ng_bcopy.S).
+ * ng_bcopy_dev() was the MOVE16-free variant kept for driver-owned buffers; there is
+ * no MOVE16 any more, so the distinction is gone and the name is now an alias. Both
+ * are declared before the __SASC/gcc split so either toolchain sees them. */
 void ng_bcopy(const void *src, void *dst, long len);
-/* ng_bcopy_dev(): same, minus MOVE16 -- safe against driver-owned buffers. */
-void ng_bcopy_dev(const void *src, void *dst, long len);
+#define ng_bcopy_dev(s,d,l) ng_bcopy(s,d,l)
 
 #if __SASC
 /*
@@ -175,24 +175,24 @@ bzero(void *buf, register unsigned len)
     *s++ = '\0';
 }
 
+/*
+ * ovbcopy() -- the overlap-safe copy. This was a byte-at-a-time C loop in both
+ * directions; it now hands the whole job to ng_bcopy(), which picks the direction
+ * the same way and then moves 64 bytes an iteration with movem.l instead of one
+ * byte at a time.
+ *
+ * SAFE ONLY SINCE THE OVERLAP FIX. The routine Timm contributed peeled the odd
+ * trailing byte BEFORE choosing a direction, which corrupted a forward
+ * overlapping copy of odd length -- exactly what ovbcopy() exists to do. Do not
+ * point anything else at ng_bcopy() for overlapping work without re-reading the
+ * FIX 1 note in kern/ng_bcopy.S.
+ *
+ * Argument order already matches: both take (src, dst, len).
+ */
 static inline void
 ovbcopy(const void *v1, void *v2, register unsigned len)
 {
-  const register u_char *s1 = v1;
-  register u_char *s2 = v2;
-  
-  if (s1 < s2) {
-    /*
-     * copy possibly destroying s1 (if overlap), copy backwards
-     */
-    s1 += len;
-    s2 += len;
-    while (len--)
-      *(--s2) = *(--s1); 
-  }
-  else
-    while (len--)
-      *s2++ = *s1++;
+  ng_bcopy(v1, v2, (long)len);
 }
 
 static inline void

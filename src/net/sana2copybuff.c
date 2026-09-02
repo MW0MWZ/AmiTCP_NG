@@ -107,9 +107,10 @@ RCS_ID_C="$Id: sana2copybuff.c,v 1.15 1993/12/20 18:06:41 jraja Exp $";
 
 #include <net/if_sana.h>
 #include <api/amiga_raf.h>
-/* Payload copies use ng_bcopy_dev(): CopyMemQuick when both ends are longword
- * aligned, CopyMem otherwise. NOT ng_bcopy() -- that adds a MOVE16 path, and these
- * buffers are driver-owned memory whose caching and bus behaviour we do not know. */
+/* Payload copies use ng_bcopy_dev(), which is now just ng_bcopy(). The two were
+ * separate only to keep MOVE16 away from driver-owned buffers, whose caching and bus
+ * behaviour we do not know; ng_bcopy() no longer issues MOVE16 or any other burst or
+ * cache-line operation -- plain move.b/move.w/movem.l -- so that objection is spent. */
 
 #if NG_RX_CSUM
 #include <netinet/in_cksum_copy_protos.h>
@@ -270,6 +271,18 @@ static BOOL copy_from_mbuf_body(to, from, n)
 {
   register struct mbuf *m = from->ioip_packet;
   register unsigned count;
+
+  /*
+   * ioip_if NULL means sana_unrun() gave up on a driver that would not return
+   * this request on teardown, neutralised it, and sana_remove_interface() then
+   * FREED that softc. The driver still owns the request and can still call this
+   * hook on it -- that is precisely the case the neutralising exists for -- so
+   * touching ioip_if here writes through freed memory. On a no-MMU 68k that is
+   * silent: no trap at the fault site, corruption surfacing later somewhere
+   * unrelated. Refuse the transfer instead; the request is abandoned anyway.
+   */
+  if (from->ioip_if == NULL)
+    return FALSE;
 
   from->ioip_if->ss_copyout++;		/* SANA2CopyStats: byte CopyFromBuff (TX) */
 
@@ -456,7 +469,16 @@ static BOOL copy_to_mbuf_body(to, from, n)
   int     fused;
 #endif
 
+  /* Same abandoned-request hazard as copy_from_mbuf_body -- see the note there. */
+  if (to->ioip_if == NULL)
+    return FALSE;
+
   to->ioip_if->ss_copyin++;		/* SANA2CopyStats: byte CopyToBuff (RX) */
+
+  /* The driver may take a DMA pointer from us and then copy anyway -- the spec
+   * lets it decide late. Only the copy hook knows a copy really happened, so it
+   * is the one that must withdraw the promise. */
+  to->ioip_dmaed = 0;
 
   /*
    * Reject a NULL preallocated chain or a zero-length frame up front. Without
@@ -654,6 +676,10 @@ static SAVEDS BOOL RAF3(m_copy_from_mbuf32,
 #if 0
 {
 #endif
+  /* Guard BEFORE the counter: the body checks too, but this touches ioip_if
+   * first, and on an abandoned request that pointer is into freed memory. */
+  if (from->ioip_if == NULL)
+    return FALSE;
   from->ioip_if->ss_copyout32++;	/* how often the driver chose the R4 variant */
   return copy_from_mbuf_body(to, from, n);
 }
@@ -665,10 +691,160 @@ static SAVEDS BOOL RAF3(m_copy_to_mbuf32,
 #if 0
 {
 #endif
+  if (to->ioip_if == NULL)		/* see m_copy_from_mbuf32 */
+    return FALSE;
   to->ioip_if->ss_copyin32++;
   return copy_to_mbuf_body(to, from, n);
 }
 
+/* ON by default (SANADMA=NO turns it off). Offering these tags is safe by
+ * construction: a driver that does not implement DMA ignores tags it does not
+ * recognise and keeps calling the copy hooks, which is what every driver did
+ * before this existed. Gating it off by default would mean nobody ever got the
+ * benefit, because nobody would know to ask for it.
+ *
+ * The setting remains so a machine that misbehaves has a way out without
+ * reinstalling. */
+LONG ng_sana_dma = 1;
+
+/*
+ * SANA-II DMA buffer management: S2_DMACopyToBuff32 / S2_DMACopyFromBuff32.
+ *
+ * Instead of calling us to copy the frame, a capable driver asks for an address
+ * and moves the bytes itself. That removes a whole CPU pass over every received
+ * packet -- the copy this file otherwise performs.
+ *
+ * THE CONTRACT (SANA-II R3). The driver calls us with the ios2_Data cookie in A0.
+ * We return either NULL ("the driver may not use DMA for this buffer", and it
+ * falls back to the copy hooks), or the address of a buffer that is in contiguous
+ * memory, correctly readable/writable, aligned on a 32-bit boundary, and whose
+ * size is a multiple of 32 bits and at least ios2_DataLength. Returning NULL is
+ * always legal, so every check below simply declines rather than failing.
+ *
+ * WHAT WE HAND BACK, AND WHY IT IS THE SECOND MBUF. ioip_alloc_mbuf() builds the
+ * receive chain as a small MGETHDR mbuf followed by 2048-byte clusters. That shape
+ * is deliberate and is NOT changed here: it is what keeps the copy and the fused
+ * checksum working on aligned pointers. So DMA is offered the CLUSTER -- one
+ * contiguous, 4-aligned, 2048-byte region -- and the little header mbuf is simply
+ * unused for a DMA'd frame.
+ *
+ * A pleasant consequence: ARP reads never get a cluster (ARP_MTU fits inside
+ * MHLEN), so m_next is NULL for them, we decline, and they keep copying exactly as
+ * before. No extra cluster is consumed anywhere.
+ *
+ * ALIGNMENT. A normal (non-RAW) CMD_READ delivers "the Data Link Layer packet data
+ * only" -- the driver strips the Ethernet header, which comes back separately in
+ * ios2_SrcAddr/ios2_PacketType. So byte 0 of this buffer is the IP header, and a
+ * 4-aligned buffer means a 4-aligned IP header. We never set SANA2IOB_RAW on a
+ * read.
+ */
+static SAVEDS APTR RAF3(m_dma_to_mbuf32,
+		 struct IOIPReq*, to,      a0,
+		 BYTE*,           unused1, a1,
+		 ULONG,           unused2, d0)
+#if 0
+{
+#endif
+  register struct mbuf *m;
+  register ULONG len;
+
+  (void)unused1; (void)unused2;
+
+  if (!ng_sana_dma || to == NULL || to->ioip_if == NULL)
+    return NULL;
+
+  /* ioip_if NULL means sana_unrun() gave up waiting for a driver that would not
+   * return this request and neutralised it -- AND FREED THAT SOFTC (see the
+   * comment at if_sana.c's sana_poll skip). A driver still holding such a request
+   * can still call us on it, which is exactly this case, so touching ioip_if here
+   * would be a use-after-free on a no-MMU machine. Check before ANY counter. */
+  to->ioip_if->ss_dmaask++;		/* the driver ASKED -- count before any test */
+
+  m = to->ioip_reserved;
+  if (m == NULL || (m = m->m_next) == NULL ||	/* the cluster, not the header mbuf */
+      (m->m_flags & M_EXT) == 0) {		/* must be cluster-backed to be contiguous */
+    to->ioip_if->ss_dmano_buf++;
+    return NULL;
+  }
+
+  len = (ULONG)to->ioip_s2.ios2_DataLength;
+  if (len == 0 || len > (ULONG)m->m_ext.ext_size) {
+    /* Expected to dominate if a driver asks BEFORE the frame has arrived, when
+     * it cannot yet know the length. That is a legitimate thing for it to do and
+     * we simply decline, but it must be visible rather than looking like silence. */
+    to->ioip_if->ss_dmano_len++;
+    return NULL;
+  }
+
+  if (((ULONG)mtod(m, caddr_t) & 3UL) != 0) {	/* spec: 32-bit boundary */
+    to->ioip_if->ss_dmano_align++;
+    return NULL;
+  }
+
+  /*
+   * Push any dirty lines we still hold for this range out to RAM NOW, before the
+   * device writes it. The cluster is recycled memory and nothing flushes on free,
+   * so the CPU can still hold dirty lines from its previous life. Doing it here is
+   * what makes the post-DMA CacheClearE() in sana_read() safe: on a copyback cache
+   * "clear" is push-THEN-invalidate, so a dirty line surviving into the completion
+   * would be written out ON TOP of the frame the device just delivered. Flushing
+   * first leaves nothing to push. No-op below a 68040.
+   */
+  CacheClearE((APTR)mtod(m, caddr_t), len, CACRF_ClearD);
+
+  to->ioip_dmaed = 1;			/* completion must build the packet itself */
+  to->ioip_if->ss_dmato32++;
+  return (APTR)mtod(m, caddr_t);
+}
+
+/*
+ * Transmit. The outgoing chain nearly always starts with a header mbuf, so a
+ * single contiguous run covering the whole packet is the exception rather than the
+ * rule and this normally declines. Implemented honestly with that test rather than
+ * pretended.
+ */
+static SAVEDS APTR RAF3(m_dma_from_mbuf32,
+		 struct IOIPReq*, from,    a0,
+		 BYTE*,           unused1, a1,
+		 ULONG,           unused2, d0)
+#if 0
+{
+#endif
+  register struct mbuf *m;
+  register ULONG len;
+
+  (void)unused1; (void)unused2;
+
+  if (!ng_sana_dma || from == NULL || from->ioip_if == NULL)
+    return NULL;			/* see the note in m_dma_to_mbuf32 */
+
+  from->ioip_if->ss_dmaaskout++;	/* asked, whatever we answer */
+
+  m = from->ioip_packet;
+  if (m == NULL || m->m_next != NULL)		/* must be ONE mbuf: contiguous */
+    return NULL;
+
+  len = (ULONG)from->ioip_s2.ios2_DataLength;
+  if (len == 0 || len > (ULONG)m->m_len)
+    return NULL;
+  if (((ULONG)mtod(m, caddr_t) & 3UL) != 0)
+    return NULL;
+
+  /*
+   * The device is about to READ this buffer. Everything in it was written by the
+   * CPU (ip_output, tcp_output, the checksum routines), so on a 68040/060 copyback
+   * cache those writes may still be sitting in the cache with RAM holding whatever
+   * the mbuf last contained. Without this the card transmits stale bytes -- no
+   * exception, no failed test, just a wrong frame on the wire. Push them out.
+   */
+  CacheClearE((APTR)mtod(m, caddr_t), len, CACRF_ClearD);
+
+  from->ioip_if->ss_dmafrom32++;
+  return (APTR)mtod(m, caddr_t);
+}
+
+/* Two lists. The driver reads whichever it was handed at OpenDevice() time and
+ * keeps it, so an interface already up can never have its hooks changed under it. */
 struct TagItem buffermanagement[5] = {
     { S2_CopyToBuff,     (ULONG)m_copy_to_mbuf },		/* mandatory */
     { S2_CopyFromBuff,   (ULONG)m_copy_from_mbuf },		/* mandatory */
@@ -676,4 +852,15 @@ struct TagItem buffermanagement[5] = {
     { S2_CopyFromBuff32, (ULONG)m_copy_from_mbuf32 },	/* R4, optional */
     { TAG_END, }
 };
+
+struct TagItem buffermanagement_dma[7] = {
+    { S2_CopyToBuff,        (ULONG)m_copy_to_mbuf },		/* mandatory */
+    { S2_CopyFromBuff,      (ULONG)m_copy_from_mbuf },		/* mandatory */
+    { S2_CopyToBuff32,      (ULONG)m_copy_to_mbuf32 },		/* R4, optional */
+    { S2_CopyFromBuff32,    (ULONG)m_copy_from_mbuf32 },	/* R4, optional */
+    { S2_DMACopyToBuff32,   (ULONG)m_dma_to_mbuf32 },		/* R3 DMA, optional */
+    { S2_DMACopyFromBuff32, (ULONG)m_dma_from_mbuf32 },		/* R3 DMA, optional */
+    { TAG_END, }
+};
+
 
