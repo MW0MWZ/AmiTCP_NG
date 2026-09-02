@@ -360,6 +360,14 @@ struct ErrorHookMsg
 #define SBTC_NG_TCP_PREDWIN		0x2009	/* ULONG: fast-path hits, window updates */
 #define SBTC_NG_TCP_REASSFULL		0x200A	/* ULONG: segs dropped, reass queue full */
 
+/* Receive-ring liveness. Read together: posted vs wanted says whether the ring
+ * is full, bled down, or empty; idle says whether anything is completing at all.
+ * See the block comment above ng_rx_posted() in net/if_sana.c for how the four
+ * combinations map to four different faults. */
+#define SBTC_NG_RX_POSTED		0x200B	/* ULONG: reads the drivers hold now */
+#define SBTC_NG_RX_WANTED		0x200C	/* ULONG: reads we try to keep posted */
+#define SBTC_NG_RX_IDLE			0x200D	/* ULONG: secs since last completion */
+
 /* Socket wakeup accounting -- is the per-segment sorwakeup() doing real work? */
 #define SBTC_NG_SOWK_CALLS		0x2020	/* ULONG: sowakeup() calls, all sockets  */
 #define SBTC_NG_SOWK_RCV		0x2021	/* ULONG: of those, on a receive buffer  */

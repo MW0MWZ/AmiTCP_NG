@@ -2282,6 +2282,87 @@ sana_rearm_reads(struct sana_softc *ssc)
 }
 
 /*
+ * ---------------------------------------------------------------------------
+ * Receive-ring liveness, exported for rxprofile.
+ *
+ * These exist because "the transfer just died, nothing was logged" has been
+ * diagnosed by GUESSWORK four times running, and every guess was wrong. The
+ * three numbers below distinguish the remaining candidates outright:
+ *
+ *   posted == wanted, idle climbing   the drivers hold every read request we
+ *                                     gave them and are completing none. The
+ *                                     re-arm gate (sent < reqno) is correctly
+ *                                     false, so nothing re-posts and nothing
+ *                                     ever notices. This is the case with no
+ *                                     recovery path in the code today.
+ *   posted <  wanted, idle climbing   we retired reads and failed to re-arm --
+ *                                     ours, in sana_rearm_reads()/the pool.
+ *   posted == 0                       the ring bled to nothing; the watchdog
+ *                                     backstop did not do its job.
+ *   idle small                        the receive path is ALIVE and the stall
+ *                                     is somewhere else entirely (transmit,
+ *                                     the socket layer, the peer).
+ *
+ * Cheap enough to read at any time: a walk of ssq, which is a handful of
+ * interfaces, under splimp() so a completion cannot alter the counters mid-walk.
+ * ---------------------------------------------------------------------------
+ */
+ULONG
+ng_rx_posted(void)		/* read requests the drivers currently hold */
+{
+  struct sana_softc *p;
+  ULONG n = 0;
+  spl_t s = splimp();
+
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      n += (ULONG)p->ss_ip.sent + (ULONG)p->ss_arp.sent;
+  splx(s);
+  return n;
+}
+
+ULONG
+ng_rx_wanted(void)		/* ring size we are trying to keep posted */
+{
+  struct sana_softc *p;
+  ULONG n = 0;
+  spl_t s = splimp();
+
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      n += (ULONG)p->ss_ip.reqno + (ULONG)p->ss_arp.reqno;
+  splx(s);
+  return n;
+}
+
+ULONG
+ng_rx_idle_secs(void)		/* since ANY interface last completed a request */
+{
+  struct sana_softc *p;
+  struct timeval now;
+  long newest = 0;
+  spl_t s;
+
+  /* get_time() calls GetSysTime(), which must not run under splimp(): take the
+   * clock first, then raise. Interfaces are few and if_lastchange only moves
+   * forward, so the worst this costs is a reading one tick stale. */
+  get_time(&now);
+
+  s = splimp();
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      if (p->ss_if.if_lastchange.tv_sec > newest)
+	newest = p->ss_if.if_lastchange.tv_sec;
+  splx(s);
+
+  if (newest == 0)			/* nothing up, or nothing has ever run */
+    return 0;
+  if (now.tv_sec <= newest)		/* clock stepped backwards; report fresh */
+    return 0;
+  return (ULONG)(now.tv_sec - newest);
+}
+
+/*
  * sana_watchdog(): the per-interface if_slowtimo watchdog (~1 s tick). Re-arm any
  * retired reads, then re-arm if_timer so it fires again next tick. Called from
  * if_slowtimo() with splimp() already held (sana_rearm_reads nests its own).

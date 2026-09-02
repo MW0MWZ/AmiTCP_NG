@@ -104,6 +104,7 @@ struct sample {
   ULONG predack, preddat, predwin, rcvtotal; /* TCP header-prediction accounting */
   ULONG pcbmiss;			/* one-entry PCB cache misses */
   ULONG reassfull;			/* segments dropped: reassembly queue full */
+  ULONG rxposted, rxwanted, rxidle;	/* receive-ring liveness */
   ULONG cp32in, cp32out;		/* SANA-II R4 32-bit copy callbacks */
   ULONG dmain, dmaout;			/* SANA-II DMA: frames the driver moved itself */
   ULONG dmaask, dmaaskout;		/* ...and how often it ASKED, accepted or not */
@@ -148,7 +149,7 @@ static void take_tcp(struct sample *s)
 {
   /* +11 = 5 base counters + 5 sowakeup counters + TAG_END. Adding a tag before
    * the miss loop means bumping this AND the miss base index below. */
-  struct TagItem tg[NMISS + 12];
+  struct TagItem tg[NMISS + 15];
   int i, n = 0;
 
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_PREDACK);  tg[n++].ti_Data = 0;
@@ -162,6 +163,9 @@ static void take_tcp(struct sample *s)
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_SEL);     tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_ASYNC);   tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_REASSFULL);tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_POSTED);    tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_WANTED);    tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_IDLE);      tg[n++].ti_Data = 0;
   for (i = 0; i < NMISS; i++) {
     tg[n].ti_Tag = NG_SBTM_GETVAL(missdef[i].tag);     tg[n++].ti_Data = 0;
   }
@@ -178,8 +182,11 @@ static void take_tcp(struct sample *s)
   s->wkwait   = tg[7].ti_Data;  s->wksel   = tg[8].ti_Data;
   s->wkasync  = tg[9].ti_Data;
   s->reassfull= tg[10].ti_Data;
+  s->rxposted = tg[11].ti_Data;
+  s->rxwanted = tg[12].ti_Data;
+  s->rxidle   = tg[13].ti_Data;
   for (i = 0; i < NMISS; i++)
-    s->miss[i] = tg[11 + i].ti_Data;
+    s->miss[i] = tg[14 + i].ti_Data;	/* base moved with the three above */
 }
 
 /* Percentage of `total` that `part` represents, rounded, 0 when total is 0.
@@ -303,6 +310,34 @@ static void fastpath(struct sample *s)
   if (s->reassfull)
     Printf((STRPTR)"  reassembly queue FULL, segments dropped = %ld  <-- transfer will stall\n",
            (LONG)s->reassfull);
+
+  /* ------------------------------------------------------------------
+   * Receive ring. Print it ALWAYS, not only when something looks wrong:
+   * during a stall the interesting reading is often that everything here
+   * is healthy, which rules out the whole receive path in one line.
+   *
+   * Read posted/wanted together with idle -- neither means much alone.
+   * The verdicts below are the four cases in if_sana.c's ng_rx_posted()
+   * comment, spelled out here so the answer does not depend on whoever is
+   * reading the output knowing the code.
+   * ------------------------------------------------------------------ */
+  Printf((STRPTR)"  receive ring      = %ld posted of %ld, idle %ld s\n",
+         (LONG)s->rxposted, (LONG)s->rxwanted, (LONG)s->rxidle);
+
+  if (s->rxidle >= 5) {
+    if (s->rxwanted && s->rxposted >= s->rxwanted)
+      Printf((STRPTR)"    <-- FULL ring, nothing completing: the DRIVER is holding\n"
+                     "        every read and returning none. Nothing re-posts,\n"
+                     "        because the re-arm gate only fires below the ring size.\n");
+    else if (s->rxposted == 0)
+      Printf((STRPTR)"    <-- ring EMPTY: every read was retired and none re-armed.\n"
+                     "        The watchdog backstop is not recovering it.\n");
+    else
+      Printf((STRPTR)"    <-- ring PARTLY posted and idle: reads retired without\n"
+                     "        being re-armed. Ours -- sana_rearm_reads/mbuf pool.\n");
+  } else if (s->rxidle > 0) {
+    Printf((STRPTR)"    (receive path is alive -- a stall now is NOT the ring)\n");
+  }
 
   if (slow == 0)
     return;
@@ -445,6 +480,14 @@ static void delta(struct sample *d, struct sample *b, struct sample *a)
   d->rcvtotal = DSUB(rcvtotal);
   d->pcbmiss  = DSUB(pcbmiss);
   d->reassfull= DSUB(reassfull);
+  /* NOT DSUB: these three are LEVELS (how many reads are posted right now, how
+   * many we want, how long since the last completion), not since-boot counters.
+   * Differencing them would print 0 for a ring sitting permanently full -- the
+   * exact state WATCH exists to catch -- and a negative idle as it recovers.
+   * Carry the CURRENT reading through. */
+  d->rxposted = b->rxposted;
+  d->rxwanted = b->rxwanted;
+  d->rxidle   = b->rxidle;
   d->cp32in   = DSUB(cp32in);
   d->cp32out  = DSUB(cp32out);
   d->dmain    = DSUB(dmain);

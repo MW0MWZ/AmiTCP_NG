@@ -266,6 +266,10 @@ static void __attribute__((unused)) ng_begincfg(void *aam) {					/* BeginInterfa
  * the tools include no library headers, so the value is duplicated here. */
 #define NG_SBTC_TCP_REASSFULL	0x200A	/* segs dropped: reass queue full     */
 #define NG_SBTC_TCP_PREDWIN	0x2009	/* fast-path hits, window updates     */
+/* Receive-ring liveness -- MUST match SBTC_NG_RX_* in socketbasetags.h. */
+#define NG_SBTC_RX_POSTED	0x200B	/* reads the drivers hold right now   */
+#define NG_SBTC_RX_WANTED	0x200C	/* reads we try to keep posted        */
+#define NG_SBTC_RX_IDLE		0x200D	/* seconds since the last completion  */
 #define NG_SBTC_SOWK_CALLS	0x2020
 #define NG_SBTC_SOWK_RCV	0x2021
 #define NG_SBTC_SOWK_WAIT	0x2022
