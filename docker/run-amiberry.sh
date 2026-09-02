@@ -26,6 +26,26 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMEOUT="${TIMEOUT:-95}"
 NET="${NET:-0}"
+# A command run INSIDE the container, in the background, just before amiberry
+# starts -- for a test server the guest is meant to talk to over SLIRP. Its
+# output is echoed at the end of the run. Must not contain single quotes.
+PRELAUNCH="${PRELAUNCH:-}"
+# Docker network to attach the container to. SLIRP is a user-mode NAT, so the
+# guest can reach anything the CONTAINER can reach -- joining amitcp-net is
+# what lets it pull a 100 MB file off the transferhost.
+NETWORK="${NETWORK:-}"
+# NETEM applies tc qdisc netem to the container's own interface before the
+# emulator starts, e.g. NETEM="delay 100ms loss 0.5%". SLIRP reaches the
+# outside through that interface, so the guest inherits the delay and loss.
+#
+# WHY IT MATTERS: this rig cannot exceed ~4 Mb/s, so at a 4ms RTT there is
+# only a few KB in flight and the window never has to open. Bandwidth-delay
+# product is bandwidth TIMES delay -- adding 100ms of RTT buys the same large
+# in-flight window that a 37 Mbit link buys, at a bandwidth we can actually
+# emulate. It is the only way to reach that regime here.
+NETEM="${NETEM:-}"
+CAPARG=(); [ -n "$NETEM" ] && CAPARG=(--cap-add NET_ADMIN)
+NETOPT=(); [ -n "$NETWORK" ] && NETOPT=(--network "$NETWORK")
 HDD="${HDD:-/work/emu/hdd/System/Workbench3.2}"
 
 # RAM (Z3 fast, MB). THIS SELECTS THE STACK'S RAM TIER, so it decides which set of
@@ -49,12 +69,25 @@ RAMARG=()
 # Default is therefore set per-mode in the MODEL block below.
 CPU="${CPU:-}"
 
-# Model + ROM default by mode: NET=1 needs Zorro (A4000), NET=0 is fine on A600.
+# Model + ROM default by mode: NET=1 needs Zorro for the A2065, NET=0 is fine on
+# an A600.
+#
+# AND THE ZORRO MACHINE DEPENDS ON THE CPU. The A4000 Kickstart will not run on a
+# 68000, so "CPU=68000 --model A4000" boots nothing at all -- no phase log, no
+# output, indistinguishable from the stack hanging. It cost a 23-minute run. The
+# A2000 is the machine that has both: Zorro II slots for the card, and a ROM
+# (the shared CDTV/A1000/A500/A2000/A600 image) that a 68000 can execute. So a
+# 68000 network test runs on an A2000 and an accelerated one on an A4000.
 NETARG=()
 if [ "$NET" = "1" ]; then
-  MODEL="${MODEL:-A4000}"                          # Zorro III -- hosts the A2065
-  ROM="${ROM:-/work/emu/rom/kicka4000.rom}"
   CPU="${CPU:-68040}"                               # match Andy's PiStorm/Emu68 040
+  if [ "$CPU" = "68000" ]; then
+    MODEL="${MODEL:-A2000}"                         # Zorro II, and 68000-capable ROM
+    ROM="${ROM:-/work/emu/rom/kickCDTVa1000a500a2000a600.rom}"
+  else
+    MODEL="${MODEL:-A4000}"                         # Zorro III -- hosts the A2065
+    ROM="${ROM:-/work/emu/rom/kicka4000.rom}"
+  fi
   NETARG=(-s "a2065=slirp")     # "slirp" = SLIRP User Mode NAT driver (ethernet.cpp)
 else
   MODEL="${MODEL:-A600}"                            # light loopback-only machine
@@ -77,12 +110,28 @@ if [ "$CPU" != "0" ]; then
   CPUARG=(-s "cpu_model=$CPU" -s "fpu_model=$FPUMODEL")
 fi
 
-docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
+docker run --rm "${NETOPT[@]}" "${CAPARG[@]}" -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
   Xvfb :99 -screen 0 1024x768x24 +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
   export DISPLAY=:99 SDL_AUDIODRIVER=dummy LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
   export HOME=/tmp/abhome; mkdir -p /tmp/abhome
   sleep 2
   echo '>>> launching amiberry (model $MODEL, CPU=$CPU, NET=$NET, RAM=${RAM}MB Z3, timeout ${TIMEOUT}s)'
+  if [ -n '$NETEM' ]; then
+    dev=\$(ip route | awk '/default/{print \$5; exit}')
+    tc qdisc add dev \$dev root netem $NETEM 2>/dev/null \\
+      && echo '>>> netem on '\$dev': $NETEM' \\
+      || echo '>>> NETEM REQUESTED BUT NOT APPLIED (no tc, or no NET_ADMIN) -- results are NOT delayed'
+  fi
+  if [ -n '$PRELAUNCH' ]; then
+    echo '>>> prelaunch: $PRELAUNCH'
+    # bash -c, not a subshell: with PRELAUNCH empty a bare subshell expands
+    # to an empty pair of parens, which is a SYNTAX error -- and bash parses
+    # the whole script before running any of it, so the guard above does not
+    # save you. It silently killed every run-smoke.sh run: empty emulator
+    # log, four FAILs, and nothing to say the harness was the problem.
+    bash -c '$PRELAUNCH' >/tmp/prelaunch.log 2>&1 &
+    sleep 1
+  fi
   cd /opt/amiberry
   # STOP AS SOON AS THE GUEST IS DONE.
   #
@@ -129,5 +178,8 @@ docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
     echo \">>> TIMEOUT after ${TIMEOUT}s with no done.marker -- the guest really did hang\"
   fi
   grep -viE '^[[:space:]]*\$' /tmp/ami.log | tail -30
+  if [ -s /tmp/prelaunch.log ]; then
+    echo '>>> prelaunch output:'; cat /tmp/prelaunch.log
+  fi
   echo '>>> amiberry exited'
 "
