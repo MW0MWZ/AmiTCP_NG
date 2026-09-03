@@ -92,6 +92,7 @@ RCS_ID_C="$Id: tcp_timer.c,v 1.8 1993/06/04 11:16:15 jraja Exp $";
 #include <sys/protosw.h>
 #include <sys/errno.h>
 #include <sys/synch.h>
+#include <sys/syslog.h>
 
 #include <net/if.h>
 #include <net/route.h>
@@ -148,6 +149,109 @@ tcp_fasttimo()
 }
 
 /*
+ * How long a frozen reader has to stay frozen before we say so. 30 s at the
+ * 2 Hz slow tick -- well past TCP's own persist ceiling, so no legitimate
+ * scheduling delay on a loaded 68000 can reach it.
+ */
+#define NG_RCVSTALL_TICKS	(30 * PR_SLOWHZ)
+
+/*
+ * Report a frozen reader. Logging here runs at splnet(), which is safe and is
+ * already this codebase's practice: vlog() claims its buffer with a
+ * NON-BLOCKING GetMsg() and drops the line when the pool is empty, which is
+ * why subr_prf.c documents it as callable from inside splnet()/splimp().
+ *
+ * Two lines rather than one long one: every RawDoFmt argument has to be
+ * LONG-sized, and a shorter list is a shorter thing to get wrong.
+ */
+static void
+ng_rcvstall_report(struct tcpcb *tp, struct inpcb *ip, struct sockbuf *sb)
+{
+	struct socket *so = ip->inp_socket;
+
+	log(LOG_WARNING,
+	    "rcvstall: %08lx:%ld -> %08lx:%ld state %ld, reader blocked %ld s "
+	    "with data already buffered\n",
+	    (long)ip->inp_laddr.s_addr, (long)ntohs(ip->inp_lport),
+	    (long)ip->inp_faddr.s_addr, (long)ntohs(ip->inp_fport),
+	    (long)tp->t_state,
+	    (long)((tcp_now - tp->t_rcvstall) / PR_SLOWHZ));
+	log(LOG_WARNING,
+	    "rcvstall: rcvq %ld of %ld (mbcnt %ld), so_state %lx, so_error %ld\n",
+	    (long)sb->sb_cc, (long)sb->sb_hiwat, (long)sb->sb_mbcnt,
+	    (long)so->so_state, (long)so->so_error);
+}
+
+/*
+ * PORT (AmiTCP_NG): receive-stall detector.
+ *
+ * TCP has no receiver-side liveness timer: if bytes are sitting in a socket
+ * buffer and the reader was never woken, both ends wait for ever and no timer
+ * in any stack recovers it. This says so out loud instead. DETECT ONLY -- it
+ * never wakes anybody, because the point is to capture the state, and a
+ * "recovery" would destroy the evidence it exists to collect.
+ *
+ * Rides tcp_slowtimo's existing walk: no new timer, no second list walk, no
+ * extra splnet(). Called once per connection per 500ms tick, already at
+ * splnet(), which in_pcb.c documents as what stops a concurrent soclose() from
+ * freeing a pcb under the walk.
+ *
+ * TWO EXCLUSIONS, both of which would otherwise make it cry wolf on a HEALTHY
+ * machine -- and a detector that fires on working systems is worse than none:
+ *
+ *   PROGRESS.  A reader blocked with data present is legitimate on its own --
+ *   MSG_WAITALL sleeps with sb_cc > 0, and so does a raised SO_RCVLOWAT. What is
+ *   NOT legitimate is that plus sb_cc frozen. Any change in sb_cc restarts the
+ *   clock, so a slow-but-live reader cannot trip it.
+ *
+ * KNOWN AND ACCEPTED NOISE: a MSG_WAITALL reader part-way through a record whose
+ * PEER has gone quiet is byte-for-byte the same local state as the fault, and no
+ * predicate over so_rcv can separate them. It is reported; read it alongside
+ * whether the peer should have been sending.
+ */
+static void
+ng_rcvstall_check(struct tcpcb *tp, struct inpcb *ip)
+{
+	struct socket *so;
+	struct sockbuf *sb;
+
+	if (ip->inp_ppcb == 0)		/* half-attached: nothing to read yet */
+		return;
+	if ((so = ip->inp_socket) == 0)
+		return;
+	sb = &so->so_rcv;
+
+	/*
+	 * Ask the SLEEP QUEUE, not SB_WAIT. sowakeup() clears SB_WAIT and then
+	 * calls wakeup(), which returns void -- so a wakeup that reached nobody
+	 * leaves the flag FALSE with the reader still asleep, which is exactly
+	 * the fault this exists to catch. The flag also goes stale the other way:
+	 * a read ending by timeout or signal returns through kern_synch.c, which
+	 * never touches the socket layer, and leaves it set with nobody asleep.
+	 * The queue knows; the flag does not.
+	 */
+	if (sb->sb_cc == 0 || ng_sleeper_on((caddr_t)&sb->sb_cc) != 1) {
+		tp->t_rcvstall = 0;		/* nobody waiting, or cannot tell */
+		tp->t_rcvstall_done = 0;
+		return;
+	}
+
+	if (tp->t_rcvstall == 0 || tp->t_rcvstall_cc != (u_long)sb->sb_cc) {
+		tp->t_rcvstall	    = tcp_now;	/* first sighting, or it moved */
+		tp->t_rcvstall_cc   = (u_long)sb->sb_cc;
+		tp->t_rcvstall_done = 0;
+		return;
+	}
+
+	/* Wraparound-safe, the same idiom tcp_input.c uses against ts_recent_age. */
+	if (!tp->t_rcvstall_done &&
+	    (int)(tcp_now - tp->t_rcvstall) >= NG_RCVSTALL_TICKS) {
+		tp->t_rcvstall_done = 1;
+		ng_rcvstall_report(tp, ip, sb);
+	}
+}
+
+/*
  * Tcp protocol timeout routine called every 500 ms.
  * Updates the timers in all active tcb's and
  * causes finite state machine actions if timers expire.
@@ -188,6 +292,7 @@ tcp_slowtimo()
 		tp->t_idle++;
 		if (tp->t_rtt)
 			tp->t_rtt++;
+		ng_rcvstall_check(tp, ip);
 tpgone:
 		;
 	}

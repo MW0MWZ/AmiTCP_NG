@@ -159,6 +159,13 @@ struct tcpcb {
 	u_char	requested_s_scale;	/* window scaling the peer requested */
 	u_long	ts_recent;		/* timestamp echo data */
 	u_long	ts_recent_age;		/* when ts_recent was last updated */
+/*
+ * PORT (AmiTCP_NG): receive-stall detector state. u_long, not short like
+ * t_idle -- a permanently stuck connection outlives a 16-bit tick counter.
+ */
+	u_long	t_rcvstall;		/* tcp_now when the reader froze, 0 = not frozen */
+	u_long	t_rcvstall_cc;		/* sb_cc at that moment; a change means progress */
+	u_long	t_rcvstall_done;	/* reported already: report once per episode */
 	tcp_seq	last_ack_sent;		/* for RFC 1323 PAWS ts_recent update */
 /*
  * RFC 2018 SACK receiver scoreboard: the out-of-order data blocks we currently

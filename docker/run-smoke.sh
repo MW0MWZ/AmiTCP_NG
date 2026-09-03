@@ -193,8 +193,10 @@ C:GetNetStatus DEBUG >>SYS:tier.log
 Echo >>SYS:phase.log "4-status"
 C:ping 10.0.2.2 -c 3 >SYS:ping.log
 Echo >>SYS:phase.log "5-ping"
+C:bcastio
+Echo >>SYS:phase.log "6-bcast"
 C:RemoveNetInterface smoke0 >SYS:teardown.log
-Echo >>SYS:phase.log "6-teardown"
+Echo >>SYS:phase.log "7-teardown"
 Echo >SYS:done.marker "done"
 Wait 5
 EOF
@@ -213,6 +215,11 @@ stage() {   # stage <arch>
   NG_ARCH="$arch" ./docker/build-lib.sh   >/dev/null 2>&1 || { bad "library build ($arch)"; return 1; }
   NG_ARCH="$arch" ./docker/build-tools.sh >/dev/null 2>&1 || { bad "tools build ($arch)";   return 1; }
   cp build/bsdsocket.library "$G/Libs/bsdsocket.library"
+  # Guest test programs live in docker/tests/ and are built here, at the same
+  # arch as the library, so the suite is reproducible from a clean checkout.
+  docker run --rm -v "$ROOT":/work -w /work amigadev/crosstools:m68k-amigaos \
+    bash -c "m68k-amigaos-gcc -noixemul -O2 ${arch} -Wall docker/tests/bcastio.c -o $G/C/bcastio" \
+    >/dev/null 2>&1 || { bad "bcastio build failed"; return 1; }
   for t in AddNetInterface RemoveNetInterface GetNetStatus ShowNetStatus \
            CheckAmiTCPNGConfig ping; do
     [ -f "build/$t" ] && cp "build/$t" "$G/C/$t"
@@ -295,6 +302,22 @@ tier2_one() {   # tier2_one <host cpu>   -- the library is staged by the caller
   case "$(gcat ping.log)" in
     *"bytes from"*) ok "ping to the gateway got replies" ;;
     *)              bad "ping produced no replies" ;;
+  esac
+  # Broadcast, both ways. Checking the RECEIVED lines and not just "no error":
+  # a sendto() that returns a byte count while the datagram goes nowhere is the
+  # exact shape the old limited-broadcast routing bug took.
+  bc="$(gcat bcastio.log)"
+  case "$bc" in
+    *"SO_BROADCAST set"*) ok "SO_BROADCAST accepted" ;;
+    *)                    bad "SO_BROADCAST refused" ;;
+  esac
+  case "$bc" in
+    *"RECEIVED"*"BCAST-LIMITED"*) ok "255.255.255.255 broadcast delivered" ;;
+    *)                            bad "limited broadcast sent but never arrived" ;;
+  esac
+  case "$bc" in
+    *"RECEIVED"*"BCAST-SUBNET"*) ok "subnet broadcast delivered" ;;
+    *)                           bad "subnet broadcast sent but never arrived" ;;
   esac
   [ "$fail" -eq "$before" ]
 }

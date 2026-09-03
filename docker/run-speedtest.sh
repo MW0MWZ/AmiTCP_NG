@@ -72,6 +72,15 @@ ZW="${ZW:-0}"                   # 1 = run the zero-window recovery test
 # SMB leg: the OTHER protocol the stall is reported on. smbfs 2.22 is already
 # in the guest; the transferhost share is guest-readable.
 SMB="${SMB:-0}"                 # MiB, 0 = skip
+# SMBMANY copies a directory of small files instead of one big one. That is the
+# workload the stall is actually reported on: thousands of opens, closes and
+# directory round trips, not one long stream.
+SMBMANY="${SMBMANY:-0}"         # 1 = copy the many-file directory
+# CONCURRENT runs the bulk copy and a download AT THE SAME TIME. Every other leg
+# here drives one connection; the reported failure has both, and dies on the
+# download first while the copy keeps going. Contention for the mbuf pool, the
+# receive ring and the single stack task is untested otherwise.
+CONCURRENT="${CONCURRENT:-0}"
 # REAL=1 runs AmiSpeedTest the way a USER runs it: no HOST=/PORT=, so it takes
 # MODE_SPEEDTEST -- fetch the server list, open TCP to each candidate to time
 # the latency, pick the closest, then a real HTTP GET/POST against it. That is
@@ -182,6 +191,7 @@ done
 [ "$ZW" = "0" ] || [ -f tmp/zwtest ] || die "ZW=1 but tmp/zwtest is not built"
 [ "$WEB" = "0" ] || [ -f tmp/httpget ] || die "WEB=1 but tmp/httpget is not built"
 [ "$SMB" = "0" ] || [ -f "$G/C/smbfs" ] || die "SMB=$SMB but the guest has no C:smbfs"
+[ "$SMBMANY" = "0" ] || [ -f "$G/C/smbfs" ] || die "SMBMANY=1 but the guest has no C:smbfs"
 [ -f tmp/taskprobe ] && cp tmp/taskprobe "$G/C/taskprobe"
 [ -f tmp/zwtest ]    && cp tmp/zwtest    "$G/C/zwtest"
 [ -f tmp/latmeter ]  && cp tmp/latmeter  "$G/C/latmeter"
@@ -192,7 +202,7 @@ say "staged $(wc -c < build/bsdsocket.library) byte library, $CPU host, ${RAM}MB
 
 # --- the bulk far end -------------------------------------------------------
 FTPHOST=""
-if [ "$BULK" != "0" ] || [ "$SMB" != "0" ]; then
+if [ "$BULK" != "0" ] || [ "$SMB" != "0" ] || [ "$SMBMANY" != "0" ] || [ "$CONCURRENT" != "0" ]; then
   FTPHOST="$(docker inspect transferhost \
     --format "{{(index .NetworkSettings.Networks \"$DOCKNET\").IPAddress}}" 2>/dev/null)"
   [ -n "$FTPHOST" ] || die "transferhost is not running on $DOCKNET -- TESTFILE_SIZES=\"$BULK\" DETACH=1 ./docker/run-transferhost.sh"
@@ -289,6 +299,42 @@ C:rxprofile ${IFACE}0 >SYS:rx-bulk-post.log
 EOF
 # smbfs is a filesystem HANDLER: it stays resident once started, so it has to be
 # Run in the background and given a moment to mount before the volume exists.
+[ "$CONCURRENT" != "0" ] && cat <<EOF
+C:Run >NIL: C:smbfs SERVICE=//$FTPHOST/share VOLUME=SMB USER=$FTPUSER PASSWORD=$FTPPASS QUIET
+Wait 15
+C:List SMB: >SYS:smb-mount.log
+Echo >>SYS:phase.log "19-concurrent-start"
+C:MakeDir >NIL: SYS:manycopy
+C:Run >NIL: C:Copy SMB:many SYS:manycopy ALL QUIET
+Wait 5
+C:Run >NIL: AmiTCP:AmiSpeedTest HOST=10.0.2.2 PORT=$PORT DOWN UNIT=MEGABIT >SYS:speed-conc.log
+Wait 30
+C:rxprofile ${IFACE}0 >SYS:rx-conc-30.log
+C:netstat -s >SYS:ns-conc-30.log
+Echo >>SYS:phase.log "20-conc-30"
+Wait 60
+C:rxprofile ${IFACE}0 >SYS:rx-conc-90.log
+C:netstat -s >SYS:ns-conc-90.log
+C:taskprobe >SYS:tp-conc.log
+Echo >>SYS:phase.log "21-conc-90"
+Wait 90
+C:List SYS:manycopy >SYS:conc-files.log
+C:rxprofile ${IFACE}0 >SYS:rx-conc-180.log
+Echo >>SYS:phase.log "22-conc-180"
+EOF
+[ "$SMBMANY" != "0" ] && cat <<EOF
+C:Run >NIL: C:smbfs SERVICE=//$FTPHOST/share VOLUME=SMB USER=$FTPUSER PASSWORD=$FTPPASS QUIET
+Wait 15
+C:List SMB: >SYS:smb-mount.log
+C:rxprofile ${IFACE}0 >SYS:rx-many-pre.log
+Echo >>SYS:phase.log "17-many-start"
+C:MakeDir >NIL: SYS:manycopy
+C:Copy SMB:many SYS:manycopy ALL QUIET
+Echo >>SYS:phase.log "18-many-done"
+C:List SYS:manycopy >SYS:many-result.log
+C:taskprobe >SYS:tp-many.log
+C:rxprofile ${IFACE}0 >SYS:rx-many-post.log
+EOF
 [ "$SMB" != "0" ] && cat <<EOF
 C:Run >NIL: C:smbfs SERVICE=//$FTPHOST/share VOLUME=SMB USER=$FTPUSER PASSWORD=$FTPPASS QUIET
 Wait 15
@@ -349,7 +395,7 @@ PRELAUNCH="/work/docker/speedtest-lansrv.sh $PORT /work/$UBUILD/uAmiSpeedTest" \
 # --- report -----------------------------------------------------------------
 gcat() { docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest \
            bash -c "cat '/work/$G/$1' 2>/dev/null"; }
-for f in phase.log ifup.log ping.log speed-down.log speed-up.log rxwatch.log tp-120.log rx-120.log ns-120.log latmeter.log dns.log rx-real.log httpget.log rx-web-pre.log rx-web-post.log zw.log rx-zw.log bulk.log rx-bulk-post.log smb-mount.log rx-smb-post.log netstat-final.log; do
+for f in phase.log ifup.log ping.log speed-down.log speed-up.log rxwatch.log tp-120.log rx-120.log ns-120.log latmeter.log dns.log rx-real.log httpget.log rx-web-pre.log rx-web-post.log zw.log rx-zw.log bulk.log rx-bulk-post.log smb-mount.log rx-smb-post.log rx-many-post.log tp-many.log speed-conc.log rx-conc-90.log tp-conc.log rx-conc-180.log netstat-final.log; do
   body="$(gcat "$f")"
   [ -n "$body" ] || continue
   say ""; say "--- $f ---"; printf '%s\n' "$body"
