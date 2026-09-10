@@ -13,9 +13,9 @@
  *           e.g.  NAME=wheel ID=0 USERS=root
  *
  * Those two template strings, the DEVS:Internet directory, the SYS: default
- * home and the root/nobody/wheel/nogroup fallbacks below are all present
- * verbatim in Roadshow's own usergroup.library binary, so this is a checked
- * match rather than a guess.
+ * home and the root/nobody/wheel/nogroup fallbacks below are the conventional
+ * AmigaOS values, and match what an existing usergroup.library on the platform
+ * uses. Checked against that rather than guessed.
  *
  * Lines beginning with '#' are comments. Both files are optional: AmigaOS has
  * no accounts, so the whole notion of a user here exists to let ported Unix

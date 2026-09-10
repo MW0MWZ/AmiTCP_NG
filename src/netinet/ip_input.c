@@ -188,6 +188,13 @@ int	ipprintfs = IPPRINTFS;		/* this has effect only if DIAGNOSTIC */
 int	ip_defttl = MAXTTL;
 
 struct	ipstat	ipstat = {0};	/* ip statistics */
+/* Guard the size GetNetworkStatistics reports (NG_STAT_IP_OUR = 80). Adding a
+ * field here without updating that constant truncates the tail silently -- and
+ * worse, publishes our new field at an offset a Roadshow-compatible caller
+ * reads as one of THEIRS. tcpstat and udpstat already had this guard; ipstat
+ * was the one that did not. */
+typedef char ng_ipstat_size_matches_NG_STAT_IP_OUR
+	[(sizeof(struct ipstat) == 80) ? 1 : -1];
 struct	ipq	ipq = {0};	/* ip reass. queue */
 u_short	ip_id = {0};		/* ip packet ctr, for ids */
 struct	ifqueue	ipintrq = {0};	/* ip packet input queue */

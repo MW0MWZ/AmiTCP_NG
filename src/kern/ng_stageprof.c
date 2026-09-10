@@ -6,8 +6,8 @@
  * TEMPORARY INSTRUMENTATION, off unless NG_STAGEPROF is set. It exists because
  * arithmetic disagreed with measurement and the measurement won.
  *
- * docker/run-ipprofile.sh times a UDP loopback round trip and, on the emulated
- * 7 MHz 68000, gives ~8.9 us per payload byte. The four passes over the payload
+ * Timing a UDP loopback round trip on the emulated 7 MHz 68000 gives ~8.9 us
+ * per payload byte. The four passes over the payload
  * that path is known to make -- copy in, checksum out, checksum in, copy out --
  * were measured independently by cksumbench on the SAME machine and account for
  * only ~3.4 us/byte. Something is spending the other ~5.5 us/byte, which is 60%

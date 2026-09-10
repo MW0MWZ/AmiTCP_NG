@@ -23,5 +23,12 @@ RUN git clone --depth 1 --branch v7.1.1 https://github.com/BlitterStudio/amiberr
     && cd /opt/amiberry \
     && cmake -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)"
+# iproute2 for tc/netem. run-speedtest.sh uses it to add RTT and loss to the
+# container interface SLIRP goes out through: this rig cannot exceed ~4 Mb/s, so
+# the only way to reach a large in-flight window -- the regime a 37 Mbit link
+# puts the stack in -- is to raise the delay instead of the bandwidth.
+# Last layer on purpose, so adding it does not rebuild amiberry.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 ENV LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
 WORKDIR /work

@@ -28,18 +28,11 @@
 #define DIAGNOSTIC 1
 
 /*
- * Use Exec's CopyMemQuick for payload copies whose ends are both longword-aligned
- * and whose length is a longword multiple (src/kern/ng_copy.c). CopyMem is general
- * and re-analyses alignment on every call; CopyMemQuick demands the aligned case and
- * is then a tight move.l loop. On the emulated 7 MHz 68000 this cut a UDP loopback
- * round trip's per-byte cost from 8.88 to 3.65 us/byte -- a full-MTU round trip from
- * 18.9 ms to 11.4 ms.
- *
- * Set to 0 to fall back to CopyMem everywhere, which is the behaviour every release
- * up to 4.1.6 shipped -- the switch exists so a machine that misbehaves can be tested
- * against the old path without a rebuild of anything else.
+ * NG_COPYQUICK is GONE, along with kern/ng_copy.c itself. It selected Exec's
+ * CopyMemQuick inside the old C copy dispatcher; ng_bcopy() (kern/ng_bcopy.S) no
+ * longer calls Exec at all, so the switch had nothing left to switch. Do not
+ * reintroduce it without a routine that reads it.
  */
-#define NG_COPYQUICK	1
 
 /*
  * TEMPORARY: time the four passes a packet's payload makes through the stack, to

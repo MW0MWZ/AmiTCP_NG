@@ -174,7 +174,7 @@ check_installer_sentinel LOGLEVEL    AmiTCP.config
 check_installer_sentinel LOGCONSOLE  AmiTCP.config
 check_installer_sentinel LOGFILENAME AmiTCP.config
 check_installer_sentinel MBUFCHECK   AmiTCP.config
-check_installer_sentinel USEMOVE16   AmiTCP.config
+check_installer_sentinel SANADMA     AmiTCP.config
 
 # The installer's merge blocks are meant to be VERBATIM copies of the corresponding
 # blocks in install/db/*, so that an upgraded machine ends up with the same file text
@@ -231,7 +231,7 @@ check_installer_block_matches "#db-newloglevel"    AmiTCP.config LOGLEVEL
 check_installer_block_matches "#db-newlogconsole"  AmiTCP.config LOGCONSOLE
 check_installer_block_matches "#db-newlogfilename" AmiTCP.config LOGFILENAME
 check_installer_block_matches "#db-newmbufcheck"   AmiTCP.config MBUFCHECK
-check_installer_block_matches "#db-newusemove16"  AmiTCP.config USEMOVE16
+check_installer_block_matches "#db-newsanadma" AmiTCP.config SANADMA
 check_installer_block_matches "#db-newservices" netdb ng-services-v2
 
 # Every setting the shipped AmiTCP.config offers must be the KEY (#mf-key) of one
@@ -338,12 +338,17 @@ build_variant() {
 
   # 1. Build the binaries this archive ships, for this CPU target. Exporting NG_ARCH
   # makes build-lib.sh/build.sh (via -e NG_ARCH) and build-tools.sh compile + link for
-  # the variant. A stale object tree from a previous variant would silently mix CPU
-  # targets, so wipe build/obj first -- as root inside docker, since the previous
-  # variant's docker build left those objects root-owned (a host rm would fail and
-  # leave them in place).
+  # the variant.
+  #
+  # Objects live in a PER-ARCH directory (build/obj-m68000 and friends, see
+  # build.sh), so a stale tree from another variant can no longer be linked into
+  # this one by accident -- which is what the wipe that used to be here was
+  # guarding against. A release build still starts from a clean object dir for its
+  # own arch, so nothing from an earlier source state survives into a shipped
+  # archive. Removed as root inside docker: the previous build left those objects
+  # root-owned and a host rm would fail and leave them in place.
   export NG_ARCH="-m$cpu"
-  "$ROOT/docker/cc.sh" rm -rf /work/build/obj >/dev/null 2>&1 || rm -rf "$ROOT/build/obj"
+  "$ROOT/docker/cc.sh" rm -rf "/work/build/obj-m$cpu" >/dev/null 2>&1 || rm -rf "$ROOT/build/obj-m$cpu"
   echo ">>> building bsdsocket.library ($cpu) ..."
   "$ROOT/docker/build-lib.sh" >/dev/null
   # Codegen gate: catch expensive instructions creeping into the per-packet path.
@@ -638,11 +643,11 @@ PacketCapture ping netstat tftp nslookup ftp sntp rxprofile"
 # bitfields becoming a read-modify-write BFINS once per transmitted packet, an
 # instruction the 68000 build cannot even encode).
 #
-# Nothing is lost by dropping them, because the choices that DO depend on the CPU
-# are made at run time now, from AttnFlags, inside this one binary: CopyMemQuick
-# below a 68020, CopyMem at 68020 and above, and the MOVE16 burst copy on an 040 or
-# 060 when USEMOVE16 is enabled. So a single archive gives every machine the right
-# routine -- and removes the way a user could install a build their CPU cannot run.
+# Nothing is lost by dropping them. The copy path no longer varies by CPU AT ALL:
+# ng_bcopy() (kern/ng_bcopy.S, contributed by Timm Mueller) is one plain 68000
+# routine that picks its strategy from the pointers and the length, not from
+# AttnFlags, so there is no per-CPU routine left to pre-select at build time. That
+# also removes the way a user could install a build their CPU cannot run.
 build_variant 68000 ""
 
 echo ">>> built:"

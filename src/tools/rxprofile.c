@@ -103,7 +103,13 @@ struct sample {
   LONG  bps, mtu, state;
   ULONG predack, preddat, predwin, rcvtotal; /* TCP header-prediction accounting */
   ULONG pcbmiss;			/* one-entry PCB cache misses */
+  ULONG reassfull;			/* segments dropped: reassembly queue full */
+  ULONG rxposted, rxwanted, rxidle;	/* receive-ring liveness */
+  ULONG rx_ever;			/* PacketsIn SINCE BOOT -- never differenced */
   ULONG cp32in, cp32out;		/* SANA-II R4 32-bit copy callbacks */
+  ULONG dmain, dmaout;			/* SANA-II DMA: frames the driver moved itself */
+  ULONG dmaask, dmaaskout;		/* ...and how often it ASKED, accepted or not */
+  ULONG dmanobuf, dmanolen, dmanoalign;	/* why we declined */
   ULONG wkcalls, wkrcv, wkwait, wksel, wkasync;	/* socket wakeup accounting */
   ULONG miss[NMISS];			/* why prediction rejected a segment */
 };
@@ -144,7 +150,7 @@ static void take_tcp(struct sample *s)
 {
   /* +11 = 5 base counters + 5 sowakeup counters + TAG_END. Adding a tag before
    * the miss loop means bumping this AND the miss base index below. */
-  struct TagItem tg[NMISS + 11];
+  struct TagItem tg[NMISS + 15];
   int i, n = 0;
 
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_PREDACK);  tg[n++].ti_Data = 0;
@@ -157,6 +163,10 @@ static void take_tcp(struct sample *s)
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_WAIT);    tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_SEL);     tg[n++].ti_Data = 0;
   tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_SOWK_ASYNC);   tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_TCP_REASSFULL);tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_POSTED);    tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_WANTED);    tg[n++].ti_Data = 0;
+  tg[n].ti_Tag = NG_SBTM_GETVAL(NG_SBTC_RX_IDLE);      tg[n++].ti_Data = 0;
   for (i = 0; i < NMISS; i++) {
     tg[n].ti_Tag = NG_SBTM_GETVAL(missdef[i].tag);     tg[n++].ti_Data = 0;
   }
@@ -172,8 +182,12 @@ static void take_tcp(struct sample *s)
   s->wkcalls  = tg[5].ti_Data;  s->wkrcv   = tg[6].ti_Data;
   s->wkwait   = tg[7].ti_Data;  s->wksel   = tg[8].ti_Data;
   s->wkasync  = tg[9].ti_Data;
+  s->reassfull= tg[10].ti_Data;
+  s->rxposted = tg[11].ti_Data;
+  s->rxwanted = tg[12].ti_Data;
+  s->rxidle   = tg[13].ti_Data;
   for (i = 0; i < NMISS; i++)
-    s->miss[i] = tg[10 + i].ti_Data;
+    s->miss[i] = tg[14 + i].ti_Data;	/* base moved with the three above */
 }
 
 /* Percentage of `total` that `part` represents, rounded, 0 when total is 0.
@@ -214,7 +228,7 @@ static int ci_eq(const char *a, const char *b)
 
 static int take(char *ifname, struct sample *s)
 {
-  struct TagItem tg[14];
+  struct TagItem tg[21];
 
   /* Zero everything: an untouched buffer reads back as stack garbage, which is
    * exactly the class of bug that made ShowNetStatus print impossible figures. */
@@ -233,10 +247,22 @@ static int take(char *ifname, struct sample *s)
   tg[10].ti_Tag = IFQ_GetSANA2CopyStats;tg[10].ti_Data = (ULONG)&s->cs;
   tg[11].ti_Tag = NGIFQ_Copy32In;       tg[11].ti_Data = (ULONG)&s->cp32in;
   tg[12].ti_Tag = NGIFQ_Copy32Out;      tg[12].ti_Data = (ULONG)&s->cp32out;
-  tg[13].ti_Tag = TAG_END;              tg[13].ti_Data = 0;
+  tg[13].ti_Tag = NGIFQ_DmaIn;          tg[13].ti_Data = (ULONG)&s->dmain;
+  tg[14].ti_Tag = NGIFQ_DmaOut;         tg[14].ti_Data = (ULONG)&s->dmaout;
+  tg[15].ti_Tag = NGIFQ_DmaAsk;         tg[15].ti_Data = (ULONG)&s->dmaask;
+  tg[16].ti_Tag = NGIFQ_DmaAskOut;      tg[16].ti_Data = (ULONG)&s->dmaaskout;
+  tg[17].ti_Tag = NGIFQ_DmaNoBuf;       tg[17].ti_Data = (ULONG)&s->dmanobuf;
+  tg[18].ti_Tag = NGIFQ_DmaNoLen;       tg[18].ti_Data = (ULONG)&s->dmanolen;
+  tg[19].ti_Tag = NGIFQ_DmaNoAlign;     tg[19].ti_Data = (ULONG)&s->dmanoalign;
+  tg[20].ti_Tag = TAG_END;              tg[20].ti_Data = 0;
 
   if (ng_queryif((void *)ifname, tg) != 0)
     return -1;
+
+  /* rx is differenced by delta() for the WATCH report; rx_ever is not. The ring
+   * verdict needs the LIFETIME count -- "no packet this session" and "no packet
+   * ever" are different claims, and only the second one accuses the driver. */
+  s->rx_ever = s->rx;
 
   take_tcp(s);
   return 0;
@@ -285,6 +311,55 @@ static void fastpath(struct sample *s)
          (LONG)slow, (LONG)pct(slow, s->rcvtotal));
   Printf((STRPTR)"    PCB cache miss  = %-10ld (%ld%%)\n",
          (LONG)s->pcbmiss, (LONG)pct(s->pcbmiss, s->rcvtotal));
+  /* Non-zero means segments were REFUSED admission to the reassembly queue.
+   * A handful is survivable; a climbing count during a stall is the cause. */
+  if (s->reassfull)
+    Printf((STRPTR)"  reassembly queue FULL, segments dropped = %ld  <-- transfer will stall\n",
+           (LONG)s->reassfull);
+
+  /* ------------------------------------------------------------------
+   * Receive ring. Print it ALWAYS, not only when something looks wrong:
+   * during a stall the interesting reading is often that everything here
+   * is healthy, which rules out the whole receive path in one line.
+   *
+   * Read posted/wanted together with idle -- neither means much alone, and a
+   * FULL ring with a climbing idle means nothing at all by itself: that is what
+   * a quiet link looks like. Only PacketsIn == 0 turns it into a driver
+   * verdict. The cases match if_sana.c's ng_rx_posted() comment, spelled out
+   * here so the answer does not depend on whoever is reading the output
+   * knowing the code.
+   * ------------------------------------------------------------------ */
+  Printf((STRPTR)"  receive ring (whole stack) = %ld posted of %ld, idle %ld s\n",
+         (LONG)s->rxposted, (LONG)s->rxwanted, (LONG)s->rxidle);
+
+  if (s->rxidle >= 5) {
+    if (s->rxposted == 0)
+      Printf((STRPTR)"    <-- ring EMPTY: every read was retired and none re-armed.\n"
+                     "        The watchdog backstop is not recovering it.\n");
+    else if (s->rxwanted && s->rxposted >= s->rxwanted) {
+      /* A full ring that has been idle is the NORMAL state of a quiet link, and
+       * saying otherwise sent us after the driver on a reading taken while the
+       * peer was legitimately waiting on us. PacketsIn is what separates them:
+       * zero means no read has EVER come back, which no working driver does.
+       * rx_ever, not rx: in the WATCH report rx is a session delta, and a quiet
+       * session on a busy interface would otherwise print "never received a
+       * packet" directly above a since-boot count of millions. */
+      if (s->rx_ever == 0)
+        Printf((STRPTR)"    <-- ring FULL and NO packet has ever been received: the\n"
+                       "        driver is holding every read and completing none.\n"
+                       "        Nothing re-posts -- the re-arm gate only fires below\n"
+                       "        the ring size -- and nothing notices.\n");
+      else
+        Printf((STRPTR)"    (ring fully posted, link quiet for %ld s -- this is the\n"
+                       "     normal idle state. It is a fault only if the peer was\n"
+                       "     sending; confirm that before suspecting the driver.)\n",
+               (LONG)s->rxidle);
+    } else
+      Printf((STRPTR)"    <-- ring PARTLY posted and idle: reads retired without\n"
+                     "        being re-armed. Ours -- sana_rearm_reads/mbuf pool.\n");
+  } else if (s->rxidle > 0) {
+    Printf((STRPTR)"    (receive path is alive -- a stall now is NOT the ring)\n");
+  }
 
   if (slow == 0)
     return;
@@ -334,6 +409,22 @@ static void absolute(struct sample *s)
    * pair always works; a non-zero 32-bit count means the driver understands
    * SANA-II R4, which is what decides whether the DMA variants are worth
    * building. Zero here is a real answer, not a missing feature. */
+  /* THE ONE THAT ANSWERS "is DMA actually being used?". These count frames the
+   * driver moved itself, so non-zero is proof, not inference. Zero with the hooks
+   * offered means the driver looked and declined -- which is the common case. */
+  /* ASKED and ACCEPTED are reported separately because a zero accept count on its
+   * own is ambiguous -- "never asked" and "asks constantly, refused every time"
+   * look identical, and they call for opposite responses. */
+  Printf((STRPTR)"  DMA asked in/out = %ld/%ld   accepted in/out = %ld/%ld\n",
+         (LONG)s->dmaask, (LONG)s->dmaaskout, (LONG)s->dmain, (LONG)s->dmaout);
+  if (s->dmain || s->dmaout)
+    Printf((STRPTR)"    <-- DMA IS IN USE\n");
+  else if (s->dmaask || s->dmaaskout)
+    Printf((STRPTR)"    <-- driver ASKS but we refuse every time; declined:"
+                   " no-buffer %ld  bad-length %ld  misaligned %ld\n",
+           (LONG)s->dmanobuf, (LONG)s->dmanolen, (LONG)s->dmanoalign);
+  else
+    Printf((STRPTR)"    (driver never asks -- it copies; DMA costs nothing here)\n");
   Printf((STRPTR)"  R4 copy32 in = %-8ld R4 copy32 out = %ld%s\n",
          (LONG)s->cp32in, (LONG)s->cp32out,
          (LONG)((s->cp32in || s->cp32out) ? "  <-- driver is R4-aware"
@@ -410,8 +501,28 @@ static void delta(struct sample *d, struct sample *b, struct sample *a)
   d->preddat  = DSUB(preddat);
   d->rcvtotal = DSUB(rcvtotal);
   d->pcbmiss  = DSUB(pcbmiss);
+  d->reassfull= DSUB(reassfull);
+  /* NOT DSUB: these three are LEVELS (how many reads are posted right now, how
+   * many we want, how long since the last completion), not since-boot counters.
+   * Differencing them would print 0 for a ring sitting permanently full -- the
+   * exact state WATCH exists to catch -- and a negative idle as it recovers.
+   * Carry the CURRENT reading through. rx_ever rides along for the same
+   * reason: it is a lifetime figure and differencing it would let the ring
+   * verdict below say "never received a packet" about a quiet session on an
+   * interface that has carried gigabytes. */
+  d->rxposted = b->rxposted;
+  d->rxwanted = b->rxwanted;
+  d->rxidle   = b->rxidle;
+  d->rx_ever  = b->rx_ever;
   d->cp32in   = DSUB(cp32in);
   d->cp32out  = DSUB(cp32out);
+  d->dmain    = DSUB(dmain);
+  d->dmaout   = DSUB(dmaout);
+  d->dmaask   = DSUB(dmaask);
+  d->dmaaskout= DSUB(dmaaskout);
+  d->dmanobuf = DSUB(dmanobuf);
+  d->dmanolen = DSUB(dmanolen);
+  d->dmanoalign=DSUB(dmanoalign);
   for (i = 0; i < NMISS; i++)
     d->miss[i] = (b->miss[i] > a->miss[i]) ? b->miss[i] - a->miss[i] : 0;
 

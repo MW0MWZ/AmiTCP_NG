@@ -85,6 +85,13 @@ struct IOIPReq {
   void             (*ioip_dispatch)(struct sana_softc *, struct IOIPReq *); 
   struct mbuf       *ioip_reserved;   /* reserved for packet */
   struct mbuf       *ioip_packet;     /* packet */
+  /* Set by the S2_DMACopyToBuff32 hook when we hand the driver a buffer to DMA
+   * into, meaning nothing will call a copy hook for this frame and the completion
+   * path has to build the packet itself. Cleared in sana_submit(), which is the
+   * one place every request is (re)posted -- clearing it only in the copy hooks
+   * would leave it set after a DMA'd read, and the NEXT cycle completing with an
+   * error would then treat an untouched buffer as a received frame. */
+  UBYTE              ioip_dmaed;
   struct IOIPReq    *ioip_next;	      /* allocation queue */
 };
 
@@ -122,6 +129,17 @@ struct sana_softc {
    * than AmiTCP 3.0b2 did achieves anything on real hardware. */
   ULONG           ss_copyin32;
   ULONG           ss_copyout32;
+  /* SANA-II DMA accounting. ASKED vs ACCEPTED are separate on purpose: a zero
+   * accept count alone cannot distinguish "the driver never asked" from "it asks
+   * on every frame and we refuse every time", and those call for opposite
+   * responses. The decline reasons say which test refused. */
+  ULONG           ss_dmaask;	      /* S2_DMACopyToBuff32   entered (RX) */
+  ULONG           ss_dmato32;	      /* ...and we handed back a buffer    */
+  ULONG           ss_dmaaskout;	      /* S2_DMACopyFromBuff32 entered (TX) */
+  ULONG           ss_dmafrom32;	      /* ...and we handed back a buffer    */
+  ULONG           ss_dmano_buf;	      /* declined: no cluster behind the chain */
+  ULONG           ss_dmano_len;	      /* declined: DataLength 0, or > cluster   */
+  ULONG           ss_dmano_align;     /* declined: buffer not 32-bit aligned    */
   ULONG           ss_txnobuf;	      /* TX packets dropped: send-tag mbuf alloc failed */
   ULONG           ss_rxnobuf;	      /* RX packets dropped: read re-post mbuf alloc failed */
 #if NG_RX_CSUM && NG_RX_CSUM_VERIFY

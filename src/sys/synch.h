@@ -140,6 +140,7 @@ extern void tsleep_abort_timeout(struct ng_sleepctx *, const struct timeval *);
 extern void tsleep_enter(struct ng_sleepctx *, caddr_t, const char *);
 extern int  tsleep_main(struct ng_sleepctx *, struct SocketBase *, ULONG blockmask);
 extern int  tsleep(struct SocketBase *, caddr_t, const char *,const struct timeval *);
+extern int  ng_sleeper_on(caddr_t);	/* is a task asleep on this channel? */
 extern void wakeup(caddr_t);
 
 /*

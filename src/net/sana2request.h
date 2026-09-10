@@ -50,6 +50,8 @@
  */
 
 extern struct TagItem buffermanagement[];
+extern struct TagItem buffermanagement_dma[];
+extern LONG ng_sana_dma;	/* SANACOPYDMA: publish the DMA hooks */
 
 #ifndef SYS_PARAM_H
 #include <sys/param.h>

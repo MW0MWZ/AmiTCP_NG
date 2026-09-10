@@ -238,6 +238,7 @@ struct	pkthdr {
 typedef char ng_mhlen_fits_worst_tcp_header[(MHLEN >= 80) ? 1 : -1];
 typedef char ng_mhlen_keeps_the_rx_split_aligned[((MHLEN & 3) == 0) ? 1 : -1];
 
+
 /* description of external storage mapped into mbuf, valid if M_EXT set */
 struct m_ext {
 	struct mcluster *ext_buf;	/* external buffer */
@@ -269,6 +270,18 @@ struct mbuf {
 #define	m_act		m_nextpkt
 #define	m_pkthdr	M_dat.MH.MH_pkthdr
 #define	m_ext		M_dat.MH.MH_dat.MH_ext
+
+/*
+ * The SANA-II DMA receive path (net/if_sana.c) promotes an already-clustered mbuf
+ * to a packet head by setting M_PKTHDR and writing m_pkthdr. That is only safe if
+ * m_pkthdr and m_ext do not overlap -- otherwise it would scribble over the
+ * cluster pointer and the next dereference is a wild write on this no-MMU machine.
+ * True today because m_pkthdr precedes MH_dat in the MH arm; pinned here so a
+ * future rearrangement of struct mbuf fails the build instead of the hardware.
+ */
+typedef char ng_mext_does_not_overlap_pkthdr[
+  (__builtin_offsetof(struct mbuf, m_ext)
+     >= __builtin_offsetof(struct mbuf, m_pkthdr) + sizeof(struct pkthdr)) ? 1 : -1];
 #define	m_pktdat	M_dat.MH.MH_dat.MH_databuf
 #define	m_dat		M_dat.M_databuf
 

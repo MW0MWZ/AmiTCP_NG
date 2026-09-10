@@ -191,6 +191,7 @@ sana_submit(struct IOIPReq *req)
 {
   req->ioip_s2.ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
   req->ioip_s2.ios2_Req.io_Flags &= ~IOF_QUICK;
+  req->ioip_dmaed = 0;			/* fresh cycle: no DMA promised yet */
   BeginIO((struct IORequest *)req);
 }
 
@@ -872,7 +873,15 @@ iface_make(struct ssconfig *ifc)
   if ((req = CreateIOSana2Req(NULL)) == NULL)
     log(LOG_ERR, "iface_find(): CreateIOSana2Req failed\n");
   else {
-    req->ios2_BufferManagement = buffermanagement;
+    /* Chosen once, here: a driver keeps the list it was opened with, so changing
+     * the setting can never swap hooks under a live interface. */
+    req->ios2_BufferManagement =
+      ng_sana_dma ? buffermanagement_dma : buffermanagement;
+    /* Say which list went out. Zero DMA counters mean "never offered" or "offered
+     * and the driver declined" -- opposite conclusions, and only the log separates
+     * them. */
+    if (ng_sana_dma)
+      log(LOG_INFO, "sana: offering S2_DMACopy{To,From}Buff32 to the driver\n");
 
     /* PORT (AmiTCP_NG): resolve the SANA-II driver robustly. A config just names the
      * driver (e.g. `device=wifipi.device`). Try it exactly as given FIRST -- a bare
@@ -1100,8 +1109,8 @@ iface_make(struct ssconfig *ifc)
  * one interface back: the calling task never returns, the semaphore is never
  * released, and every other task that needs it stops too. The whole library dies.
  *
- * That is not a theory. Crippling a driver so it swallows S2_ONLINE (MODE=hang in
- * docker/run-offline.sh) wedged the emulated machine exactly so: the
+ * That is not a theory. Crippling a driver so it swallows S2_ONLINE wedged an
+ * emulated machine exactly so: the
  * ONLINE command never returned, and an unrelated GetNetStatus issued afterwards
  * never returned either. The guest never reached the end of its own boot script.
  *
@@ -2273,6 +2282,93 @@ sana_rearm_reads(struct sana_softc *ssc)
 }
 
 /*
+ * ---------------------------------------------------------------------------
+ * Receive-ring liveness, exported for rxprofile.
+ *
+ * These exist because "the transfer just died, nothing was logged" has been
+ * diagnosed by GUESSWORK four times running, and every guess was wrong. The
+ * three numbers below distinguish the remaining candidates outright:
+ *
+ *   posted == wanted, idle climbing   AMBIGUOUS, and reading it as a fault is
+ *                                     a mistake: a fully posted ring with a
+ *                                     climbing idle is exactly what a QUIET
+ *                                     LINK looks like. It only means the
+ *                                     drivers are holding every read and
+ *                                     completing none -- the case with no
+ *                                     recovery path in the code today, because
+ *                                     the re-arm gate (sent < reqno) is
+ *                                     correctly false -- when no packet has
+ *                                     ever been received, or when the peer is
+ *                                     known to be sending. Check if_ipackets
+ *                                     before blaming the driver.
+ *   posted <  wanted, idle climbing   we retired reads and failed to re-arm --
+ *                                     ours, in sana_rearm_reads()/the pool.
+ *   posted == 0                       the ring bled to nothing; the watchdog
+ *                                     backstop did not do its job.
+ *   idle small                        the receive path is ALIVE and the stall
+ *                                     is somewhere else entirely (transmit,
+ *                                     the socket layer, the peer).
+ *
+ * Cheap enough to read at any time: a walk of ssq, which is a handful of
+ * interfaces, under splimp() so a completion cannot alter the counters mid-walk.
+ * ---------------------------------------------------------------------------
+ */
+ULONG
+ng_rx_posted(void)		/* read requests the drivers currently hold */
+{
+  struct sana_softc *p;
+  ULONG n = 0;
+  spl_t s = splimp();
+
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      n += (ULONG)p->ss_ip.sent + (ULONG)p->ss_arp.sent;
+  splx(s);
+  return n;
+}
+
+ULONG
+ng_rx_wanted(void)		/* ring size we are trying to keep posted */
+{
+  struct sana_softc *p;
+  ULONG n = 0;
+  spl_t s = splimp();
+
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      n += (ULONG)p->ss_ip.reqno + (ULONG)p->ss_arp.reqno;
+  splx(s);
+  return n;
+}
+
+ULONG
+ng_rx_idle_secs(void)		/* since ANY interface last completed a request */
+{
+  struct sana_softc *p;
+  struct timeval now;
+  long newest = 0;
+  spl_t s;
+
+  /* get_time() calls GetSysTime(), which must not run under splimp(): take the
+   * clock first, then raise. Interfaces are few and if_lastchange only moves
+   * forward, so the worst this costs is a reading one tick stale. */
+  get_time(&now);
+
+  s = splimp();
+  for (p = ssq; p != NULL; p = p->ss_next)
+    if ((p->ss_if.if_flags & IFF_UP) && !p->ss_removing)
+      if (p->ss_if.if_lastchange.tv_sec > newest)
+	newest = p->ss_if.if_lastchange.tv_sec;
+  splx(s);
+
+  if (newest == 0)			/* nothing up, or nothing has ever run */
+    return 0;
+  if (now.tv_sec <= newest)		/* clock stepped backwards; report fresh */
+    return 0;
+  return (ULONG)(now.tv_sec - newest);
+}
+
+/*
  * sana_watchdog(): the per-interface if_slowtimo watchdog (~1 s tick). Re-arm any
  * retired reads, then re-arm if_timer so it fires again next tick. Called from
  * if_slowtimo() with splimp() already held (sana_rearm_reads nests its own).
@@ -2712,6 +2808,59 @@ sana_read(struct sana_softc *ssc, struct IOIPReq *req,
 
   switch (req->ioip_Error) {
   case 0:
+    /*
+     * DMA'd frame: the driver wrote straight into our cluster and no copy hook
+     * ran, so nothing has built the packet. Do here what copy_to_mbuf_body()
+     * does at its end. Only inside case 0 -- on an error the buffer was never
+     * touched, and treating it as a frame would promote stale bytes.
+     */
+    if (req->ioip_dmaed && m == NULL) {
+      register struct mbuf *hdr = req->ioip_reserved;
+      register struct mbuf *cl  = hdr ? hdr->m_next : NULL;
+      register ULONG dlen = (ULONG)req->ioip_s2.ios2_DataLength;
+
+      req->ioip_dmaed = 0;
+      if (cl != NULL && dlen != 0 && dlen <= (ULONG)mtu &&
+	  dlen <= (ULONG)cl->m_ext.ext_size) {
+	/*
+	 * The CPU never saw these bytes, so on a 68040/060 copyback cache any
+	 * line we hold for this range is stale. A compliant driver flushes around
+	 * its own DMA; we cannot verify that per driver, so do it unconditionally.
+	 * No-op below a 68040. Legal here: sana_read() runs in task context (the
+	 * network task via sana_poll()), not at interrupt.
+	 *
+	 * SAFE BECAUSE OF THE FLUSH IN m_dma_to_mbuf32(). "Clear" on a copyback
+	 * cache is push-THEN-invalidate, so a dirty line surviving from this
+	 * recycled cluster's previous life would be written out ON TOP of the
+	 * frame the device just delivered. The hook flushes this exact range
+	 * before handing it over, so by here nothing is dirty and only the
+	 * invalidate half has any effect.
+	 *
+	 * That same pre-flush is why the paths which retire a read WITHOUT coming
+	 * through here (sana_probe_read, sana_unrun) need no cache handling: they
+	 * free the cluster back to the pool, and every consumer writes it before
+	 * reading it -- a re-used RX cluster is flushed again by the hook, and any
+	 * other use fills it by CPU first. Stale CLEAN lines cannot outlive that.
+	 */
+	CacheClearE((APTR)mtod(cl, caddr_t), dlen, CACRF_ClearD);
+
+	hdr->m_next = NULL;		/* detach the unused header mbuf   */
+	req->ioip_reserved = cl->m_next;	/* leftovers stay reserved   */
+	cl->m_next = NULL;
+	m_free(hdr);			/* NOT just detached: the refill path
+					 * tests the leftover chain for M_PKTHDR
+					 * and would stack a second header on it */
+	MCHTYPE(cl, MT_HEADER);		/* it is a packet head now; keeps mbstat honest */
+	cl->m_flags |= M_PKTHDR;	/* m_ext does not overlap m_pkthdr -- asserted
+					 * at compile time in sys/mbuf.h */
+	cl->m_len = (int)dlen;
+	cl->m_pkthdr.len = (int)dlen;
+	cl->m_pkthdr.rcvif = (struct ifnet *)ssc;
+	req->ioip_packet = NULL;
+	m = cl;
+      }
+      /* else: decline quietly -- the read is re-armed by the caller as usual. */
+    }
     /* A driver that completes a read with io_Error == 0 but never ran CopyToBuff
      * (m_copy_to_mbuf returned FALSE -- e.g. a rejected over/undersized or zero-
      * length frame) leaves ioip_packet, and so m, NULL. Writing m->m_flags then

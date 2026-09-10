@@ -4,61 +4,34 @@
  * Copyright (c) 1993 AmiTCP/IP Group, <amitcp-group@hut.fi>
  *                    Helsinki University of Technology, Finland.
  *                    All rights reserved.
- *
- * HISTORY
- * $Log: amiga_subr.h,v $
- * Revision 1.13  1994/01/23  22:06:26  jraja
- * Fixed bcopy argument cast.
- *
- * Revision 1.12  1994/01/18  02:28:27  jraja
- * Changed some arguments to const.
- *
- * Revision 1.11  1993/06/04  11:16:15  jraja
- * Fixes for first public release.
- *
- * Revision 1.10  1993/05/17  01:02:04  ppessi
- * Changed RCS version
- *
- * Revision 1.9  1993/04/24  23:19:22  jraja
- * Changed define NO_NOALIGN to USE_ALIGNED_COPIES.
- *
- * Revision 1.8  93/04/13  22:30:20  22:30:20  jraja (Jarno Tapio Rajahalme)
- * Changed NOALIGNED to NOALIGN.
- * 
- * Revision 1.7  93/03/22  17:04:11  17:04:11  jraja (Jarno Tapio Rajahalme)
- * Added definitions for aligned_bzero() aligned_bzero_const(),
- * aligned_bcopy() aligned_bcopy_const(). These are optimized versions of
- * bzero() and bcopy(). _const ones are to be used with constant size argument.
- * 
- * Revision 1.6  93/03/19  14:14:44  14:14:44  too (Tomi Ollila)
- * Code changes at night 17-18 March 1993
- * 
- * Revision 1.5  93/03/04  09:43:32  09:43:32  jraja (Jarno Tapio Rajahalme)
- * Fixed includes.
- * 
- * Revision 1.4  93/02/27  12:44:25  12:44:25  jraja (Jarno Tapio Rajahalme)
- * added strncpy() for gcc.
- * 
- * Revision 1.3  93/02/24  12:52:22  12:52:22  jraja (Jarno Tapio Rajahalme)
- * Changed uxkern to kern.
- * 
- * Revision 1.2  93/02/04  18:57:47  18:57:47  jraja (Jarno Tapio Rajahalme)
- * Added SASC definitions and ovbcopy().
- * 
- * Revision 1.1  93/01/06  19:05:36  19:05:36  jraja (Jarno Tapio Rajahalme)
- * Initial revision
- * 
  */
+
 #ifndef AMIGA_SUBR_H
 #define AMIGA_SUBR_H
 
-/* ng_bcopy(): non-overlapping payload copy -- MOVE16 fast path on 68040/060 for a
- * 16-aligned bulk, else CopyMem. Used on the user<->mbuf socket copies (uiomove) only;
- * the SANA driver-buffer copies stay on CopyMem (see ng_copy.c). Declared before the
- * __SASC/gcc split so both toolchains see it. */
-void ng_bcopy(const void *src, void *dst, long len);
-/* ng_bcopy_dev(): same, minus MOVE16 -- safe against driver-owned buffers. */
-void ng_bcopy_dev(const void *src, void *dst, long len);
+/*
+ * Memory functions are a complete mess in this project. Naming conventions and
+ * half-baked optimization ideas with various compilers were genuinely b0rked
+ * already in 1994. This should be cleaned up thoroughly before more attempts
+ * at optimization are undertaken. SAS/C cruft should be removed completely,
+ * as well as useless information about check-ins more than 30 yrs ago, filling
+ * endless pages and rendering this stuff unmaintainable (TSM260903)
+ */
+
+#define RARG(reg,arg) arg __asm(reg)
+void ng_bcopy( RARG("a0", void *), RARG("a1", void *), RARG("d0", LONG) );
+void ng_bzero( RARG("a0", void *), RARG("d0", LONG) );
+
+#define ovbcopy(src,dst,len) ng_bcopy((void *)(src),dst,len)
+#define bcopy ovbcopy
+#define ng_bcopy_dev bcopy
+#define aligned_bcopy bcopy
+#define aligned_bcopy_const bcopy
+
+#define bzero ng_bzero
+#define aligned_bzero bzero
+#define aligned_bzero_const bzero
+
 
 #if __SASC
 /*
@@ -166,6 +139,7 @@ bcmp(const void *v1, const void *v2, register unsigned len)
   return (0);
 }
 
+#if 0
 static inline void
 bzero(void *buf, register unsigned len)
 {
@@ -178,21 +152,7 @@ bzero(void *buf, register unsigned len)
 static inline void
 ovbcopy(const void *v1, void *v2, register unsigned len)
 {
-  const register u_char *s1 = v1;
-  register u_char *s2 = v2;
-  
-  if (s1 < s2) {
-    /*
-     * copy possibly destroying s1 (if overlap), copy backwards
-     */
-    s1 += len;
-    s2 += len;
-    while (len--)
-      *(--s2) = *(--s1); 
-  }
-  else
-    while (len--)
-      *s2++ = *s1++;
+  ng_bcopy(v1, v2, (long)len);
 }
 
 static inline void
@@ -204,6 +164,7 @@ bcopy(const void *v1, void *v2, register unsigned len)
   while (len--)
     *s2++ = *s1++;
 }
+#endif
 
 static inline int
 strlen(register const char *s1)
@@ -238,12 +199,8 @@ strncpy(register char *s1, register const char *s2, register unsigned int len)
  * These are for both environments
  */
 
-#ifndef USE_ALIGNED_COPIES
-#define aligned_bcopy_const bcopy
-#define aligned_bcopy bcopy
-#define aligned_bzero_const bzero
-#define aligned_bzero bzero
-#else
+#ifdef USE_ALIGNED_COPIES
+
 /*
  * clear an aligned memory area of constant length to zero
  */ 

@@ -20,6 +20,13 @@ for MB in $SIZES; do
 done
 chown -R amiga:amiga "$SHARE"
 
+# GIVE amiga A REAL SAMBA PASSWORD. Without one, "map to guest = Bad User" turns
+# every login into a guest session, and a guest session has no usable session key
+# -- so SMB2 signing fails and samba logs "Bad SMB2 signature for message" while
+# the client hangs mid-negotiation. SMB1 clients never noticed; smb2-handler does.
+(echo "${SMB_PASS:-amiga}"; echo "${SMB_PASS:-amiga}") | smbpasswd -s -a amiga >/dev/null 2>&1 \
+  || echo "WARNING: could not set the samba password for amiga -- SMB2 clients will fail signing"
+
 # Container's own address -- used both for the banner and for FTP passive mode
 # (works when the Amiga guest reaches the container directly on a shared network).
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"

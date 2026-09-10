@@ -89,8 +89,8 @@ extern struct Library *MasterSocketBase;
  *     RoadshowControl SET net.shutdown_grace=10
  *
  * ...and must then use a NetShutdown that will wait that long. Ours will (its
- * default timeout is comfortably above this); Roadshow's own binary waits five and
- * will report failure. That trade is the operator's to make, which is exactly why
+ * default timeout is comfortably above this); the Roadshow NetShutdown waits five
+ * seconds and will report failure. That trade is the operator's to make, which is exactly why
  * this is a knob and not a new hardcoded number.
  *
  * Clamped at the point of use, not here: ChangeRoadshowData() writes straight

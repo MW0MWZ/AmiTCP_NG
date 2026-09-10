@@ -1,0 +1,60 @@
+--- server.c	2024-11-17 16:23:46.000000000 +0000
++++ server.c	2026-09-02 09:05:58.204060887 +0000
+@@ -33,6 +33,8 @@
+ #include "server.h"
+ #include "debug.h"
+ 
++extern bool g_closeAfterDownload;
++
+ 
+ static bool getInterfaceList(int sock, char *intStr);
+ static void handleTtcpClient(int clientSock, char *remoteHost);
+@@ -353,6 +355,14 @@
+                 if (!g_userStop) {
+                     if (sent == -1) {
+                         output("Error sending data\n");
++                    } else if (g_closeAfterDownload) {
++                        /* AmiTCP_NG test rig: the CLI client sets isLAN=false
++                         * (MODE_LAN_CLIENT is GUI-only), so its receive loop
++                         * exits on EOF, never on the byte count, and it never
++                         * sends the ACK. speedtest.net closes here; do the
++                         * same, or the two ends wait for each other for ever. */
++                        myGetTime(&end);
++                        printBps("%7d", "-->", &start, &end, bytesSent);
+                     } else {
+                         // block waiting for response
+                         rcvd = recv(clientSock, g_buf, BUFLEN, 0);
+--- uamispeedtest.c	2024-11-11 14:43:00.000000000 +0000
++++ uamispeedtest.c	2026-09-02 09:05:58.204182105 +0000
+@@ -33,6 +33,7 @@
+ bool g_isInteractiveCli = true;;
+ bool g_useGUI;
+ int g_direction = DIR_BOTH;
++bool g_closeAfterDownload = false;
+ 
+ static void showUsage(int e);
+ 
+@@ -55,11 +56,14 @@
+ 
+     memset(host, 0, HOSTLEN);
+ 
+-    while ((c = getopt (argc, argv, "b:hfp:sSu:")) != -1)
++    while ((c = getopt (argc, argv, "b:Chfp:sSu:")) != -1)
+         switch (c) {
+             case 'b':
+                 g_appBufLen = atoi(optarg) * 1024;
+                 break;
++            case 'C':
++                g_closeAfterDownload = true;
++                break;
+             case 'h':
+                 showUsage(EXIT_SUCCESS);
+                 break;
+@@ -145,6 +149,7 @@
+ {
+     puts("Usage: uAmiSpeedTest [host]");
+     puts("-b: app buffer (8/16/32 - default 32)");
++    puts("-C: close after download (what speedtest.net does)");
+     puts("-h: show help");
+     puts("-f: use fast.com");
+     puts("-p: port number (default 8080)");

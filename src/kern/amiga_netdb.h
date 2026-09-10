@@ -65,6 +65,16 @@
 #include <netdb.h>
 #endif
 
+
+/* struct CSource is <dos/rdargs.h>. This used to arrive via the DOS protos; with
+ * __NOLIBBASE__ it does not, and the symptom is obscure -- gcc reports "'struct
+ * CSource' declared inside parameter list", having invented a new incomplete type
+ * per prototype. Must sit OUTSIDE any surrounding #ifndef, or files that already
+ * satisfy that guard skip it. */
+#ifndef DOS_RDARGS_H
+#include <dos/rdargs.h>
+#endif
+
 #ifndef IN_H
 #include <netinet/in.h>
 #endif

@@ -798,10 +798,13 @@ extern unsigned long ng_detected_ram;			/* kern/amiga_main.c   */
 extern unsigned long tcp_sendspace, tcp_recvspace;	/* netinet/tcp_usrreq.c */
 extern unsigned long sb_max;				/* kern/uipc_socket2.c  */
 extern unsigned long ng_last_if_baudrate;		/* api/amiga_roadshow_compat.c */
-extern int tcppredack, tcppreddat, tcppcbcachemiss, tcppredwin;
+extern int tcppredack, tcppreddat, tcppcbcachemiss, tcppredwin, tcpreassfull;
 /* Socket wakeup accounting -- defined in kern/uipc_socket2.c, NOT tcp_input.c. */
 extern unsigned long ng_sowk_calls, ng_sowk_rcv, ng_sowk_wait, ng_sowk_sel, ng_sowk_async;	/* netinet/tcp_input.c  */
 extern u_long ng_tcp_rcvtotal();			/* netinet/tcp_input.c  */
+extern ULONG  ng_rx_posted();				/* net/if_sana.c        */
+extern ULONG  ng_rx_wanted();				/* net/if_sana.c        */
+extern ULONG  ng_rx_idle_secs();			/* net/if_sana.c        */
 /* Header-prediction miss attribution (netinet/tcp_input.c tcp_predict_miss). */
 extern int tcppm_state, tcppm_flags, tcppm_tstamp, tcppm_seq, tcppm_win,
 	   tcppm_rexmit, tcppm_dupack, tcppm_sack, tcppm_ack, tcppm_cwnd,
@@ -1250,6 +1253,20 @@ ULONG SAVEDS RAF2(_SocketBaseTagList,
 	break;
 
       CASE_NG_GET( SBTC_NG_TCP_PCBMISS, tcppcbcachemiss );
+      CASE_NG_GET( SBTC_NG_TCP_REASSFULL, tcpreassfull );
+
+      /* Receive-ring liveness. Functions, not globals, so they are computed at
+       * the moment of the query -- a stall is diagnosed by watching these move
+       * (or fail to), and a cached value would defeat the whole point. */
+      case (SBTC_NG_RX_POSTED << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = ng_rx_posted();
+	break;
+      case (SBTC_NG_RX_WANTED << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = ng_rx_wanted();
+	break;
+      case (SBTC_NG_RX_IDLE   << SBTB_CODE):
+	if (!((UWORD)tag & SBTF_SET)) *tagData = ng_rx_idle_secs();
+	break;
       CASE_NG_GET( SBTC_NG_TCP_PREDWIN, tcppredwin      );
 
       CASE_NG_GET( SBTC_NG_SOWK_CALLS,  ng_sowk_calls );

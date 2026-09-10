@@ -26,6 +26,64 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMEOUT="${TIMEOUT:-95}"
 NET="${NET:-0}"
+# A command run INSIDE the container, in the background, just before amiberry
+# starts -- for a test server the guest is meant to talk to over SLIRP. Its
+# output is echoed at the end of the run. Must not contain single quotes.
+PRELAUNCH="${PRELAUNCH:-}"
+# Docker network to attach the container to. SLIRP is a user-mode NAT, so the
+# guest can reach anything the CONTAINER can reach -- joining amitcp-net is
+# what lets it pull a 100 MB file off the transferhost.
+NETWORK="${NETWORK:-}"
+# NETEM applies tc qdisc netem to the container's own interface before the
+# emulator starts, e.g. NETEM="delay 100ms loss 0.5%". SLIRP reaches the
+# outside through that interface, so the guest inherits the delay and loss.
+#
+# WHY IT MATTERS: this rig cannot exceed ~4 Mb/s, so at a 4ms RTT there is
+# only a few KB in flight and the window never has to open. Bandwidth-delay
+# product is bandwidth TIMES delay -- adding 100ms of RTT buys the same large
+# in-flight window that a 37 Mbit link buys, at a bandwidth we can actually
+# emulate. It is the only way to reach that regime here.
+NETEM="${NETEM:-}"
+# A REAL filesystem for the guest to write to. The DH0 directory mount is
+# handled by the emulator, not by an AmigaOS filesystem, so nothing in that
+# path behaves like a real single-threaded handler -- and handler contention
+# is exactly what a stalled copy is suspected of causing. HDF attaches a
+# hardfile with a real FFS on it so writes go through the real thing.
+HDF="${HDF:-}"
+HDFARG=(); [ -n "$HDF" ] && HDFARG=(-W "DH1:$HDF")
+
+# FAST=1 spends the host's cycles on 68k code and nothing else. A soak run is
+# rate-limited by how much guest work fits in the wall clock, so anything the
+# emulator does BESIDES executing instructions is time the test does not get.
+#
+# The two that actually cost here are graphics and idling. The container renders
+# through llvmpipe -- software Mesa on a 2-core box -- so painting every frame is
+# a real fraction of a core; gfx_framerate=20 paints one in twenty and the guest
+# is still perfectly observable, because this rig reads results from FILES, not
+# from the screen. cpu_idle is 150 in the A4000 QuickStart, which hands the host
+# back a timeslice whenever the guest looks idle -- exactly the wrong trade when
+# the guest is waiting on a socket and we want it back the instant data lands.
+#
+# JIT is NOT part of this switch: --model A4000 already sets cachesize to
+# MAX_JIT_CACHE, so every 040 run this rig has ever done was already translated.
+# It is pinned here only so the setting is stated rather than inherited.
+#
+# The accuracy knobs (cycle_exact, cpu_compatible, data_cache) are OFF, so chip
+# timing is no longer period-correct. That is fine for a stack test -- nothing
+# here depends on Agnus -- but it does mean FAST=1 is not the configuration to
+# use if you are ever chasing something timing-sensitive on the CHIPSET side.
+FAST="${FAST:-0}"
+FASTARG=()
+if [ "$FAST" = "1" ]; then
+  FASTARG=(-s cpu_speed=max -s cachesize=16384
+           -s cpu_compatible=false -s cpu_cycle_exact=false
+           -s blitter_cycle_exact=false -s cpu_data_cache=false
+           -s cpu_idle=0 -s sound_output=none
+           -s gfx_framerate=20 -s collision_level=none
+           -s immediate_blits=true -s floppy_speed=0)
+fi
+CAPARG=(); [ -n "$NETEM" ] && CAPARG=(--cap-add NET_ADMIN)
+NETOPT=(); [ -n "$NETWORK" ] && NETOPT=(--network "$NETWORK")
 HDD="${HDD:-/work/emu/hdd/System/Workbench3.2}"
 
 # RAM (Z3 fast, MB). THIS SELECTS THE STACK'S RAM TIER, so it decides which set of
@@ -49,12 +107,25 @@ RAMARG=()
 # Default is therefore set per-mode in the MODEL block below.
 CPU="${CPU:-}"
 
-# Model + ROM default by mode: NET=1 needs Zorro (A4000), NET=0 is fine on A600.
+# Model + ROM default by mode: NET=1 needs Zorro for the A2065, NET=0 is fine on
+# an A600.
+#
+# AND THE ZORRO MACHINE DEPENDS ON THE CPU. The A4000 Kickstart will not run on a
+# 68000, so "CPU=68000 --model A4000" boots nothing at all -- no phase log, no
+# output, indistinguishable from the stack hanging. It cost a 23-minute run. The
+# A2000 is the machine that has both: Zorro II slots for the card, and a ROM
+# (the shared CDTV/A1000/A500/A2000/A600 image) that a 68000 can execute. So a
+# 68000 network test runs on an A2000 and an accelerated one on an A4000.
 NETARG=()
 if [ "$NET" = "1" ]; then
-  MODEL="${MODEL:-A4000}"                          # Zorro III -- hosts the A2065
-  ROM="${ROM:-/work/emu/rom/kicka4000.rom}"
   CPU="${CPU:-68040}"                               # match Andy's PiStorm/Emu68 040
+  if [ "$CPU" = "68000" ]; then
+    MODEL="${MODEL:-A2000}"                         # Zorro II, and 68000-capable ROM
+    ROM="${ROM:-/work/emu/rom/kickCDTVa1000a500a2000a600.rom}"
+  else
+    MODEL="${MODEL:-A4000}"                         # Zorro III -- hosts the A2065
+    ROM="${ROM:-/work/emu/rom/kicka4000.rom}"
+  fi
   NETARG=(-s "a2065=slirp")     # "slirp" = SLIRP User Mode NAT driver (ethernet.cpp)
 else
   MODEL="${MODEL:-A600}"                            # light loopback-only machine
@@ -62,20 +133,91 @@ else
   CPU="${CPU:-0}"                                   # A600 is a 68000 -- leave it alone
 fi
 
+# fpu_model is NOT the same knob as cpu_model, and it does not take a CPU number.
+# Amiberry accepts 0 / 68881 / 68882 / 68040 / 68060 -- so "fpu_model=68020" is not a
+# valid FPU and the emulator never reaches the guest (empty phase.log, reads exactly
+# like the stack hanging). The 040/060 have the FPU on-chip and name themselves; a
+# bare 020/030 has no FPU unless one is fitted, which is the honest default for a
+# test rig. This only ever worked before because CPU was always 68040.
 CPUARG=()
-[ "$CPU" != "0" ] && CPUARG=(-s "cpu_model=$CPU" -s "fpu_model=$CPU")
+if [ "$CPU" != "0" ]; then
+  case "$CPU" in
+    68040|68060) FPUMODEL="$CPU" ;;   # on-chip FPU, named after the CPU
+    *)           FPUMODEL=0 ;;        # 68020/68030: no coprocessor fitted
+  esac
+  CPUARG=(-s "cpu_model=$CPU" -s "fpu_model=$FPUMODEL")
+fi
 
-docker run --rm -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
+docker run --rm "${NETOPT[@]}" "${CAPARG[@]}" -v "$ROOT":/work -w /work amitcp-ng-amiberry:latest bash -c "
   Xvfb :99 -screen 0 1024x768x24 +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
   export DISPLAY=:99 SDL_AUDIODRIVER=dummy LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe
   export HOME=/tmp/abhome; mkdir -p /tmp/abhome
   sleep 2
-  echo '>>> launching amiberry (model $MODEL, CPU=$CPU, NET=$NET, RAM=${RAM}MB Z3, timeout ${TIMEOUT}s)'
+  echo '>>> launching amiberry (model $MODEL, CPU=$CPU, NET=$NET, RAM=${RAM}MB Z3, FAST=$FAST, timeout ${TIMEOUT}s)'
+  if [ -n '$NETEM' ]; then
+    dev=\$(ip route | awk '/default/{print \$5; exit}')
+    tc qdisc add dev \$dev root netem $NETEM 2>/dev/null \\
+      && echo '>>> netem on '\$dev': $NETEM' \\
+      || echo '>>> NETEM REQUESTED BUT NOT APPLIED (no tc, or no NET_ADMIN) -- results are NOT delayed'
+  fi
+  if [ -n '$PRELAUNCH' ]; then
+    echo '>>> prelaunch: $PRELAUNCH'
+    # bash -c, not a subshell: with PRELAUNCH empty a bare subshell expands
+    # to an empty pair of parens, which is a SYNTAX error -- and bash parses
+    # the whole script before running any of it, so the guard above does not
+    # save you. It silently killed every run-smoke.sh run: empty emulator
+    # log, four FAILs, and nothing to say the harness was the problem.
+    bash -c '$PRELAUNCH' >/tmp/prelaunch.log 2>&1 &
+    sleep 1
+  fi
   cd /opt/amiberry
+  # STOP AS SOON AS THE GUEST IS DONE.
+  #
+  # This used to be a bare timeout+amiberry, so every run burned its whole
+  # timeout however quickly the guest finished -- the test scripts write
+  # done.marker as their last act and then the host just sat there. Over a
+  # three-tier smoke run that was minutes of pure waiting.
+  #
+  # The guest disk is a DIRECTORY mount, not an HDF, so guest writes land on this
+  # filesystem as they happen and the marker shows up here immediately. Poll for
+  # it and stop. TIMEOUT goes back to being the backstop it was meant to be, for a
+  # guest that hangs or never reaches the end.
+  rm -f '$HDD/done.marker'
   timeout ${TIMEOUT} ./build/amiberry --model $MODEL \
      -r '$ROM' \
-     -s filesystem2=rw,DH0:System:'$HDD',0 \
-     ${NETARG[*]} ${RAMARG[*]} ${CPUARG[*]} \
-     -G 2>&1 | grep -viE '^\s*$' | tail -30
+     -s filesystem2=rw,DH0:System:'$HDD',0 ${HDFARG[*]} \
+     ${NETARG[*]} ${RAMARG[*]} ${CPUARG[*]} ${FASTARG[*]} \
+     -G >/tmp/ami.log 2>&1 &
+  amipid=\$!
+  waited=0
+  while [ \$waited -lt ${TIMEOUT} ]; do
+    if [ -s '$HDD/done.marker' ]; then
+      sleep 3                       # let the guest quiesce after its last write
+      kill \$amipid 2>/dev/null
+      echo \">>> guest finished after \${waited}s (timeout ${TIMEOUT}s)\"
+      break
+    fi
+    if ! kill -0 \$amipid 2>/dev/null; then
+      # The emulator stopped by itself. That is NOT the same as the guest
+      # hanging, and reporting it as one sends the reader hunting a stack bug
+      # that is not there. Say which happened and show the emulator's own output.
+      early=1; break
+    fi
+    sleep 1; waited=\$((waited+1))
+  done
+  wait \$amipid 2>/dev/null
+  if [ -s '$HDD/done.marker' ]; then
+    :
+  elif [ \"\${early:-0}\" = 1 ]; then
+    echo \">>> EMULATOR EXITED on its own after \${waited}s with no done.marker --\"
+    echo \">>> this is an emulator/host failure, NOT necessarily a guest hang:\"
+    tail -20 /tmp/ami.log
+  else
+    echo \">>> TIMEOUT after ${TIMEOUT}s with no done.marker -- the guest really did hang\"
+  fi
+  grep -viE '^[[:space:]]*\$' /tmp/ami.log | tail -30
+  if [ -s /tmp/prelaunch.log ]; then
+    echo '>>> prelaunch output:'; cat /tmp/prelaunch.log
+  fi
   echo '>>> amiberry exited'
 "

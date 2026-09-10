@@ -580,6 +580,49 @@ tsleep(struct SocketBase *p,  /* Library base through which this call came */
   return (result);
 }
 
+/*
+ * PORT (AmiTCP_NG): is a task ACTUALLY asleep on this channel right now?
+ *
+ * The receive-stall detector needs this because SB_WAIT cannot answer it.
+ * sowakeup() clears SB_WAIT and THEN calls wakeup(), which returns void -- so a
+ * wakeup that reached nobody leaves the flag false with the reader still asleep,
+ * and a read that ended by timeout or signal leaves it true with nobody asleep.
+ * The sleep queue is the only thing that knows.
+ *
+ * AttemptSemaphore, never ObtainSemaphore -- and NOT because blocking under
+ * Forbid() is unsafe. It is not: Wait() under Forbid() is a documented AmigaOS
+ * guarantee, and wakeup() below already takes this same semaphore unconditionally
+ * while TCP holds splnet(). The hazard is subtler. A task's Wait() is precisely
+ * where it steps outside Forbid()'s protection so another task can run, and the
+ * caller here is midway through tcp_slowtimo()'s walk of tcb -- a walk whose only
+ * protection against a concurrent soclose() mutating the list IS that splnet()
+ * (in_pcb.c documents exactly this). Blocking would reopen the window the outer
+ * lock exists to close. Returns -1 for "could not tell"; the caller is on a
+ * 500ms timer and simply asks again.
+ */
+int
+ng_sleeper_on(caddr_t chan)
+{
+  register queue_t q;
+  struct ng_sleepctx *sc;
+  int found = 0;
+
+  if (chan == 0 || !sleep_initialized)
+    return (-1);
+  if (!AttemptSemaphore(&sleep_semaphore))
+    return (-1);
+
+  q = &sleep_queue[SLEEP_HASH(chan)];
+  sc = (struct ng_sleepctx *)queue_first(q);
+  while (!queue_end(q, (queue_entry_t)sc)) {
+    if (sc->sc_wchan == chan) { found = 1; break; }
+    sc = (struct ng_sleepctx *)queue_next(&sc->sc_link);
+  }
+
+  ReleaseSemaphore(&sleep_semaphore);
+  return (found);
+}
+
 void
 wakeup(caddr_t chan)
 {

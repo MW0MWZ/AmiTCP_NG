@@ -39,7 +39,7 @@
  *    trusted to tell you which side of it you are on. A wrapped value is
  *    detectable -- it is smaller than the epoch difference, which no real time
  *    after 1978 can be -- so era 1 is handled rather than ignored. Both eras are
- *    verified against known timestamps with docker/bench/sntpd.py: NTP
+ *    verified against known timestamps: NTP
  *    3944678400 must give 2025-01-01, and the wrapped 123010304 must give
  *    2040-01-01.
  *
@@ -53,6 +53,7 @@
 #include <exec/types.h>
 #include <dos/dos.h>
 #include <dos/rdargs.h>
+#include <dos/var.h>		/* LV_VAR, GVF_GLOBAL_ONLY for GetVar */
 #include <devices/timer.h>
 #include <utility/date.h>
 #include <proto/exec.h>
@@ -211,6 +212,262 @@ static ULONG ntp_to_amiga(ULONG ntp)
   return asecs;
 }
 
+/* ---- POSIX TZ (ENV:TZONE) ---------------------------------------------------
+ *
+ * The variable holds a POSIX TZ string, e.g. "GMT0BST" or "EST5EDT" or a fully
+ * specified "CET-1CEST,M3.5.0/2,M10.5.0/3". Written on most machines by the
+ * Aminet SetDST tool.
+ *
+ *   STD offset [DST [offset]] [,start[/time],end[/time]]
+ *
+ * THE OFFSET SIGN IS INVERTED from the way people say it: it is the value ADDED
+ * TO LOCAL TIME TO GET UTC, so it counts degrees WEST. "EST5EDT" is UTC-5, and
+ * "CET-1" is UTC+1. This trips everyone up once; it is the standard, not a bug.
+ *
+ * A DST name with no offset means one hour east of standard, per POSIX.
+ *
+ * A DST name with no RULE -- which is what "GMT0BST" is, and what SetDST writes
+ * -- says daylight saving exists but not when. POSIX leaves that
+ * implementation-defined. We use the EU rule (last Sunday in March to last
+ * Sunday in October), which is right for the machines that produce these
+ * strings; anyone needing different dates can spell the rule out, and then we
+ * use theirs.
+ */
+struct tzinfo {
+  int  have;			/* 0 = no usable TZ, ignore the rest	  */
+  long std_off;			/* seconds WEST of UTC, standard time	  */
+  long dst_off;			/* seconds WEST of UTC, daylight time	  */
+  int  has_dst;			/* a DST name was present		  */
+  UWORD s_mon, s_week, s_day;	long s_time;	/* start rule, local secs */
+  UWORD e_mon, e_week, e_day;	long e_time;	/* end rule			  */
+};
+
+/* [+-]hh[:mm[:ss]] -- returns seconds west, advances *pp past what it ate. */
+static long tz_offset(const char **pp)
+{
+  const char *p = *pp;
+  const char *start = p;
+  long sign = 1, v[3];
+  int  i = 0;
+
+  if (*p == '+') p++;
+  else if (*p == '-') { sign = -1; p++; }
+
+  /* A sign we cannot use is a sign we must not eat. This function reports "I
+   * read nothing" by leaving *pp where it found it, and the DST-offset caller
+   * leans on that to keep its one-hour-east default; swallowing a lone '+' or
+   * '-' would break the promise and hand back a bogus zero. */
+  if (*p < '0' || *p > '9') { *pp = start; return 0; }
+
+  for (i = 0; i < 3; i++) {
+    long n = 0;
+    if (*p < '0' || *p > '9') break;
+    while (*p >= '0' && *p <= '9') {
+      /* Refuse overflow BEFORE it happens, not after. v[0] gets multiplied by
+       * 3600, and on 32 bits a large enough field wraps round into a perfectly
+       * plausible SMALL offset -- "XXX1193047" arrives as -31 minutes and
+       * sails straight through the caller's range check, setting the clock
+       * half an hour wrong. A bound applied to the result cannot catch that,
+       * because by then the arithmetic is already undefined. */
+      if (n > 999999L) { *pp = start; return 0; }
+      n = n * 10 + (*p++ - '0');
+    }
+    v[i] = n;
+    if (*p != ':') { i++; break; }
+    p++;
+  }
+
+  /* Ranges per POSIX: the hours field of a changeover TIME may run to 167, the
+   * minutes and seconds are ordinary clock fields. Checking here keeps every
+   * product below well inside 32 bits. */
+  if (i > 0 && v[0] > 167L) { *pp = start; return 0; }
+  if (i > 1 && v[1] > 59L)  { *pp = start; return 0; }
+  if (i > 2 && v[2] > 59L)  { *pp = start; return 0; }
+
+  *pp = p;
+  { long secs = 0;
+    if (i > 0) secs += v[0] * 3600L;
+    if (i > 1) secs += v[1] * 60L;
+    if (i > 2) secs += v[2];
+    return sign * secs;
+  }
+}
+
+/* A zone NAME: letters, or anything inside <> (POSIX allows <+04> style). */
+static void tz_name(const char **pp)
+{
+  const char *p = *pp;
+  if (*p == '<') { while (*p && *p != '>') p++; if (*p) p++; }
+  else while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) p++;
+  *pp = p;
+}
+
+/* "Mm.w.d[/time]" -- the only rule form worth supporting; Jn/n are archaic. */
+static int tz_rule(const char **pp, UWORD *mon, UWORD *week, UWORD *day, long *tim)
+{
+  const char *p = *pp;
+  long n;
+
+  *tim = 2 * 3600L;			/* POSIX default changeover: 02:00 local */
+  if (*p != 'M') return 0;
+  p++;
+  /* Range-check each field BEFORE narrowing it to UWORD. Truncating first and
+   * validating the truncated value makes the check a decoration: "M65539.5.0"
+   * wraps to month 3 and is then waved through as if it said March. */
+  n = 0;
+  while (*p >= '0' && *p <= '9') { if (n > 99999L) return 0; n = n * 10 + (*p++ - '0'); }
+  if (n < 1 || n > 12) return 0;
+  *mon = (UWORD)n;
+  if (*p != '.') return 0;
+  p++;
+  n = 0;
+  while (*p >= '0' && *p <= '9') { if (n > 99999L) return 0; n = n * 10 + (*p++ - '0'); }
+  if (n < 1 || n > 5) return 0;
+  *week = (UWORD)n;
+  if (*p != '.') return 0;
+  p++;
+  n = 0;
+  while (*p >= '0' && *p <= '9') { if (n > 99999L) return 0; n = n * 10 + (*p++ - '0'); }
+  if (n > 6) return 0;
+  *day = (UWORD)n;
+  if (*p == '/') {
+    const char *r;
+    p++;
+    r = p;
+    *tim = tz_offset(&p);
+    if (p == r) return 0;		/* "/" with nothing usable after it */
+  }
+  *pp = p;
+  return 1;
+}
+
+static int tz_parse(const char *s, struct tzinfo *t)
+{
+  const char *p = s;
+
+  t->have = 0; t->has_dst = 0;
+  if (!s || !*s) return 0;
+
+  tz_name(&p);
+  if (p == s) return 0;			/* no standard name -- not a TZ string */
+
+  /* The standard offset is MANDATORY -- see the grammar above, where it is the
+   * one element not in brackets. Treating a bare "CET" as UTC+0 would not just
+   * set the clock an hour out in winter and two in summer, it would print
+   * "Time zone: CET (UTC+0:00)" and state that wrong answer as a fact. Better
+   * to reject the string and say we did not understand it: the caller then
+   * leaves the clock in UTC, which is at least an honest answer. */
+  { const char *q = p;
+    t->std_off = tz_offset(&p);
+    if (p == q) return 0;
+  }
+  t->dst_off = t->std_off - 3600L;	/* POSIX default: one hour east of std */
+
+  if (*p && *p != ',') {		/* a DST name follows */
+    const char *q = p;
+    tz_name(&p);
+    if (p != q) {
+      t->has_dst = 1;
+      if (*p && *p != ',') {
+        /* Only overwrite the one-hour-east default if an offset was ACTUALLY
+         * read. tz_offset() consumes nothing and returns 0 when the next
+         * character is not a digit or sign -- so a trailing space or newline
+         * after the DST name would otherwise replace the correct default with
+         * zero, and the clock would sit on standard time all year. That is the
+         * very bug this parser exists to fix, arriving by another door. */
+        const char *r = p;
+        long v = tz_offset(&p);
+        if (p != r) t->dst_off = v;
+      }
+    }
+  }
+
+  /* EU default, used when the string names DST but gives no rule: both
+   * changeovers happen at 01:00 UTC.
+   *
+   * POSIX states rule times in LOCAL time -- standard time for the spring one,
+   * DAYLIGHT time for the autumn one -- so each has to be written as the local
+   * clock reading that lands on 01:00 UTC. DERIVE them rather than hardcoding
+   * a pair of constants: 01:00 and 02:00 are only correct for a zone whose
+   * standard offset is zero, so "GMT0BST" looked right while "CET-1CEST"
+   * changed over an hour early. Deriving also makes the spring/autumn
+   * asymmetry fall out of the arithmetic instead of being two hand-maintained
+   * numbers that the next person to read this will helpfully make match.
+   *
+   * Must stay BELOW the DST block above -- it reads the final dst_off. */
+  t->s_mon = 3;  t->s_week = 5; t->s_day = 0; t->s_time = 3600L - t->std_off;
+  t->e_mon = 10; t->e_week = 5; t->e_day = 0; t->e_time = 3600L - t->dst_off;
+
+  if (*p == ',') {
+    p++;
+    if (!tz_rule(&p, &t->s_mon, &t->s_week, &t->s_day, &t->s_time)) return 0;
+    if (*p != ',') return 0;
+    p++;
+    if (!tz_rule(&p, &t->e_mon, &t->e_week, &t->e_day, &t->e_time)) return 0;
+  }
+
+  /* Anything left over means we did not understand this string, whatever we
+   * managed to read from the front of it. Say so rather than act on a partial
+   * reading -- the caller then leaves the clock in UTC, which is a defensible
+   * answer, where a half-parsed offset is not. */
+  if (*p != '\0') return 0;
+
+  t->have = 1;
+  return 1;
+}
+
+/* Amiga seconds of the week-th <day> of <mon> in <year>, at <tim> local. */
+static ULONG tz_when(UWORD year, UWORD mon, UWORD week, UWORD day, long tim)
+{
+  struct ClockData cd;
+  ULONG first, s;
+  int   w;
+
+  cd.year = year; cd.month = mon; cd.mday = 1;
+  cd.hour = 0; cd.min = 0; cd.sec = 0; cd.wday = 0;
+  first = Date2Amiga(&cd);
+  Amiga2Date(first, &cd);		/* fills in wday: 0 = Sunday */
+
+  /* first occurrence of <day> in the month */
+  w = (int)day - (int)cd.wday; if (w < 0) w += 7;
+  s = first + (ULONG)w * 86400UL;
+
+  /* week 1..4 = that many; 5 = the LAST one in the month */
+  { ULONG add = (week >= 5) ? 4UL : (ULONG)(week - 1);
+    while (add > 0) {
+      ULONG nxt = s + 7UL * 86400UL;
+      Amiga2Date(nxt, &cd);
+      if (cd.month != mon) break;	/* ran off the end: keep the last valid */
+      s = nxt; add--;
+    }
+  }
+  return s + (ULONG)tim;
+}
+
+/* Seconds to ADD to a UTC timestamp to get local time (i.e. EAST-positive). */
+static long tz_local_adjust(const struct tzinfo *t, ULONG utc)
+{
+  struct ClockData cd;
+  ULONG start, end;
+
+  if (!t->have) return 0;
+  if (!t->has_dst) return -t->std_off;
+
+  Amiga2Date(utc, &cd);
+  /* The rules are expressed in LOCAL time, so convert each changeover to UTC
+   * using the offset in force just BEFORE it: standard before the spring one,
+   * daylight before the autumn one. */
+  start = tz_when(cd.year, t->s_mon, t->s_week, t->s_day, t->s_time) + (ULONG)t->std_off;
+  end   = tz_when(cd.year, t->e_mon, t->e_week, t->e_day, t->e_time) + (ULONG)t->dst_off;
+
+  if (start <= end) {			/* northern hemisphere */
+    if (utc >= start && utc < end) return -t->dst_off;
+  } else {				/* southern: DST spans the new year */
+    if (utc >= start || utc < end) return -t->dst_off;
+  }
+  return -t->std_off;
+}
+
 static void show_time(const char *label, ULONG secs)
 {
   struct ClockData cd;
@@ -233,7 +490,7 @@ int main(void)
   struct MsgPort *tp = 0;
   const char *host;
   ULONG addr, mine_hi, mine_lo, t3, asecs, before, after;
-  long s = -1, fromlen, n, port = NTP_PORT, offmin = 0;
+  long s = -1, fromlen, n, port = NTP_PORT, offmin = 0, offsec = 0;
   int i, try, rc = RETURN_OK, doset;
 
   for (i = 0; i < 5; i++) args[i] = 0;
@@ -242,7 +499,9 @@ int main(void)
     Printf((STRPTR)"usage: sntp <host> [QUERY] [OFFSET <minutes>] [PORT <n>]\n"
                    "  sets the system and battery clocks from <host>.\n"
                    "  QUERY reports the time without setting anything.\n"
-                   "  OFFSET is minutes EAST of UTC (AmigaOS keeps local time).\n");
+                   "  OFFSET is minutes EAST of UTC (AmigaOS keeps local time).\n"
+                   "  Without OFFSET, ENV:TZONE is used if it holds a POSIX\n"
+                   "  time zone such as GMT0BST or CET-1CEST.\n");
     return RETURN_FAIL;
   }
   host  = (const char *)args[0];
@@ -256,6 +515,11 @@ int main(void)
     Printf((STRPTR)"sntp: OFFSET must be -1440..1440 minutes\n");
     FreeArgs(rda); return RETURN_FAIL;
   }
+  /* Seconds, not minutes: a TZ string may specify an offset with a seconds
+   * field, and dividing to minutes first would silently drop it. AFTER the
+   * range check, not before -- "OFFSET 2000000000" would otherwise overflow
+   * here and only be rejected on the next line. */
+  offsec = offmin * 60L;
   if (port < 1 || port > 65535) {
     Printf((STRPTR)"sntp: PORT must be 1..65535\n");
     FreeArgs(rda); return RETURN_FAIL;
@@ -398,7 +662,55 @@ int main(void)
   { unsigned long rtt = (after >= before) ? (after - before) : 0;
     asecs += (rtt / 50UL) / 2UL;
   }
-  asecs = asecs + (ULONG)(offmin * 60L);	/* local time, if asked. ULONG
+  /* ENV:TZONE, unless OFFSET was given on the command line -- an explicit
+   * argument always wins over the environment. */
+  if (!args[2]) {
+    UBYTE tzbuf[64];
+
+    tzbuf[0] = '\0';
+    tzbuf[sizeof(tzbuf) - 1] = '\0';	/* do not rely on GetVar to terminate */
+    if (GetVar((STRPTR)"TZONE", tzbuf, sizeof(tzbuf) - 1, LV_VAR | GVF_GLOBAL_ONLY) > 0) {
+      struct tzinfo tz;
+      long tzlen;			/* NOT n -- the outer n is the recvfrom count */
+
+      tzbuf[sizeof(tzbuf) - 1] = '\0';	/* again: the call may have filled it */
+
+      /* Trim trailing whitespace. An ENV: file written by an editor or by a
+       * tool that appends a line ending very often carries one, and every byte
+       * of it is input this parser would otherwise have to make sense of. */
+      tzlen = 0;
+      while (tzbuf[tzlen]) tzlen++;
+      while (tzlen > 0 && (tzbuf[tzlen-1] == '\n' || tzbuf[tzlen-1] == '\r' ||
+                           tzbuf[tzlen-1] == ' '  || tzbuf[tzlen-1] == '\t'))
+        tzbuf[--tzlen] = '\0';
+
+      if (tzlen == 0) {
+        /* Nothing but whitespace. Saying "'' is not a time zone" helps no one. */
+      } else if (tz_parse((const char *)tzbuf, &tz)) {
+        long adj = tz_local_adjust(&tz, asecs);
+
+        /* THE SAME BOUND THE OFFSET ARGUMENT GETS. Nothing in the grammar
+         * limits how large a parsed offset can be -- "XXX100" reads as a
+         * hundred hours -- and a clock set confidently to a wildly wrong time
+         * is worse than one left alone. Out of range: say so, change nothing. */
+        if (adj < -1440L * 60L || adj > 1440L * 60L) {
+          Printf((STRPTR)"sntp: ENV:TZONE '%s' gives an impossible offset "
+                         "-- ignoring it.\n", (LONG)tzbuf);
+        } else {
+          offsec = adj;
+          Printf((STRPTR)"Time zone:   %s (UTC%s%ld:%02ld)\n", (LONG)tzbuf,
+                 (LONG)((adj < 0) ? "-" : "+"),
+                 (LONG)((adj < 0 ? -adj : adj) / 3600L),
+                 (LONG)(((adj < 0 ? -adj : adj) / 60L) % 60L));
+        }
+      } else {
+        Printf((STRPTR)"sntp: ENV:TZONE is '%s', which is not a time zone I "
+                       "understand -- ignoring it.\n", (LONG)tzbuf);
+      }
+    }
+  }
+
+  asecs = asecs + (ULONG)offsec;		/* local time, if asked. ULONG
 				 * throughout: modular arithmetic is fully defined, and the
 				 * sanity floor (year 2000) is far above any offset, so a
 				 * negative one cannot underflow. */
