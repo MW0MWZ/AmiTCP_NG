@@ -3240,6 +3240,7 @@ extern int    ipforwarding, ipsendredirects, subnetsarelocal, tcp_mssdflt, tcp_i
 extern int    tcp_do_sack, tcp_do_rfc3042;
 extern int    ip_defttl, icmpmaskrepl, tcp_do_rfc1323, tcp_do_rfc1323_tstmp;
 extern int    ng_netctl_grace_secs;			/* kern/amiga_netctl.c */
+extern int    ng_rx_csum_active;			/* net/sana2copybuff.c */
 extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 
 /*
@@ -3295,6 +3296,10 @@ static const struct ng_rsd_opt ng_rsd_opts[] = {
   { "tcp.do_rfc1323",     0, &tcp_do_rfc1323      },
   { "ip.defttl",          0, &ip_defttl       },
   { "ip.forwarding",      0, &ipforwarding    },
+  /* OURS, like net.shutdown_grace. Writable: ng_cpu_tune() sets only the
+   * default, and AttnFlags sees neither clock speed nor an emulated CPU. Safe
+   * to flip live -- a frame in flight latched the flag before it started. */
+  { "ip.rx_cksum",        0, &ng_rx_csum_active },
   { "ip.sendredirects",   0, &ipsendredirects },
   { "ip.subnetsarelocal", 0, &subnetsarelocal },
   { "tcp.do_win_scale",   0, &tcp_do_rfc1323  },

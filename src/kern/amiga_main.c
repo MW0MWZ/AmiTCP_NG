@@ -542,8 +542,8 @@ ng_ram_tier(void)
 }
 
 /*
- * ng_cpu_tune --- turn on the CPU-costly RFC 1323 options only where the
- * processor can afford them.
+ * ng_cpu_tune --- turn on the CPU-costly options only where the processor can
+ * afford them.
  *
  * RFC 1323 timestamps put a 12-byte option -- built, byte-swapped and PAWS-
  * checked -- on every data segment (RSTs and keepalive probes carry no option),
@@ -555,6 +555,13 @@ ng_ram_tier(void)
  * (tcp_do_rfc1323) stays on everywhere -- it costs one shift at connection
  * setup, nothing per segment.
  *
+ * The fused receive checksum is gated here too, but as a BAND, off at both
+ * ends: a 68000 cannot afford it in interrupt (it doubles interrupt-time work
+ * per byte and overruns the frame interval), and on an '040/'060 it measures
+ * 0.92-0.96x because the cache already made the pass it removes nearly free.
+ * AttnFlags gives the model but not the clock, so this errs towards OFF;
+ * "ip.rx_cksum" overrides it for anything unclassifiable, Emu68 included.
+ *
  * Like ng_ram_tier(), this must run BEFORE readconfig() so an explicit config
  * tunable still overrides the CPU-derived default.
  */
@@ -562,14 +569,24 @@ static void
 ng_cpu_tune(void)
 {
   extern int tcp_do_rfc1323_tstmp;
+  extern int ng_rx_csum_active;
+  ULONG      attn = SysBase->AttnFlags;
 
   /* exec sets AFF_680x0 in AttnFlags for the detected processor (or better);
    * any of '020/'030/'040/'060 is "performant" for our purposes. */
-  if (SysBase->AttnFlags &
-      (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060))
+  if (attn & (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060))
     tcp_do_rfc1323_tstmp = 1;
   else
     tcp_do_rfc1323_tstmp = 0;
+
+  /* 040/060 FIRST: exec sets these cumulatively, so an '040 also has AFF_68020
+   * and an '020-first test would claim it. */
+  if (attn & (AFF_68040 | AFF_68060))
+    ng_rx_csum_active = 0;
+  else if (attn & (AFF_68020 | AFF_68030))
+    ng_rx_csum_active = 1;
+  else
+    ng_rx_csum_active = 0;		/* bare 68000/68010 */
 }
 
 /*

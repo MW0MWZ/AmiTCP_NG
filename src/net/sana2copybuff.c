@@ -116,6 +116,11 @@ RCS_ID_C="$Id: sana2copybuff.c,v 1.15 1993/12/20 18:06:41 jraja Exp $";
 #include <netinet/in_cksum_copy_protos.h>
 #endif
 
+/* Fuse the checksum into the receive copy? Set by ng_cpu_tune(), writable as
+ * "ip.rx_cksum". Defined outside the #if above so ng_cpu_tune() and the option
+ * table link whatever this build decided. Off until tuned. */
+int ng_rx_csum_active = 0;
+
 /*
  * allocate mbufs for the size MTU at free_chain for read request
  */
@@ -499,9 +504,10 @@ static BOOL copy_to_mbuf_body(to, from, n)
 #endif
 
 #if NG_RX_CSUM
-  /* Decided once, before a single byte moves. A frame we cannot parse simply gets
-   * copied exactly as it always was, with no checksum published. */
-  fused = ng_rx_csum_parse(from, n, &hlen, &iplen);
+  /* Decided once, before a single byte moves; an unparseable frame is copied as
+   * it always was. The && short-circuits the parse too, and the consumers key on
+   * M_CSUM_DONE, so no other site needs a runtime test. */
+  fused = ng_rx_csum_active && ng_rx_csum_parse(from, n, &hlen, &iplen);
 #endif
 
   while (n > 0) {
