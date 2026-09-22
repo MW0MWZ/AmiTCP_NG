@@ -18,7 +18,7 @@
  * release -- this is the single source of truth (build-release.sh reads it too).
  */
 #define AMITCP_NG_VER   "4.1.8-beta"
-#define DATE    "20.9.2026"
+#define DATE    "22.9.2026"
 #define VERS    "bsdsocket.library 4.1"
 #define VSTRING "bsdsocket.library 4.1 (AmiTCP_NG " AMITCP_NG_VER ")\n\r"
 #define VERSTAG "\0$VER: bsdsocket.library 4.1 (AmiTCP_NG " AMITCP_NG_VER ")"
