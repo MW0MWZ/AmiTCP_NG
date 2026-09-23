@@ -3240,6 +3240,8 @@ extern int    ipforwarding, ipsendredirects, subnetsarelocal, tcp_mssdflt, tcp_i
 extern int    tcp_do_sack, tcp_do_rfc3042;
 extern int    ip_defttl, icmpmaskrepl, tcp_do_rfc1323, tcp_do_rfc1323_tstmp;
 extern int    ng_netctl_grace_secs;			/* kern/amiga_netctl.c */
+extern LONG   ng_task_pri;				/* kern/amiga_main.c */
+extern int    ng_task_pri_changed(void *pt, LONG new);	/* validates and applies */
 extern int    ng_rx_csum_active;			/* net/sana2copybuff.c */
 extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 
@@ -3276,7 +3278,7 @@ static const struct ng_rsd_opt ng_rsd_opts[] = {
    * publishing a knob that controls nothing would be worse than not having it.
    *
    * Still absent, for want of anything to point at: tcp.rttdflt, tcp.random,
-   * tcp.use_mssdflt_for_remote, bpf.bufsize, task.controller.priority.
+   * tcp.use_mssdflt_for_remote, bpf.bufsize.
    */
   /*
    * OURS, not one of Roadshow's names -- how many seconds applications get to close
@@ -3288,6 +3290,11 @@ static const struct ng_rsd_opt ng_rsd_opts[] = {
    * caller's timeout makes that caller cancel a shutdown that was about to work.
    */
   { "net.shutdown_grace", 0, &ng_netctl_grace_secs },
+  /* Below applications on a 68000 so the machine stays usable during a transfer;
+   * ng_cpu_tune() picks the default. Applied on write, see below. The second name
+   * is Roadshow's own (its default is 0); both drive the same setting. */
+  { "task.priority",            0, &ng_task_pri         },
+  { "task.controller.priority", 0, &ng_task_pri         },
   { "icmp.maskrepl",      0, &icmpmaskrepl        },
   { "icmp.processecho",   0, &icmp_process_echo   },
   { "icmp.procesststamp", 0, &icmp_process_tstamp },
@@ -3454,6 +3461,18 @@ BOOL SAVEDS RAF5(_ChangeRoadshowData,
     writeErrnoValue(libPtr, ENOSPC);		/* wrong size for this option */
     return (FALSE);
   }
+  if (n->rdn_Data == (APTR)&ng_task_pri) {
+    /* Copy, don't dereference: the SFD promises only a byte length, and an odd
+     * `data` would Address Error on a 68000. */
+    LONG v;
+    bcopy((caddr_t)data, (caddr_t)&v, sizeof(v));
+    if (!ng_task_pri_changed(NULL, v)) {
+      writeErrnoValue(libPtr, EINVAL);
+      return (FALSE);
+    }
+    return (TRUE);
+  }
+
   Forbid();
   bcopy((caddr_t)data, (caddr_t)n->rdn_Data, length);
   Permit();
@@ -3794,7 +3813,12 @@ ng_apply_env_tunables(void)
       continue;				/* not a number -- ignore, do not guess */
     if (neg) v = -v;
 
-    *(LONG *)ng_rsd_opts[i].data = v;
+    /* Validated options take their validator, not a raw store. */
+    if (ng_rsd_opts[i].data == (APTR)&ng_task_pri) {
+      if (!ng_task_pri_changed(NULL, v))
+	continue;			/* out of range: keep the default */
+    } else
+      *(LONG *)ng_rsd_opts[i].data = v;
 
     /* Remember the name for the startup report (bounded, oldest wins). */
     {

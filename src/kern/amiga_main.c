@@ -158,6 +158,30 @@ static int  ng_stack_quiesce(void);
  */
 struct Task * AmiTCP_Task;
 
+/* Net-task priority. Above applications drains the receive ring, below them
+ * keeps the machine usable. ng_cpu_tune() sets it; NETTASKPRI overrides. */
+LONG ng_task_pri = 5;
+
+/* The one validator: config, ENV:, live SET and RoadshowControl all land here,
+ * so a bad value is refused once and a good one applies immediately. */
+int ng_task_pri_changed(void *p, LONG new)
+{
+  extern volatile BOOL ng_stack_running;
+
+  if (new < -128 || new > 127)
+    return (FALSE);			/* ln_Pri is a signed BYTE: refuse it */
+
+  /* setvalue() stores this again afterwards, unlocked, so simultaneous writers
+   * can leave ng_task_pri stale against ln_Pri. Accepted: harmless to the
+   * scheduler, and only a RoadshowControl GET reads the mirror. */
+  Forbid();				/* the net task cannot exit under us here */
+  ng_task_pri = new;
+  if (ng_stack_running && AmiTCP_Task)
+    SetTaskPri(AmiTCP_Task, ng_task_pri);
+  Permit();
+  return (TRUE);
+}
+
 extern struct ExecBase * SysBase;
 extern struct Library * MasterSocketBase;
 extern WORD nthLibrary;
@@ -241,7 +265,7 @@ main(int argc, char *argv[])
     /*
      * Set our priority 
      */
-    oldpri = SetTaskPri(AmiTCP_Task, 5);
+    oldpri = SetTaskPri(AmiTCP_Task, ng_task_pri);
 
     /*
      * Set our Task name 
@@ -587,6 +611,12 @@ ng_cpu_tune(void)
     ng_rx_csum_active = 1;
   else
     ng_rx_csum_active = 0;		/* bare 68000/68010 */
+
+  /* A 68000 is saturated by TCP, so packets lose to the user. Faster CPUs keep
+   * today's behaviour -- unmeasured there, so unchanged. */
+  ng_task_pri = (attn & (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060)) ? 5 : -1;
+  /* Set only -- the callers apply it after readconfig(). Applying it here would
+   * capture it as main()'s oldpri and strand the Shell at it on shutdown. */
 }
 
 /*
@@ -995,7 +1025,7 @@ static void ng_stack_process(void)
   else
     goto fail;
 
-  SetTaskPri(AmiTCP_Task, 5);
+  SetTaskPri(AmiTCP_Task, ng_task_pri);
   AmiTCP_Task->tc_Node.ln_Name = "AmiTCP_NG";
   initialized = TRUE;
 

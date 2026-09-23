@@ -126,6 +126,19 @@ static void debug_dump(void)
     Printf((STRPTR)"RAM tier (the ceiling):             %s (mbuf pool max %ld KB)\n",
            (LONG)tname, (LONG)maxmem);
     Printf((STRPTR)"Effective window = min(link-speed target, RAM tier); a config tcp.* overrides.\n");
+    /* The LIVE priority: a configured value that never reached the task is
+     * exactly what is worth seeing here. */
+    { /* "AmiTCP_NG" is the library build's name; the program build uses "AmiTCP". */
+      struct Task *nt = FindTask((STRPTR)"AmiTCP_NG");
+      if (!nt) nt = FindTask((STRPTR)"AmiTCP");
+      if (!nt)
+        Printf((STRPTR)"Net task priority:                  stack not running\n");
+      else
+        Printf((STRPTR)"Net task priority:                  %ld (%s)\n",
+               (LONG)nt->tc_Node.ln_Pri,
+               (LONG)((nt->tc_Node.ln_Pri < 0)
+                      ? "below applications -- the machine stays responsive"
+                      : "above applications -- packets win")); }
     Printf((STRPTR)"                            RAM tier         actual (live)\n");
     Printf((STRPTR)"  tcp.sendspace         %14ld     %14ld\n", (LONG)snd,   (LONG)live_snd);
     Printf((STRPTR)"  tcp.recvspace         %14ld     %14ld\n", (LONG)rcv,   (LONG)live_rcv);

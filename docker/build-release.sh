@@ -232,6 +232,7 @@ check_installer_block_matches "#db-newlogconsole"  AmiTCP.config LOGCONSOLE
 check_installer_block_matches "#db-newlogfilename" AmiTCP.config LOGFILENAME
 check_installer_block_matches "#db-newmbufcheck"   AmiTCP.config MBUFCHECK
 check_installer_block_matches "#db-newsanadma" AmiTCP.config SANADMA
+check_installer_block_matches "#db-newnettaskpri" AmiTCP.config NETTASKPRI
 check_installer_block_matches "#db-newservices" netdb ng-services-v2
 
 # Every setting the shipped AmiTCP.config offers must be the KEY (#mf-key) of one
