@@ -112,5 +112,11 @@ docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -e NG_DEF_EXTRA \
   cd "$OBJ" && m68k-amigaos-gcc -noixemul $NG_ARCH -o ../amitcp *.o \
       -Wl,--allow-multiple-definition \
       /opt/m68k-amigaos/m68k-amigaos/lib/libamiga.a && cd ../..
-  echo "linked: build/amitcp"; file build/amitcp
+  echo "linked: build/amitcp"
+  # Check the hunk magic ourselves (HUNK_HEADER 0x000003F3). This was `file`, which
+  # the toolchain image does not ship -- a cold pull failed the build on its own
+  # reporting line, after a successful link.
+  magic=$(od -An -tx1 -N4 build/amitcp | tr -d " \n")
+  [ "$magic" = "000003f3" ] || { echo "!!! build/amitcp is not an AmigaOS hunk executable (magic $magic)"; exit 1; }
+  echo "verified: build/amitcp is an AmigaOS hunk executable"
 '

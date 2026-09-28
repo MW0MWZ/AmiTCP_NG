@@ -173,6 +173,29 @@ Wait 5
 EOF
 }
 
+# The tier 2 interface definition. WRITTEN here, not assumed: emu/ is gitignored,
+# so anything this file needs and does not create is untracked state that a clean
+# checkout will not have. The bps= line is the point of the tier (see the header):
+# without it an emulated A2065 reports 10 Mbit and the run silently exercises the
+# wrong auto-tune path while still calling itself the 100 Mbit tier.
+iface_tier2() {
+  mkdir -p "$G/Devs/NetInterfaces"
+  cat > "$G/Devs/NetInterfaces/smoke" <<'EOF'
+device=a2065.device
+unit=0
+configure=dhcp
+bps=100000000
+EOF
+  # The write is not assumed either: these files have been root-owned before now,
+  # and a silently failed redirect would put us straight back to a red tier 2.
+  case "$(cat "$G/Devs/NetInterfaces/smoke" 2>/dev/null)" in
+    *"bps=100000000"*) ;;
+    *) echo "HARNESS NOT READY: cannot write $G/Devs/NetInterfaces/smoke." >&2
+       echo "NOTHING WAS TESTED. This is not a test failure." >&2
+       exit 2 ;;
+  esac
+}
+
 seq_tier2() {
   cat > "$G/S/Startup-sequence" <<'EOF'
 ; AMITCP_NG_SMOKE_GENERATED
@@ -275,7 +298,7 @@ tier1() {
 tier2_one() {   # tier2_one <host cpu>   -- the library is staged by the caller
   local host="$1"
   say ""; say "=== TIER 2: 68000 build on A4000/${host}, ~42 MB, 100 Mbit link ==="
-  seq_tier2; gclean
+  iface_tier2; seq_tier2; gclean
   RAM=32 NET=1 CPU="$host" TIMEOUT=300 ./docker/run-amiberry.sh >/tmp/ng-emu.log 2>&1
 
   local before=$fail
