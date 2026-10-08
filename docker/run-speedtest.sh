@@ -292,10 +292,13 @@ C:rxprofile ${IFACE}0 >SYS:rx-zw.log
 EOF
 [ "$BULK" != "0" ] && cat <<EOF
 C:rxprofile ${IFACE}0 >SYS:rx-bulk-pre.log
+C:netstat -s >SYS:ns-bulk-pre.log
 Echo >>SYS:phase.log "9-bulk-start"
 C:ftp GET $FTPHOST test-${BULK}m.bin NIL: USER $FTPUSER PASS $FTPPASS >SYS:bulk.log
 Echo >>SYS:phase.log "10-bulk-done"
 C:rxprofile ${IFACE}0 >SYS:rx-bulk-post.log
+C:netstat -s >SYS:ns-bulk-post.log
+C:ShowNetStatus >SYS:sns-bulk-post.log
 EOF
 # smbfs is a filesystem HANDLER: it stays resident once started, so it has to be
 # Run in the background and given a moment to mount before the volume exists.

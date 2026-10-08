@@ -159,9 +159,6 @@ RCS_ID_C="$Id: tcp_input.c,v 3.1 1994/03/26 09:53:54 too Exp $";
 #include <netinet/in_pcb_protos.h>
 #include <netinet/in_protos.h>
 #include <netinet/in_cksum_protos.h>
-#if NG_RX_CSUM
-#include <netinet/in_cksum_copy_protos.h>
-#endif
 #include <kern/uipc_socket_protos.h>
 #include <kern/uipc_socket2_protos.h>
 #include <kern/accesscontrol.h>
@@ -670,52 +667,7 @@ tcp_input(m, iphlen)
 	ti->ti_x1 = 0;
 	ti->ti_len = (u_short)tlen;
 	(void)HTONS(ti->ti_len);
-#if NG_RX_CSUM
-	/*
-	 * If the SANA receive copy already summed this datagram's transport bytes, the
-	 * whole second pass over the payload is unnecessary: add the pseudo-header (the
-	 * 20-byte overlay just rewritten above) to the stored sum, fold once, complement.
-	 * Arithmetically identical to in_cksum(m, len) -- one's-complement addition is
-	 * associative, and every partial sum here stays raw so it is folded exactly once.
-	 *
-	 * The stored sum covers [ip_hl*4, ip_len) as the frame arrived. Between then and
-	 * here it survives ip_stripoptions() (relocates transport bytes without changing
-	 * them; ip_hl counts 32-bit words so the region's start parity cannot move) and
-	 * m_pullup() (relocates, or allocates a new head and drops the flag). Nothing on
-	 * this path trims inside the region -- tcp_input's own m_adj() calls all happen
-	 * after this point.
-	 */
-	if (m->m_flags & M_CSUM_DONE) {
-		u_long s;
-#if NG_RX_CSUM_VERIFY
-		/*
-		 * MUST be taken BEFORE ti_sum is written. in_cksum() sums the checksum
-		 * FIELD along with everything else -- that is how the "valid packet sums
-		 * to zero" trick works -- so overwriting ti_sum first would have the slow
-		 * pass measure a packet we had already altered. Got this wrong the first
-		 * time and the cross-check caught it, which is the point of having one.
-		 */
-		u_short slow = (u_short)in_cksum(m, len);
-#endif
-		s = in_cksum_words(mtod(m, caddr_t), (u_long)sizeof (struct ip),
-				   m->m_pkthdr.csum);
-		ti->ti_sum = in_cksum_fold(s);
-#if NG_RX_CSUM_VERIFY
-		{	/* positive proof this path RAN -- "no disagreement" and "never
-			 * executed" look identical in a log otherwise. */
-			static int said = 0;
-			if (!said) { said = 1; log(LOG_DEBUG, "rxcsum: TCP consumer active"); }
-		}
-		if (slow != ti->ti_sum) {
-			tcpstat.tcps_rcvbadsum++;	/* refuse a sum we just disproved */
-			log(LOG_ERR, "rxcsum: TCP consumer disagrees fast=%04lx slow=%04lx",
-			    (ULONG)ti->ti_sum, (ULONG)slow);
-			goto drop;
-		}
-#endif
-	} else
-#endif
-		ti->ti_sum = in_cksum(m, len);
+	ti->ti_sum = in_cksum(m, len);
 	if (ti->ti_sum) {
 		tcpstat.tcps_rcvbadsum++;
 		goto drop;

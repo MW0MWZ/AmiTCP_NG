@@ -31,15 +31,7 @@ docker run --rm -v "$ROOT":/work -w /work "$XIMG" bash -c "
   export NG_ARCH=-m$CPU
   source docker/ccflags.sh
   m68k-amigaos-gcc -c -m$CPU src/netinet/in_cksum_asm.S -o /tmp/ck.o
-  m68k-amigaos-gcc -c -m$CPU src/netinet/in_cksum_copy_asm.S -o /tmp/icca.o
-  # The REAL in_cksum_copy object, built with the library's own flags -- not a copy of
-  # the source pasted into the harness. Proving a transcription proves nothing about
-  # what ships. It is self-contained (nm -u reports no undefined symbols), so it links
-  # into a -noixemul harness without dragging the stack in.
-  m68k-amigaos-gcc -c src/netinet/in_cksum_copy.c -o /tmp/icc.o \\
-    \$NG_INC \$NG_DEF \$NG_CFLAGS \$NG_FORCEINC
-  echo \"   in_cksum_copy.o built with: \${NG_CFLAGS##* }\"
-  m68k-amigaos-gcc -noixemul -O2 -m$CPU docker/bench/cksumbench.c /tmp/ck.o /tmp/icc.o /tmp/icca.o -o build/cksumbench
+  m68k-amigaos-gcc -noixemul -O2 -m$CPU docker/bench/cksumbench.c /tmp/ck.o -o build/cksumbench
   m68k-amigaos-strip build/cksumbench" || { echo '!!! harness build failed'; exit 1; }
 "$ROOT/docker/cc.sh" chown "$(id -u):$(id -g)" /work/build/cksumbench >/dev/null 2>&1 || true
 cp "$ROOT/build/cksumbench" "$G/C/cksumbench"

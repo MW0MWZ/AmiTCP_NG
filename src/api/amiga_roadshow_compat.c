@@ -3281,6 +3281,12 @@ extern int    ip_defttl, icmpmaskrepl, tcp_do_rfc1323, tcp_do_rfc1323_tstmp;
 extern int    ng_netctl_grace_secs;			/* kern/amiga_netctl.c */
 extern LONG   ng_task_pri;				/* kern/amiga_main.c */
 extern int    ng_task_pri_changed(void *pt, LONG new);	/* validates and applies */
+/*
+ * REMOVED FEATURE, OPTION RETAINED. The fused receive checksum is gone (it cost
+ * throughput and received frames on every CPU), but a stale ENVARC: entry or a
+ * script setting this must not fail. Nothing reads it.
+ */
+static int    ng_rx_csum_gone;
 extern u_long tcp_recvspace, tcp_sendspace, udp_recvspace, udp_sendspace;
 
 /*
@@ -3341,6 +3347,12 @@ static const struct ng_rsd_opt ng_rsd_opts[] = {
   { "tcp.do_rfc1323",     0, &tcp_do_rfc1323      },
   { "ip.defttl",          0, &ip_defttl       },
   { "ip.forwarding",      0, &ipforwarding    },
+  /* OURS, like net.shutdown_grace. Writable: ng_cpu_tune() sets only the
+   * default, and AttnFlags sees neither clock speed nor an emulated CPU. Safe
+   * to flip live -- a frame in flight latched the flag before it started. */
+  /* Accepted and ignored: NG_RSD_AUTOTUNED makes SET succeed with a note instead
+   * of an error, and keeps ng_apply_env_tunables() from reading it at all. */
+  { "ip.rx_cksum",        NG_RSD_AUTOTUNED, &ng_rx_csum_gone },
   { "ip.sendredirects",   0, &ipsendredirects },
   { "ip.subnetsarelocal", 0, &subnetsarelocal },
   { "tcp.do_win_scale",   0, &tcp_do_rfc1323  },
@@ -3486,9 +3498,15 @@ BOOL SAVEDS RAF5(_ChangeRoadshowData,
    * the user is told plainly why the number they asked for is not the one in use.
    */
   if (ng_rsd_opts[i].flags & NG_RSD_AUTOTUNED) {
-    log(LOG_NOTICE, "%s is tuned automatically from this machine's RAM and link "
-	"speed; the requested value was not applied (currently %ld).\n",
-	(char *)n->rdn_Name, (long)*(LONG *)n->rdn_Data);
+    /* ip.rx_cksum is not tuned, it is gone -- saying "tuned from RAM" would send
+     * someone looking for a knob that no longer exists. */
+    if (n->rdn_Data == (APTR)&ng_rx_csum_gone)
+      log(LOG_NOTICE, "%s no longer does anything and is accepted for "
+	  "compatibility only.\n", (char *)n->rdn_Name);
+    else
+      log(LOG_NOTICE, "%s is tuned automatically from this machine's RAM and link "
+	  "speed; the requested value was not applied (currently %ld).\n",
+	  (char *)n->rdn_Name, (long)*(LONG *)n->rdn_Data);
     return (TRUE);
   }
   if (length != n->rdn_Length) {

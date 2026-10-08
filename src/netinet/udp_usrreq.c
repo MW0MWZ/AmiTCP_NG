@@ -121,9 +121,6 @@ RCS_ID_C="$Id: udp_usrreq.c,v 1.9 1993/06/04 11:16:15 jraja Exp $";
 #include <netinet/ip_output_protos.h>
 #include <netinet/ip_icmp_protos.h>
 #include <netinet/in_cksum_protos.h>
-#if NG_RX_CSUM
-#include <netinet/in_cksum_copy_protos.h>
-#endif
 #include <netinet/in_pcb_protos.h>
 #include <netinet/in_protos.h>
 #include <kern/uipc_socket2_protos.h>
@@ -249,17 +246,6 @@ udp_input(m, iphlen)
 	if (ip->ip_len != len) {
 		m_adj(m, len - ip->ip_len);
 		/* ip->ip_len = len; */
-#if NG_RX_CSUM
-		/*
-		 * PORT (AmiTCP_NG): this trim is the ONE place in the local receive path
-		 * that removes bytes from INSIDE the region the SANA copy summed. Every
-		 * other m_adj() on the way here either touches only padding beyond ip_len
-		 * or runs after the checksum. A stored sum still covering those bytes is
-		 * now wrong, so invalidate it AT THE MUTATION -- do not expect the
-		 * consumer below to remember that this happened.
-		 */
-		m->m_flags &= ~M_CSUM_DONE;
-#endif
 	}
 	/*
 	 * Save a copy of the IP header in case we want restore it
@@ -275,38 +261,6 @@ udp_input(m, iphlen)
 		((struct ipovly *)ip)->ih_prev = 0;
 		((struct ipovly *)ip)->ih_x1 = 0;
 		((struct ipovly *)ip)->ih_len = uh->uh_ulen;
-#if NG_RX_CSUM
-		/* Same trade as tcp_input: the transport bytes were summed during the
-		 * receive copy, so only the pseudo-header is left to add. Note uh_sum == 0
-		 * (no checksum, legal per RFC 768) is already excluded by the test above,
-		 * so this path only runs where a checksum must actually be verified. */
-		if (m->m_flags & M_CSUM_DONE) {
-			u_long s;
-#if NG_RX_CSUM_VERIFY
-			/* BEFORE uh_sum is written -- in_cksum() sums the checksum field
-			 * itself, so overwriting it first makes the slow pass measure an
-			 * already-altered packet. See the matching note in tcp_input. */
-			u_short slow = (u_short)in_cksum(m, len + sizeof (struct ip));
-#endif
-			s = in_cksum_words(mtod(m, caddr_t),
-					   (u_long)sizeof (struct ip),
-					   m->m_pkthdr.csum);
-			uh->uh_sum = in_cksum_fold(s);
-#if NG_RX_CSUM_VERIFY
-			{
-				static int said = 0;
-				if (!said) { said = 1; log(LOG_DEBUG, "rxcsum: UDP consumer active"); }
-			}
-			if (slow != uh->uh_sum) {
-				udpstat.udps_badsum++;
-				log(LOG_ERR, "rxcsum: UDP consumer disagrees fast=%04lx slow=%04lx",
-				    (ULONG)uh->uh_sum, (ULONG)slow);
-				m_freem(m);
-				return;
-			}
-#endif
-		} else
-#endif
 		{ NG_PROF_IN(NG_PROF_CKSIN);
 			uh->uh_sum = in_cksum(m, len + sizeof (struct ip));
 		  NG_PROF_OUT(NG_PROF_CKSIN, (long)len); }

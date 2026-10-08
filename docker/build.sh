@@ -59,9 +59,6 @@ docker run --rm -e NG_ARCH -e NG_CKSUM_ASM -e NG_SOCKBUF_DEBUG -e NG_DEF_EXTRA \
   # always assembled and -- unlike before -- at the target arch. The asm checksum is
   # gated on NG_CKSUM_ASM (mutually exclusive with the C in_cksum.c).
   asm_srcs="src/kern/ng_bcopy.S"
-  # The fused RX copy+checksum. Self-gating is not possible in a .S, so only assemble
-  # it when the C side is compiled in (NG_RX_CSUM is off for 68040/060).
-  case "$NG_ARCH" in *68040*|*68060*) ;; *) asm_srcs="$asm_srcs src/netinet/in_cksum_copy_asm.S" ;; esac
   [ "$NG_CKSUM_ASM" = 1 ] && asm_srcs="$asm_srcs src/netinet/in_cksum_asm.S"
   for a in $asm_srcs; do
     o="$OBJ/$(basename "${a%.S}").o"

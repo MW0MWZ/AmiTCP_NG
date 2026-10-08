@@ -142,15 +142,6 @@ struct sana_softc {
   ULONG           ss_dmano_align;     /* declined: buffer not 32-bit aligned    */
   ULONG           ss_txnobuf;	      /* TX packets dropped: send-tag mbuf alloc failed */
   ULONG           ss_rxnobuf;	      /* RX packets dropped: read re-post mbuf alloc failed */
-#if NG_RX_CSUM && NG_RX_CSUM_VERIFY
-  /* Present only in a self-checking build (NG_RX_CSUM_VERIFY, off by default): the
-   * fused receive checksum re-proved the slow way on every frame. Counters rather than
-   * only a log line, because logging is off unless configured on, and a validation run
-   * that reported success while silently checking nothing would be worse than no check
-   * at all. */
-  ULONG           ss_csumok;	      /* fused RX checksums confirmed correct */
-  ULONG           ss_csumbad;	      /* fused RX checksums that DISAGREED -- must stay 0 */
-#endif
   UWORD		  ss_reqno;	      /* # of requests to allocate */
   UWORD           ss_cflags;	      /* configuration flags */
   UBYTE           ss_offcleanup;      /* set when the driver went offline: sana_poll()

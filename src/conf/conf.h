@@ -65,52 +65,6 @@ void ng_prof_addr(const char *tag, void *src, void *dst, long len);
 #define NG_PROF_ADDR(t,s,d,n)
 #endif
 
-/*
- * Fuse the SANA receive copy with the Internet checksum (net/sana2copybuff.c), so a
- * received frame crosses memory twice instead of three times.
- *
- * GATED BY CPU, on measurement rather than taste. Fused vs today's CopyMem+in_cksum,
- * at 40/576/1460 bytes: 68000 1.29/1.26/1.24x, 68020 1.44/1.33/1.29x, but 68040
- * 1.32/1.00/0.96x -- a LOSS at the sizes that carry the data, because 4K of data cache
- * keeps the frame resident and makes today's second pass nearly free. MOVE16 cannot
- * rescue a fused loop: it is memory-to-memory and routes nothing through a data
- * register to add from, so a one-pass 68040 variant is architecturally impossible.
- *
- * NB the 68040 figures are EMULATED and varied between runs (0.92x then 0.96x at
- * 1460); confirm on real hardware before treating this gate as settled.
- */
-#if defined(__mc68040__) || defined(__mc68060__)
-#define NG_RX_CSUM	0
-#else
-#define NG_RX_CSUM	1
-#endif
-
-/*
- * A SELF-CHECKING BUILD: recompute every fused receive checksum the slow way and
- * compare, both where it is produced (the SANA copy) and where it is consumed
- * (tcp_input / udp_input). Any disagreement is logged and counted, and the disproved
- * sum is refused rather than used.
- *
- * OFF by default, and it must stay off in anything shipped or measured:
- *
- * ⚠️ A BUILD WITH THIS ON IS SLOWER THAN BASELINE, NOT FASTER. It adds a full extra
- * pass over the payload at DEVICE-INTERRUPT priority, on top of the fused copy -- so
- * total interrupt-time work exceeds even the old plain-copy path, whose checksum
- * happened later at IP/TCP level rather than inside the driver's interrupt. The
- * 1.24-1.29x figures above are fused-vs-baseline and include NONE of this. That
- * matters at this call site in particular: it produced a receive-ring re-arm livelock
- * once before, so time-in-interrupt here is not a free variable.
- *
- * Kept rather than deleted because it earns its place as a diagnostic: if a machine
- * ever shows corruption that might be checksum-related, one flag turns the stack into
- * something that proves or clears itself under real traffic. It has already found two
- * real defects that way. Deliberately NOT gated on DIAGNOSTIC, which ships.
- *
- * Validated with this ON: 145,000+ frames on 68000 hardware under a sustained SMB
- * download, zero disagreements, with both the producer and the TCP consumer confirmed
- * live; UDP consumer confirmed under emulation.
- */
-#define NG_RX_CSUM_VERIFY	0
 
 /*
  * Be compatible with BSD 4.2. Affects only checksumming of UDP data. If true

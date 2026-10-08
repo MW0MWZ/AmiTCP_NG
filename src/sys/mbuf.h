@@ -194,21 +194,9 @@ struct	pkthdr {
 	int	len;		/* total packet length */
 	struct	ifnet *rcvif;	/* rcv interface */
 	/*
-	 * PORT (AmiTCP_NG): transport-only Internet checksum accumulated by the SANA
-	 * receive copy, valid ONLY when M_CSUM_DONE is set in m_flags. Unfolded and
-	 * uncomplemented; the consumer adds the pseudo-header, folds once and
-	 * complements, exactly as in_cksum()'s tail does. Deliberately 32 bits: a
-	 * folded 16-bit intermediate would drag in one's complement's two
-	 * representations of zero for no benefit, since the space is affordable.
-	 *
-	 * ⚠️ "Add the pseudo-header" is the TCP/UDP consumption model, not a universal
-	 * one. The producer does not filter on ip_p, so this sum is published for any
-	 * non-fragmented IPv4 datagram -- including ICMP, whose checksum has NO
-	 * pseudo-header, and for which this raw transport-only sum is already the
-	 * complete input. A consumer that adds a pseudo-header unconditionally to
-	 * anything carrying M_CSUM_DONE will get ICMP wrong. Check the protocol.
-	 *
-	 * Growing this struct shrinks MHLEN -- see the asserts below before touching it.
+	 * VESTIGIAL as of 4.1.8: the SANA receive copy that filled this was removed.
+	 * Kept only because dropping it shrinks pkthdr and so changes MHLEN, which has
+	 * asserts and a tcp_output panic keyed to it -- that is its own change.
 	 */
 	u_long	csum;
 };
@@ -230,10 +218,11 @@ struct	pkthdr {
  *      it, as two planning passes mistakenly did.
  *      hdrlen is sizeof(struct tcpiphdr) (40) + optlen, and optlen is bounded at 40 by
  *      tcp_output.c's own optbuf[40], which the SACK path genuinely fills.
- * 2. The SANA receive copy splits its first destination chunk at exactly MHLEN. Keeping
- *    that a multiple of 4 keeps the payload chunk's source pointer in the same
- *    congruence class as the header chunk's, which is what lets a fused copy+checksum
- *    run its aligned fast path on the payload -- the part that carries the bytes.
+ * 2. The SANA receive copy splits its first destination chunk at exactly MHLEN, so
+ *    MHLEN's parity decides the payload chunk's. ng_bcopy() needs both pointers only
+ *    EVEN for its movem path -- it tests bit 0 and nothing else -- so evenness is the
+ *    real requirement. The assert below is deliberately stricter at mod-4, which a
+ *    128-byte MSIZE gives anyway; nothing needs the stronger form.
  */
 typedef char ng_mhlen_fits_worst_tcp_header[(MHLEN >= 80) ? 1 : -1];
 typedef char ng_mhlen_keeps_the_rx_split_aligned[((MHLEN & 3) == 0) ? 1 : -1];
@@ -299,32 +288,12 @@ typedef char ng_mext_does_not_overlap_pkthdr[
 #define	M_BCAST		0x0100	/* send/received as link-level broadcast */
 #define	M_MCAST		0x0200	/* send/received as link-level multicast */
 /*
- * PORT (AmiTCP_NG): m_pkthdr.csum holds a valid transport-only checksum, accumulated
- * during the SANA receive copy over exactly [ip_hl*4, ip_len) -- header and any
- * trailing link padding excluded.
- *
- * DELIBERATELY NOT IN M_COPYFLAGS. Three separate things keep it honest, and the third
- * is the one that is easy to get wrong:
- *
- *   1. Content-preserving mutators may keep it. m_pullup()'s reuse-in-place branch and
- *      ip_stripoptions() relocate bytes without changing them, and the summed region's
- *      start parity is unaffected because ip_hl counts 32-bit words.
- *   2. Region-excluded mutators may keep it. m_adj() only ever trims bytes outside
- *      [hlen, ip_len) in this path.
- *   3. ANY mutator reached through M_COPY_PKTHDR drops it UNCONDITIONALLY -- content,
- *      offset and length are all irrelevant, because m_flags is masked to M_COPYFLAGS.
- *      This, and NOT rule 1, is what makes m_copym() safe: ip_forward()'s ICMP quote
- *      copies from offset 0 and is byte-identical for what it takes, so it looks
- *      content-preserving -- but it is TRUNCATED to 64 bytes and must never inherit a
- *      whole-datagram checksum.
- *
- * So do not "tidy" this into M_COPYFLAGS. A mutator that changes summed-region CONTENT
- * without allocating a new head would never touch M_COPYFLAGS and would corrupt in
- * silence.
+ * VESTIGIAL (see pkthdr.csum): nothing sets M_CSUM_DONE, so its deliberate absence
+ * from M_COPYFLAGS no longer matters either way. Both are kept to avoid changing
+ * MHLEN; retiring them is a separate change.
  */
 #define	M_CSUM_DONE	0x0400	/* m_pkthdr.csum is valid (see above) */
 
-/* flags copied when copying m_pkthdr */
 #ifdef USE_M_EOR
 #define	M_COPYFLAGS	(M_PKTHDR|M_EOR|M_BCAST|M_MCAST)
 #else
