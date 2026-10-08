@@ -71,35 +71,23 @@ it brings the whole TCP/IP stack up by itself the first time any program opens i
 
 - Runs on **emulated AmigaOS 3.2** and **real 68k hardware** as a self-starting
   `LIBS:bsdsocket.library`.
-- **Emulator-validated** (A2065 over SLIRP): DNS, a full DHCP lease, `ping`,
-  same-host broadcast and loopback, the socket-event mechanism end to end, and
-  BPF capture whose pcap files were checked by reading them back with `tcpdump`
-  on the host.
 - **Hardware-validated** (PiStorm + `wifipi.device`): bring-up, DHCP, routing,
-  DNS and connectivity over 100 Mbit WiFi — roughly **56 Mbit down / 52 up**
-  once the SANA-II transmit queue landed. **Amiga Explorer** works.
+  DNS and connectivity over 100 Mbit WiFi — roughly **56 Mbit down / 52 up**.
+  **Amiga Explorer** works.
+- **Emulator-validated** (A2065 over SLIRP): DNS, DHCP, `ping`, broadcast,
+  loopback, socket events, and BPF captures read back with `tcpdump`.
 - **Roadshow-compatible** — name-, argument- and output-compatible, so Roadie,
   NetMon and existing scripts drive it unchanged.
-- **Measured, not assumed** — the TCP work came from counters read off real
-  hardware: header prediction was covering 98% of segments downloading and 9%
-  uploading; the cause was the peer's moving window, and the fix took uploads
-  to 57%.
-- **Tunable at run time** — `AmiTCPControl` reads and changes the stack's
-  internal options (`AmiTCPControl` on its own lists them all), the same command
-  shape and option names Roadshow uses, so existing scripts work unchanged.
-  `SAVE` keeps a setting across reboots. Options the stack sizes for itself from
-  your machine's RAM, CPU and link speed accept a setting but keep the tuned
-  value, saying so in the log — a script that sets them carries on instead of
-  failing, and nobody is left wondering why their number is not the one in use.
-- **Paced ARP** — the 4.3BSD base broadcast a fresh ARP request for *every*
-  packet to an unresolved address, with no cap, and told the caller it had been
-  sent. Now: one request a second, a bounded burst, then a hold-down that
-  reports the host unreachable instead of transmitting into silence. A resolved
-  entry is re-checked by **unicast** probe rather than trusted for twenty
-  minutes, and ordinary inbound traffic confirms a peer is alive, so an active
-  connection is never probed at all.
-- **One build for every Amiga** — a single 68000 archive that picks its copy
-  routine at run time from the CPU it finds itself on.
+- **Ethernet, SLIP and PPP** — a point-to-point link is configured from the same
+  interface file with `destination=`.
+- **Tunable at run time** — `AmiTCPControl` lists and changes the stack's
+  options, under Roadshow's own names; `SAVE` keeps one across reboots. Options
+  the stack sizes from your RAM, CPU and link speed accept a setting and keep
+  the tuned value, saying so in the log, so a script never fails on them.
+- **One build for every Amiga** — a single 68000 archive that tunes itself to
+  the CPU, RAM and link speed it finds.
+- **Measured, not assumed** — the TCP and ARP work came from counters read off
+  real hardware, not from guesses about where the time went.
 - **Deferred** — IP filter (`ipf_*`), monitor hooks, server API
   ([docs/DEFERRED-VECTORS.md](docs/DEFERRED-VECTORS.md)); IP multicast *receive*
   is not implemented.
@@ -180,9 +168,25 @@ Settings AmiTCP_NG acts on:
 | `address=`           | Static IPv4 address. |
 | `netmask=`           | Static subnet mask. |
 | `gateway=`           | Default-route gateway. |
+| `destination=`       | The machine at the other end of a point-to-point link (SLIP, PPP). Omit it and the `gateway=` above is used as the peer. |
+| `pointopoint=yes`    | Force a point-to-point link for a driver that does not report itself as SLIP, CSLIP or PPP. Turns off broadcast, so never combine it with `configure=dhcp`. |
 | `nameserver=`        | A DNS server. Repeat the line for more than one. |
 | `domain=`            | Default domain name. |
 | `requiresinitdelay=yes` | Pause briefly after opening the device (some hardware needs a warm-up before it will configure). |
+
+A serial link has no broadcast and no ARP — there is exactly one machine at the
+other end, and you name it rather than relying on the netmask:
+
+```
+device=slip.device
+unit=0
+address=192.168.4.2
+destination=192.168.4.1
+netmask=255.255.255.255
+gateway=192.168.4.1
+```
+
+`255.255.255.255` is correct on a link like that and is what other systems use.
 
 Roadshow keys that AmiTCP_NG does not act on (`iprequests`, `writerequests`,
 `filter`, `configure=auto/fastauto`, `debug`) are accepted and ignored, so a
@@ -213,6 +217,7 @@ starts. The knobs worth knowing:
 | `GATEWAY=NO`           | Whether to forward IP between interfaces (act as a router). |
 | `TCP_SENDSPACE=<bytes>`| TCP send-buffer size (overrides the auto-tuned default; see below). |
 | `TCP_RECVSPACE=<bytes>`| TCP receive-buffer size (overrides the auto-tuned default). |
+| `NETTASKPRI=<-128..127>` | What wins when the machine runs out of CPU during a transfer. Default `-1` on a 68000 so the mouse and windows stay live, `5` on 68020 and up. Setting it here overrides that on any processor. |
 | `LOGGING=ON\|OFF`      | Keep a log at all. Default **ON** — a quiet file, nothing on screen. |
 | `LOGLEVEL=0..7`        | How much. Default 5. **7** also logs every failing library call and its errno, which is how you find out what a program is unhappy with. |
 | `LOGCONSOLE=ON\|OFF`   | Also throw the log at a console window. Default **OFF** — the window puts itself in front of whatever you are doing. |
