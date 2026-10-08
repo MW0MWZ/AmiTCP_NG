@@ -11,7 +11,8 @@
  * "adress=" is silently ignored at boot and the interface simply comes up with no
  * address, which is a miserable thing to debug. The checker can say so.
  *
- * ADD A KEYWORD IN BOTH PLACES -- here, and in AddNetInterface.c's parse_line().
+ * ADD A KEYWORD IN BOTH PLACES -- here, and in net/ng_ifconfig.c's parser (which
+ * AddNetInterface links; it no longer has a parse_line of its own).
  * They are separate because the parser needs per-keyword code and the checker only
  * needs the names; keeping the names in one file is what stops them drifting.
  *
@@ -28,6 +29,8 @@
   X("address")			\
   X("netmask")			\
   X("gateway")			\
+  X("destination")		\
+  X("pointopoint")		\
   X("domain")			\
   X("nameserver")		\
   X("requiresinitdelay")	\

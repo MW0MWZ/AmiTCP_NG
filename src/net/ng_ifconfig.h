@@ -41,6 +41,7 @@ struct ng_ifcfg {
   char address[NG_IFCFG_VALLEN];
   char netmask[NG_IFCFG_VALLEN];
   char gateway[NG_IFCFG_VALLEN];
+  char destination[NG_IFCFG_VALLEN];	/* destination= -- the peer on a p2p link */
   char domain[NG_IFCFG_VALLEN];
   char ns[NG_IFCFG_MAXNS][NG_IFCFG_VALLEN];
   int  nns;
@@ -55,6 +56,7 @@ struct ng_ifcfg {
    * which survives the device going away and coming back, so there is nothing to
    * put back and no reason for the stack to recreate an interface to apply them.
    */
+  int  p2p;			/* pointopoint=yes -- IFF_POINTOPOINT, settable only at creation */
   long ipreq;			/* iprequests=    (0 = the stack's RAM-tiered default) */
   long wreq;			/* writerequests= (0 = the stack's RAM-tiered default) */
   long mtu;			/* mtu=           (0 = the device's reported MTU)      */

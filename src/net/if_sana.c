@@ -1775,7 +1775,7 @@ sana_device_online(struct ifnet *ifp, int online)
  * rather than freed while the driver can still write to them.
  */
 struct ifnet *
-sana_add_interface(char *ifname, char *devname, long devunit,
+sana_add_interface(char *ifname, char *devname, long devunit, long p2p,
 		   long ipreq, long wreq, long bps)
 {
   struct ssconfig ssc;
@@ -1832,6 +1832,8 @@ sana_add_interface(char *ifname, char *devname, long devunit,
   if (wreq  > 0) ssc.args->a_writeno = &wreq_val;
   /* Likewise bps=: 0 leaves the driver's reported S2_DEVICEQUERY BPS in place. */
   if (bps   > 0) ssc.args->a_bps     = &bps_val;
+  /* IFF_CANTCHANGE: settable only here, and ssconfig() clears IFF_BROADCAST with it. */
+  if (p2p)       ssc.args->a_point2point = 1;
   /* All other ssc_args fields remain 0/NULL => ssconfig() uses wire defaults. */
 
   return iface_make(&ssc);

@@ -1,0 +1,28 @@
+# AmiTCP_NG interface configuration -- SLIP or PPP (a point-to-point serial link).
+#
+# To use: copy this file to DEVS:NetInterfaces/ under the name you want the
+# interface to have (e.g. "slip0"), edit the addresses, then reboot (or run
+# "AddNetInterface DEVS:NetInterfaces/slip0" from a Shell).
+
+device=slip.device
+unit=0
+
+# A point-to-point link has no broadcast and no ARP: there is exactly one other
+# machine, and you name it with destination= rather than relying on the netmask.
+# That is why DHCP cannot work here -- use a static address.
+address=192.168.4.2
+destination=192.168.4.1
+
+# The netmask is not used to decide what is reachable on a link like this, so
+# 255.255.255.255 is correct and is what other systems use. A wider mask does no
+# harm; it simply has no effect.
+netmask=255.255.255.255
+
+# Usually the machine at the other end, i.e. the same address as destination=.
+gateway=192.168.4.1
+nameserver=192.168.4.1
+
+# Only needed if the driver does NOT report its wire type as SLIP, CSLIP or PPP.
+# Forcing it on turns off broadcast, so never combine it with configure=dhcp.
+# If you leave destination= out, the gateway above is used as the peer.
+pointopoint=yes

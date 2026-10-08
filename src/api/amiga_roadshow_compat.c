@@ -652,6 +652,8 @@ ng_flush_dynamic_nameservers(void)
 #define NGCT_TcpRecvspace	(TAG_USER + 0x004E4704)	/* LONG TCP recv buffer  */
 #define NGCT_TcpMssdflt		(TAG_USER + 0x004E4705)	/* LONG off-subnet MSS cap */
 #define NGCT_LinkSpeed		(TAG_USER + 0x004E4706)	/* LONG bits/sec, overrides S2_DEVICEQUERY BPS */
+#define NGCT_PointToPoint	(TAG_USER + 0x004E4708)	/* LONG !=0: IFF_POINTOPOINT at creation */
+#define NGCT_GatewayAsPeer	(TAG_USER + 0x004E4709)	/* STRPTR: peer fallback, p2p only */
 /*
  * A name server this interface provides, dotted-decimal STRPTR, repeatable.
  * Exists because AddDomainNameServer() has no interface argument: ownership has
@@ -772,6 +774,41 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
     }
   }
 
+  /*
+   * Destination before the address too: SIOCSIFDSTADDR installs the host route only
+   * when IFA_ROUTE is already set, and in_ifinit() leaves it clear when it bailed for
+   * a missing destination. NGCT_GatewayAsPeer is the fallback -- on a p2p link the
+   * gateway IS the peer -- used only if the stack really flagged IFF_POINTOPOINT.
+   */
+  { const char *dst = NULL, *peer = NULL;
+    struct ifreq ifr;
+    int ispp = 0;
+
+    for (tstate = tags; (ti = ng_nexttag(&tstate)) != NULL; ) {
+      if (ti->ti_Tag == IFC_DestinationAddress)   dst  = (const char *)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_GatewayAsPeer)  peer = (const char *)ti->ti_Data;
+    }
+    if (dst != NULL || peer != NULL) {
+      ng_ifr_init(&ifr, ifname);
+      ispp = (ifioctl(so, SIOCGIFFLAGS, (caddr_t)&ifr) == 0 &&
+	      (ifr.ifr_flags & IFF_POINTOPOINT) != 0);
+    }
+    /* SIOCSIFDSTADDR is EINVAL on a broadcast interface. Say so and carry on: this
+     * must not fail the whole bring-up over one unusable setting. */
+    if (dst != NULL && !ispp)
+      log(LOG_WARNING, "%s: not a point-to-point interface, destination %s ignored",
+	  ifname, dst);
+    if (ispp) {
+      if (dst == NULL && peer != NULL) {
+	dst = peer;
+	log(LOG_NOTICE, "%s: point-to-point, using gateway %s as the peer", ifname, dst);
+      }
+      if (dst != NULL &&
+	  (e = ng_set_ifaddr(so, ifname, SIOCSIFDSTADDR, (char *)dst)) != 0 && error == 0)
+	error = e;
+    }
+  }
+
   for (tstate = tags; (ti = ng_nexttag(&tstate)) != NULL; ) {
     e = 0;
     switch (ti->ti_Tag) {
@@ -781,8 +818,7 @@ ng_apply_iface_config(char *ifname, struct TagItem *tags)
     case IFC_NetMask:
       break;				/* already applied first, above */
     case IFC_DestinationAddress:
-      e = ng_set_ifaddr(so, ifname, SIOCSIFDSTADDR, (char *)ti->ti_Data);
-      break;
+      break;				/* already applied first, above */
     case IFC_BroadcastAddress:
       e = ng_set_ifaddr(so, ifname, SIOCSIFBRDADDR, (char *)ti->ti_Data);
       break;
@@ -1001,6 +1037,7 @@ LONG SAVEDS RAF3(_ConfigureInterfaceTagList,
  * could not be opened).
  */
 extern struct ifnet *sana_add_interface(char *ifname, char *devname, long devunit,
+				       long p2p,
 					long ipreq, long wreq, long bps);
 
 /*
@@ -1085,6 +1122,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
   long ipreq, wreq, sndsp, rcvsp;	/* sndsp/rcvsp needed again for the auto-tune below */
   long mssd;				/* tcp.mssdflt= off-subnet MSS cap (0 = keep global) */
   long lspeed;				/* bps= link-speed override (0 = keep the driver's) */
+  long p2p;				/* pointopoint=yes (IFF_POINTOPOINT is creation-only) */
 
   CHECK_TASK();
 
@@ -1106,7 +1144,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
    * RAM-tiered default. ng_apply_iface_config() below ignores these private tags.
    */
   { struct TagItem *ti, *tstate = tags;
-    ipreq = wreq = sndsp = rcvsp = mssd = lspeed = 0;
+    ipreq = wreq = sndsp = rcvsp = mssd = lspeed = p2p = 0;
     while ((ti = ng_nexttag(&tstate)) != NULL) {
       if (ti->ti_Tag == NGCT_IPRequests)         ipreq  = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_WriteRequests) wreq   = (long)ti->ti_Data;
@@ -1114,6 +1152,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
       else if (ti->ti_Tag == NGCT_TcpRecvspace)  rcvsp  = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_TcpMssdflt)    mssd   = (long)ti->ti_Data;
       else if (ti->ti_Tag == NGCT_LinkSpeed)     lspeed = (long)ti->ti_Data;
+      else if (ti->ti_Tag == NGCT_PointToPoint)  p2p    = (long)ti->ti_Data;
     }
     /*
      * Honour an explicit tcp.sendspace= / tcp.recvspace= from the interface config by
@@ -1165,7 +1204,7 @@ LONG SAVEDS RAF5(_AddInterfaceTagList,
   }
   {
     struct ifnet *newif = sana_add_interface((char *)interface_name, (char *)device_name,
-					     (long)unit, ipreq, wreq, lspeed);
+					     (long)unit, p2p, ipreq, wreq, lspeed);
     if (newif == NULL) {
       ReleaseSyscallSemaphore(libPtr);
       writeErrnoValue(libPtr, ENXIO);		/* could not open the device */
@@ -5162,7 +5201,8 @@ ng_reconfig_task(void)
 
   /* --- static --------------------------------------------------------------- */
   if (cfg.have_address && cfg.address[0]) {
-    struct TagItem ctags[5];
+    /* netmask, address, destination, gateway-as-peer, mtu, state, END */
+    struct TagItem ctags[7];
     int n = 0;
 
     /* Mask BEFORE address: in_ifinit() keys the connected route with whatever mask
@@ -5172,6 +5212,13 @@ ng_reconfig_task(void)
       ctags[n].ti_Tag = IFC_NetMask; ctags[n].ti_Data = (ULONG)cfg.netmask; n++;
     }
     ctags[n].ti_Tag = IFC_Address;   ctags[n].ti_Data = (ULONG)cfg.address; n++;
+    if (cfg.destination[0]) {
+      ctags[n].ti_Tag = IFC_DestinationAddress;
+      ctags[n].ti_Data = (ULONG)cfg.destination; n++;
+    } else if (cfg.gateway[0]) {
+      ctags[n].ti_Tag = NGCT_GatewayAsPeer;
+      ctags[n].ti_Data = (ULONG)cfg.gateway; n++;
+    }
     if (cfg.mtu > 0) {
       ctags[n].ti_Tag = IFC_MTU;     ctags[n].ti_Data = (ULONG)cfg.mtu; n++;
     }

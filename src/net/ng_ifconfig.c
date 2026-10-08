@@ -68,8 +68,9 @@ ng_ifcfg_clear(struct ng_ifcfg *cfg)
   cfg->recvspace = 0;
   cfg->mssdflt = 0;
   cfg->bps = 0;
+  cfg->p2p = 0;
   cfg->device[0] = cfg->address[0] = cfg->netmask[0] = '\0';
-  cfg->gateway[0] = cfg->domain[0] = '\0';
+  cfg->gateway[0] = cfg->domain[0] = cfg->destination[0] = '\0';
 }
 
 void
@@ -99,6 +100,9 @@ ng_ifcfg_parse_line(char *line, struct ng_ifcfg *cfg)
   else if (ci_eq(kw, "address"))   { s_copy(cfg->address, val, NG_IFCFG_VALLEN); cfg->have_address = 1; }
   else if (ci_eq(kw, "netmask"))   s_copy(cfg->netmask, val, NG_IFCFG_VALLEN);
   else if (ci_eq(kw, "gateway"))   s_copy(cfg->gateway, val, NG_IFCFG_VALLEN);
+  else if (ci_eq(kw, "destination")) s_copy(cfg->destination, val, NG_IFCFG_VALLEN);
+  /* IFF_CANTCHANGE, so no later ioctl can set it: goes as NGCT_PointToPoint. */
+  else if (ci_eq(kw, "pointopoint")) cfg->p2p = ci_eq(val, "yes");
   else if (ci_eq(kw, "domain"))    s_copy(cfg->domain, val, NG_IFCFG_VALLEN);
   else if (ci_eq(kw, "nameserver")){ if (cfg->nns < NG_IFCFG_MAXNS) s_copy(cfg->ns[cfg->nns++], val, NG_IFCFG_VALLEN); }
   else if (ci_eq(kw, "requiresinitdelay")) cfg->initdelay = ci_eq(val, "yes");

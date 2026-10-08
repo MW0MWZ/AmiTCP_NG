@@ -92,6 +92,28 @@ static int exists(const char *path)
   return 0;
 }
 
+static void cp_str(char *d, const char *s, int max)
+{
+  int i = 0;
+  while (s[i] && i < max - 1) { d[i] = s[i]; i++; }
+  d[i] = '\0';
+}
+
+/* A validated dotted quad as a host-order u32. Caller checks valid_ipv4() first. */
+static unsigned long ipv4_u32(const char *s)
+{
+  unsigned long v = 0;
+  int part = 0;
+
+  for (;;) {
+    if (*s >= '0' && *s <= '9') { part = part * 10 + (*s - '0'); s++; continue; }
+    v = (v << 8) | (unsigned long)part;
+    if (*s != '.') break;
+    part = 0; s++;
+  }
+  return v;
+}
+
 /* A dotted quad, and nothing else. Returns 1 if valid. */
 static int valid_ipv4(const char *s)
 {
@@ -328,8 +350,11 @@ static void check_one_interface(const char *name, char *line)
   int  i = 0, k;
   int  have_device = 0, have_address = 0, dhcp = 0, have_netmask = 0;
   char devname[128];
+  char addr[32], mask[32], gw[32], dest[32];
+  int  p2p = 0;
 
   devname[0] = '\0';
+  addr[0] = mask[0] = gw[0] = dest[0] = '\0';
 
   { const char *pfx = "DEVS:NetInterfaces/";
     while (pfx[i] && i < (int)sizeof(path) - 1) { path[i] = pfx[i]; i++; }
@@ -392,13 +417,25 @@ static void check_one_interface(const char *name, char *line)
       have_address = 1;
       if (!valid_ipv4(val))
         problem(1, "%s: address '%s' is not a dotted quad.\n", (LONG)name, (LONG)val);
+      else cp_str(addr, val, sizeof addr);
     } else if (ci_eq(kw, "netmask")) {
       have_netmask = 1;
       if (!valid_ipv4(val))
         problem(1, "%s: netmask '%s' is not a dotted quad.\n", (LONG)name, (LONG)val);
+      else cp_str(mask, val, sizeof mask);
     } else if (ci_eq(kw, "gateway")) {
       if (!valid_ipv4(val))
         problem(1, "%s: gateway '%s' is not a dotted quad.\n", (LONG)name, (LONG)val);
+      else cp_str(gw, val, sizeof gw);
+    } else if (ci_eq(kw, "destination")) {
+      if (!valid_ipv4(val))
+        problem(1, "%s: destination '%s' is not a dotted quad.\n", (LONG)name, (LONG)val);
+      else cp_str(dest, val, sizeof dest);
+    } else if (ci_eq(kw, "pointopoint")) {
+      if (ci_eq(val, "yes")) p2p = 1;
+      else if (!ci_eq(val, "no"))
+        problem(0, "%s: pointopoint='%s' is not understood; only 'yes' turns it on.\n",
+                (LONG)name, (LONG)val);
     } else if (ci_eq(kw, "nameserver")) {
       if (!valid_ipv4(val))
         problem(1, "%s: nameserver '%s' is not a dotted quad.\n", (LONG)name, (LONG)val);
@@ -445,6 +482,48 @@ static void check_one_interface(const char *name, char *line)
   if (have_address && !have_netmask && !dhcp)
     problem(0, "%s: address= without netmask=; the stack will guess one from the\n"
                "           address class, which is rarely what you want.\n", (LONG)name, 0);
+
+  /* Point-to-point: no broadcast, so DHCP's discovery cannot work. */
+  if (p2p && dhcp)
+    problem(1, "%s: pointopoint=yes clears the interface's broadcast flag, which\n"
+               "         DHCP needs. Use address= and destination= instead.\n",
+            (LONG)name, 0);
+
+  /* Only a p2p interface can take one; the driver may already make it one. */
+  if (dest[0] && !p2p)
+    problem(0, "%s: destination= is ignored unless the interface is point-to-point.\n"
+               "           Add pointopoint=yes unless the driver reports SLIP, CSLIP\n"
+               "           or PPP, in which case it is already set.\n",
+            (LONG)name, 0);
+
+  /* p2p with no peer: IFF_POINTOPOINT is set but no host route is ever installed. */
+  if (p2p && !dest[0] && !gw[0])
+    problem(1, "%s: pointopoint=yes with neither destination= nor gateway=, so the\n"
+               "         peer is never set and the link gets no route.\n", (LONG)name, 0);
+
+  /* On a p2p link only the peer is reachable, so any other gateway has no route. */
+  if ((p2p || dest[0]) && gw[0] && dest[0] && !ci_eq(dest, gw))
+    problem(1, "%s: gateway %s is not the destination (peer), so it is unreachable\n"
+               "         on a point-to-point link.\n", (LONG)name, (LONG)gw);
+
+  /* Otherwise the default route needs a connected route covering the gateway first,
+   * or rtrequest() fails ENETUNREACH -- /32 is how people hit it (issue #10). */
+  if (!p2p && !dest[0] && addr[0] && mask[0] && gw[0]) {
+    unsigned long a = ipv4_u32(addr), m = ipv4_u32(mask), g = ipv4_u32(gw);
+
+    if ((a & m) != (g & m)) {
+      if (m == 0xffffffffUL)
+	problem(1, "%s: netmask 255.255.255.255 covers only this address, so gateway\n"
+		   "         %s is off-link and no default route can be added (errno 51\n"
+		   "         at boot). For SLIP or PPP add pointopoint=yes; otherwise use a\n"
+		   "         netmask that covers the gateway.\n",
+		(LONG)name, (LONG)gw);
+      else
+	problem(1, "%s: gateway %s is outside this interface's own subnet, so no\n"
+		   "         default route can be added (errno 51 at boot). Widen the\n"
+		   "         netmask to cover the gateway.\n", (LONG)name, (LONG)gw);
+    }
+  }
 
   /* Two conversions, two arguments -- this said %s three times with two, which
    * would have printed whatever followed on the stack. And it was gated on the

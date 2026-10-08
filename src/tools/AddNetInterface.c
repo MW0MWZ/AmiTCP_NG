@@ -71,6 +71,9 @@ struct Library *SocketBase;
 #define NGCT_TcpRecvspace       (TU + 0x004E4704UL)
 #define NGCT_TcpMssdflt         (TU + 0x004E4705UL)
 #define NGCT_LinkSpeed          (TU + 0x004E4706UL)
+#define NGCT_PointToPoint       (TU + 0x004E4708UL)
+#define NGCT_GatewayAsPeer      (TU + 0x004E4709UL)
+#define IFC_DestinationAddress  (TU + 1803)
 #define SM_Up                   3
 #define RTA_DefaultGateway      (TU + 1603)
 #define CAAMTA_RouterTableSize  (TU + 2006)
@@ -222,8 +225,8 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
   char  devpath[VALLEN];
   long  r, i;
   /* Creation tags. Worst case is the static path with every keyword present:
-   * 7 shared (iprequests, writerequests, tcp.sendspace, tcp.recvspace, tcp.mssdflt,
-   * mtu, bps) + 3 static (IFC_Address, IFC_NetMask, IFC_State) + TAG_END = 11.
+   * 8 shared (iprequests, writerequests, tcp.sendspace, tcp.recvspace, tcp.mssdflt,
+   * mtu, bps, pointopoint) + 4 static (address, netmask, peer, state) + END = 13.
    * Sized with headroom because nothing here bounds-checks nc -- adding a keyword
    * without growing this array would write past the end of a stack array. */
   struct TagItem ct[16];
@@ -241,6 +244,8 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
    * stack's RAM-tiered default). This prefix is shared by both creation paths. */
   if (cfg->ipreq > 0) { ct[nc].ti_Tag = NGCT_IPRequests;    ct[nc].ti_Data = (ULONG)cfg->ipreq; nc++; }
   if (cfg->wreq  > 0) { ct[nc].ti_Tag = NGCT_WriteRequests; ct[nc].ti_Data = (ULONG)cfg->wreq;  nc++; }
+  /* Creation-only: IFF_POINTOPOINT is in IFF_CANTCHANGE. */
+  if (cfg->p2p)       { ct[nc].ti_Tag = NGCT_PointToPoint;  ct[nc].ti_Data = 1;               nc++; }
 
   /* tcp.sendspace=/tcp.recvspace= override the stack's global socket buffers, and
    * mtu= sets the interface MTU. All three are honoured on both the DHCP and the
@@ -329,6 +334,12 @@ static long bring_up(const char *ifname, struct ifcfg *cfg, int quiet, long time
     if (cfg->have_address) {
       ct[n].ti_Tag = IFC_Address; ct[n].ti_Data = (ULONG)cfg->address; n++;
       if (cfg->netmask[0]) { ct[n].ti_Tag = IFC_NetMask; ct[n].ti_Data = (ULONG)cfg->netmask; n++; }
+      if (cfg->destination[0]) {
+	ct[n].ti_Tag = IFC_DestinationAddress; ct[n].ti_Data = (ULONG)cfg->destination; n++;
+      } else if (cfg->gateway[0]) {
+	/* The stack applies this ONLY if the interface is really IFF_POINTOPOINT. */
+	ct[n].ti_Tag = NGCT_GatewayAsPeer;     ct[n].ti_Data = (ULONG)cfg->gateway;     n++;
+      }
       ct[n].ti_Tag = IFC_State; ct[n].ti_Data = SM_Up; n++;
     }
     ct[n].ti_Tag = TAG_END; ct[n].ti_Data = 0;
