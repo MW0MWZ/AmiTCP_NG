@@ -366,11 +366,22 @@ VOID ng_signal_address_change(void);
 static inline void ObtainSyscallSemaphore(struct SocketBase *libPtr)
 {
   extern struct Task *AmiTCP_Task;
+  BYTE want, cur;
 
   ObtainSemaphore(&syscall_semaphore);
   libPtr->callerTask = SysBase->ThisTask;
+
+  /*
+   * RAISE to the net task's priority, never lower to it. This assigned it
+   * outright, which silently demotes any caller already above the net task --
+   * while it holds syscall_semaphore, the one lock every socket call takes. A
+   * caller dropped below the ordinary task priority there cannot finish, and
+   * every other application blocks behind it.
+   */
+  want = AmiTCP_Task->tc_Node.ln_Pri;
+  cur  = libPtr->callerTask->tc_Node.ln_Pri;
   libPtr->myPri = SetTaskPri(libPtr->callerTask,
-			     libPtr->libCallPri = AmiTCP_Task->tc_Node.ln_Pri);
+			     libPtr->libCallPri = (cur > want) ? cur : want);
 }
 
 static inline void ReleaseSyscallSemaphore(struct SocketBase *libPtr)
