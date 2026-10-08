@@ -366,6 +366,27 @@
 	"#SANADMA=NO\n"
 ))
 
+(set #db-newnettaskpri (cat
+	"\n"
+	"# --- Network task priority -----------------------------------------------------\n"
+	"#\n"
+	"# Who wins when the machine runs out of CPU during a transfer: the network, or\n"
+	"# whatever you are doing. The stack picks a default from the processor --\n"
+	"#\n"
+	"#   68000        -1   below applications, so the mouse and windows stay live\n"
+	"#   68020+        5   above applications, the traditional setting\n"
+	"#\n"
+	"# because a 7MHz 68000 is saturated by a busy connection and everything else on\n"
+	"# the machine stops until it ends, while a faster processor has time for both.\n"
+	"#\n"
+	"# Setting it here overrides that choice on ANY processor. Use 5 on a 68000 if you\n"
+	"# would rather have the transfer finish and do not mind the pause; use -1 on a\n"
+	"# fast machine if a download makes it feel sticky. Range -128 to 127; values in\n"
+	"# between behave the same as these, because what matters to the scheduler is only\n"
+	"# whether the stack is above, level with, or below the program you are using.\n"
+	"#NETTASKPRI=-1\n"
+))
+
 (set #db-newlogconsole (cat
 	"\n"
 	"# Also throw log messages at a console window, as well as the file. Default OFF,\n"
@@ -733,6 +754,12 @@
 	(set #mf-key  "MBUFCHECK")
 	(set #mf-add  #db-newmbufcheck)
 	(set #mf-desc "the buffer-pool check switch")
+	(P_MergeFile)
+
+	(set #mf-file "AmiTCP.config")
+	(set #mf-key  "NETTASKPRI")
+	(set #mf-add  #db-newnettaskpri)
+	(set #mf-desc "the network task priority")
 	(P_MergeFile)
 
 	; Make AmiTCP: resolve now (before a reboot) so anything run this session finds

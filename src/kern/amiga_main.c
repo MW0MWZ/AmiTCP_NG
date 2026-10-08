@@ -158,6 +158,30 @@ static int  ng_stack_quiesce(void);
  */
 struct Task * AmiTCP_Task;
 
+/* Net-task priority. Above applications drains the receive ring, below them
+ * keeps the machine usable. ng_cpu_tune() sets it; NETTASKPRI overrides. */
+LONG ng_task_pri = 5;
+
+/* The one validator: config, ENV:, live SET and RoadshowControl all land here,
+ * so a bad value is refused once and a good one applies immediately. */
+int ng_task_pri_changed(void *p, LONG new)
+{
+  extern volatile BOOL ng_stack_running;
+
+  if (new < -128 || new > 127)
+    return (FALSE);			/* ln_Pri is a signed BYTE: refuse it */
+
+  /* setvalue() stores this again afterwards, unlocked, so simultaneous writers
+   * can leave ng_task_pri stale against ln_Pri. Accepted: harmless to the
+   * scheduler, and only a RoadshowControl GET reads the mirror. */
+  Forbid();				/* the net task cannot exit under us here */
+  ng_task_pri = new;
+  if (ng_stack_running && AmiTCP_Task)
+    SetTaskPri(AmiTCP_Task, ng_task_pri);
+  Permit();
+  return (TRUE);
+}
+
 extern struct ExecBase * SysBase;
 extern struct Library * MasterSocketBase;
 extern WORD nthLibrary;
@@ -241,7 +265,7 @@ main(int argc, char *argv[])
     /*
      * Set our priority 
      */
-    oldpri = SetTaskPri(AmiTCP_Task, 5);
+    oldpri = SetTaskPri(AmiTCP_Task, ng_task_pri);
 
     /*
      * Set our Task name 
@@ -542,8 +566,8 @@ ng_ram_tier(void)
 }
 
 /*
- * ng_cpu_tune --- turn on the CPU-costly RFC 1323 options only where the
- * processor can afford them.
+ * ng_cpu_tune --- turn on the CPU-costly options only where the processor can
+ * afford them.
  *
  * RFC 1323 timestamps put a 12-byte option -- built, byte-swapped and PAWS-
  * checked -- on every data segment (RSTs and keepalive probes carry no option),
@@ -562,14 +586,20 @@ static void
 ng_cpu_tune(void)
 {
   extern int tcp_do_rfc1323_tstmp;
+  ULONG      attn = SysBase->AttnFlags;
 
   /* exec sets AFF_680x0 in AttnFlags for the detected processor (or better);
    * any of '020/'030/'040/'060 is "performant" for our purposes. */
-  if (SysBase->AttnFlags &
-      (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060))
+  if (attn & (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060))
     tcp_do_rfc1323_tstmp = 1;
   else
     tcp_do_rfc1323_tstmp = 0;
+
+  /* A 68000 is saturated by TCP, so packets lose to the user. Faster CPUs keep
+   * today's behaviour -- unmeasured there, so unchanged. */
+  ng_task_pri = (attn & (AFF_68020 | AFF_68030 | AFF_68040 | AFF_68060)) ? 5 : -1;
+  /* Set only -- the callers apply it after readconfig(). Applying it here would
+   * capture it as main()'s oldpri and strand the Shell at it on shutdown. */
 }
 
 /*
@@ -978,7 +1008,7 @@ static void ng_stack_process(void)
   else
     goto fail;
 
-  SetTaskPri(AmiTCP_Task, 5);
+  SetTaskPri(AmiTCP_Task, ng_task_pri);
   AmiTCP_Task->tc_Node.ln_Name = "AmiTCP_NG";
   initialized = TRUE;
 
