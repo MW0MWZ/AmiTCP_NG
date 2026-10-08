@@ -129,6 +129,8 @@ RCS_ID_C="$Id: if_sana.c,v 3.2 1994/02/03 19:12:08 ppessi Exp $";
 #include <net/sana2request.h>
 #include <net/sana2errno.h>
 
+#include <dos/dostags.h>		/* NP_Entry etc. for the submit helper */
+
 #if __SASC
 #include <proto/dos.h>
 #elif __GNUC__
@@ -238,6 +240,28 @@ static LONG sana_doio_bounded(struct IOSana2Req *req, ULONG secs,
 			      int *abandoned);
 static void sana_run(struct sana_softc *ssc, int requests, struct ifaddr *ifa);
 static void sana_unrun(struct sana_softc *ssc);
+/* The sacrificial submit helper; defined below, used by sana_init/sana_deinit. */
+static void sana_helper_start(void);
+static void sana_helper_stop(void);
+/*
+ * Guards ONLY the handoff: "read SanaHelperPort .. PutMsg to it" on one side,
+ * "send the exit token .. clear the globals" on the other, and the wedge
+ * declaration's identity check. Allocation happens outside it, and it is never
+ * held across a wait.
+ *
+ * It exists because the helper's port lives in the helper's own stack frame, and
+ * a HEALTHY helper's exit path returns from its entry function -- which makes
+ * AmigaDOS tear the Process down and free that stack. sana_helper_stop() clears
+ * the globals without waiting for any of that, so a submitter that had already
+ * captured the pointer could PutMsg() into freed memory: an AddTail through a
+ * dead mp_MsgList and a Signal() to a dead mp_SigTask. Capturing the pointer
+ * into a local (which is what stopped an earlier PutMsg(NULL) bug) does not help
+ * here -- it is precisely the captured pointer that goes stale. A wedged helper
+ * is not affected either way: it never returns, so its stack is never freed.
+ */
+static struct SignalSemaphore SanaHelperSem;
+static int                    SanaHelperSemReady = 0;
+
 static void sana_up(struct sana_softc *ssc);
 static BOOL sana_down(struct sana_softc *ssc);
 static struct mbuf *
@@ -366,6 +390,24 @@ sana_init(void)
      */
     sana_warn_stale_routes();
     loattach();
+    /* Single-threaded here: no interface exists yet and no application can have
+     * reached the socket API, so the helper rendezvous needs no lock. The
+     * semaphore below guards the LATER handoffs, which are not single-threaded. */
+    /*
+     * ONCE per library, not once per stack instance. InitSemaphore() resets the
+     * nest count, owner and wait queue unconditionally -- it does not care that
+     * somebody is holding it or queued on it. A straggler from the previous
+     * instance (ng_dhcp_task reaches this path on its own Process and nothing in
+     * the teardown waits for it) could still be inside ObtainSemaphore when a
+     * restart got here, and re-initialising underneath it would let two tasks
+     * believe they hold it -- reopening, through the back door, exactly the race
+     * the semaphore was added to close.
+     */
+    if (!SanaHelperSemReady) {
+      InitSemaphore(&SanaHelperSem);
+      SanaHelperSemReady = 1;
+    }
+    sana_helper_start();
     return (ULONG) 1 << SanaPort->mp_SigBit;
   }
 
@@ -527,6 +569,15 @@ sana_deinit(void)
     DeleteMsgPort(SanaPort);
     SanaPort = NULL;
   }
+
+  /*
+   * Retire the submit helper LAST, after every device is closed and no further
+   * BeginIO can be issued. Its globals have LIBRARY lifetime but their contents
+   * belong to this STACK INSTANCE, so leaving them set would hand the next
+   * instance a pointer into a dead task's stack frame -- the restartable-globals
+   * bug class this tree has been bitten by before.
+   */
+  sana_helper_stop();
 }
 
 /*
@@ -1133,6 +1184,365 @@ iface_make(struct ssconfig *ifc)
  *
  * Returns the driver's io_Error, or IOERR_ABORTED if we gave up on it.
  */
+
+/* ------------------------------------------------------------------ *
+ * The sacrificial submit helper.
+ *
+ * WHY THIS EXISTS
+ *
+ * Exec's BeginIO() is not a message send. It is a JSR straight into the
+ * device's BeginIO vector, executed ON THE CALLING TASK. If the driver does
+ * not return from it, the calling task is inside that driver for ever, and
+ * nothing this stack can write will get it back -- every bound below wraps the
+ * WAIT FOR A REPLY, and none of them is ever reached.
+ *
+ * This is not hypothetical. wifipi.device (Emu68-tools-old
+ * network/wifipi.device/src/device.c:298) runs the request inline on the
+ * caller's task whenever it can take its unit semaphore:
+ *
+ *     if (AttemptSemaphore(&unit->wu_Lock)) { HandleRequest(io); ... }
+ *     else { io_Flags &= ~IOF_QUICK; PutMsg(unit->wu_CmdQueue, io); }
+ *
+ * and S2_CONFIGINTERFACE, S2_ONLINE and S2_GETSTATIONADDRESS all reach helpers
+ * in its packet.c that end in a bare WaitPort() on the radio with no timeout
+ * (1806, 1943, 2068, 2156). A chip that stops answering therefore parks OUR
+ * caller inside the driver permanently. Measured on the rig with a device
+ * written to do exactly that: the network task ends up in the driver, every
+ * program that touches the stack afterwards piles up behind it, and only disk
+ * and DOS keep working -- which is precisely the failure being chased.
+ *
+ * So the BeginIO() for these commands is issued by a helper process instead of
+ * by us. If a driver eats it, it eats the helper: this stack times out, reports
+ * it, marks the request abandoned and stays alive. The helper never comes back,
+ * and that is the deal -- one leaked task and one leaked request beats a machine
+ * that has to be power-cycled. It is the same bargain sana_unrun() already makes.
+ *
+ * ONLY the control commands go through here (S2_DEVICEQUERY,
+ * S2_GETSTATIONADDRESS, S2_CONFIGINTERFACE, S2_ONLINE/S2_OFFLINE) -- everything
+ * that sana_doio_bounded() carries. The per-packet read and write path is
+ * untouched and still submits directly, because putting a context switch in
+ * front of every frame to guard against a driver defect would cost more than
+ * the defect.
+ * ------------------------------------------------------------------ */
+
+struct SanaSubmit {
+  struct Message     ss_Msg;
+  struct IOSana2Req *ss_Req;
+};
+
+static struct MsgPort *SanaHelperPort   = NULL;
+static struct Process *SanaHelperProc   = NULL;
+/*
+ * Set once a helper has been eaten by a driver. This MUST be distinguishable
+ * from "there is no helper": a wedged helper means abandon the request, whereas
+ * no helper at all means fall back to submitting directly. An earlier revision
+ * conflated the two and the fallback won -- so the first driver hang disabled
+ * the guard, and the SECOND one ran a raw unbounded BeginIO() on the very driver
+ * already known never to return from it. Caught in review; the ordering in
+ * sana_helper_begin() below is what keeps them apart.
+ */
+static int             SanaHelperWedged = 0;
+/* Who to signal when the helper's port is up. NP_UserData is not in this SDK's
+ * dos/dostags.h, and the handshake needs no lock because it happens in
+ * sana_init(), which runs once, single-threaded, before any interface exists. */
+static struct Task    *SanaHelperParent = NULL;
+static int             SanaHelperMoaned = 0;	/* log the no-helper case once */
+
+static void
+sana_helper_proc(void)
+{
+  struct Process    *me = (struct Process *)FindTask(NULL);
+  struct SanaSubmit *sub;
+  struct MsgPort     port;
+  BYTE               sigbit;
+
+  /* Build the port by hand on our own stack frame's behalf: CreateMsgPort()
+   * would need this Process's own DOSBase, which a spawned Process does not
+   * inherit, and this task needs nothing else from dos.library. */
+  port.mp_Node.ln_Type = NT_MSGPORT;
+  port.mp_Node.ln_Name = (char *)"AmiTCP_NG SANA submit";
+  port.mp_Flags        = PA_SIGNAL;
+  sigbit = AllocSignal(-1);
+  if (sigbit == -1) {
+    /* No signal, no port. Leave SanaHelperPort NULL and exit: the submitter
+     * sees no helper and falls back to submitting directly, which is exactly
+     * the behaviour that shipped before this task existed. */
+    Signal(SanaHelperParent, SIGF_SINGLE);
+    return;
+  }
+  port.mp_SigBit  = (UBYTE)sigbit;
+  port.mp_SigTask = (struct Task *)me;
+  NewList(&port.mp_MsgList);
+
+  /* The port lives in this function's stack frame, which is sound only because
+   * this function never returns. That is also the design: a helper that has
+   * been eaten by a driver never returns either. */
+  SanaHelperPort = &port;
+  Signal(SanaHelperParent, SIGF_SINGLE);
+
+  for (;;) {
+    WaitPort(&port);
+    while ((sub = (struct SanaSubmit *)GetMsg(&port)) != NULL) {
+      if (sub->ss_Req == NULL) {
+	/*
+	 * Teardown token from sana_helper_stop(): free it here, because the
+	 * sender does not wait for us, and go.
+	 *
+	 * Deliberately NOT clearing SanaHelperPort. sana_helper_stop() already
+	 * set the globals correctly before we were even scheduled, and if the
+	 * stack has been restarted since then that global now belongs to a NEW
+	 * helper -- writing it here would unregister the live one and leave the
+	 * new instance silently unprotected, on a handoff whose safety depended
+	 * on scheduler ordering nobody ever stated.
+	 */
+	FreeMem(sub, sizeof(*sub));
+	return;
+      }
+      /*
+       * The whole point of this task. If the driver never returns from here,
+       * this process is simply gone -- no cleanup, no reply, nothing after this
+       * line ever runs again. The submitter times out and carries on.
+       */
+      BeginIO((struct IORequest *)sub->ss_Req);
+      ReplyMsg(&sub->ss_Msg);
+    }
+  }
+}
+
+/*
+ * Spawn the helper. Called ONLY from sana_init(), which runs once per stack
+ * instance, single-threaded, before any interface exists and before any
+ * application can reach the socket API -- so the check-spawn-rendezvous
+ * sequence needs no lock. Doing it lazily from sana_doio_bounded() instead
+ * would need one, because that function is reachable from the net task AND
+ * from an application task at the same time.
+ *
+ * Failure is not fatal: without a helper the stack submits directly, which is
+ * what it did before this existed.
+ */
+static void
+sana_helper_start(void)
+{
+  SanaHelperPort   = NULL;
+  SanaHelperWedged = 0;
+  SanaHelperMoaned = 0;
+  SanaHelperParent = FindTask(NULL);
+
+  SetSignal(0, SIGF_SINGLE);
+  SanaHelperProc = CreateNewProcTags(NP_Entry,     (LONG)&sana_helper_proc,
+				     NP_Name,      (LONG)"AmiTCP_NG SANA submit",
+				     NP_Priority,  0,
+				     /* 8192, matching ng_reconfig_task: this task
+				      * runs arbitrarily deep into a third-party
+				      * driver, and before this change that code ran
+				      * on the CALLER'S stack (the net task's 16K).
+				      * 4096 would have been the smallest stack in
+				      * the tree for the riskiest call in it, with no
+				      * MMU to catch an overrun. */
+				     NP_StackSize, 8192,
+				     TAG_DONE, 0);
+  if (SanaHelperProc == NULL) {
+    log(LOG_ERR, "could not start the SANA submit task -- device commands will be "
+	"issued directly, and a driver that hangs in BeginIO will hang the stack\n");
+    return;
+  }
+  Wait(SIGF_SINGLE);			/* the helper signals when its port is up */
+}
+
+/*
+ * Undo it. A healthy helper is told to exit; a WEDGED one is simply abandoned,
+ * because it is inside a driver and nothing can retrieve it. Either way the
+ * globals are cleared, so the next stack instance starts with a fresh helper
+ * instead of inheriting a pointer into a dead (or stuck) task's stack frame.
+ */
+static void
+sana_helper_stop(void)
+{
+  struct MsgPort    *port;
+  struct SanaSubmit *bye;
+
+  ObtainSemaphore(&SanaHelperSem);
+  port = SanaHelperPort;
+
+  if (port != NULL && !SanaHelperWedged) {
+    bye = (struct SanaSubmit *)AllocMem(sizeof(*bye), MEMF_PUBLIC | MEMF_CLEAR);
+    if (bye != NULL) {
+      bye->ss_Msg.mn_Node.ln_Type = NT_MESSAGE;
+      bye->ss_Msg.mn_Length       = sizeof(*bye);
+      bye->ss_Msg.mn_ReplyPort    = NULL;	/* it frees the token itself */
+      bye->ss_Req                 = NULL;	/* the "please exit" token */
+      PutMsg(port, &bye->ss_Msg);
+      /* Deliberately NOT waiting: if the helper were wedged after all, waiting
+       * here would hang the teardown -- the one place that must always finish. */
+    } else {
+      log(LOG_ERR, "could not tell the SANA submit task to exit -- leaving it "
+	  "parked; it costs one task until the machine is rebooted\n");
+    }
+  }
+
+  SanaHelperPort   = NULL;
+  SanaHelperProc   = NULL;
+  SanaHelperWedged = 0;
+  SanaHelperMoaned = 0;
+  SanaHelperParent = NULL;
+  ReleaseSemaphore(&SanaHelperSem);
+}
+
+/*
+ * Submit req through the helper and wait at most secs for BeginIO() ITSELF to
+ * return. Returns 0 if it returned (the caller then inspects IOF_QUICK exactly
+ * as it would after a direct BeginIO), 1 if the driver swallowed the call and
+ * the request must be abandoned, and -1 if no helper could be used, in which
+ * case the caller should submit directly and behave as it always has.
+ */
+static int
+sana_helper_begin(struct IOSana2Req *req, ULONG secs,
+		  const char *what, const char *ifname)
+{
+  struct MsgPort     *ack  = NULL, *tport = NULL;
+  struct MsgPort     *hp;
+  struct timerequest *treq = NULL;
+  struct SanaSubmit  *sub  = NULL;
+  ULONG ackmask, timmask, got;
+  int   rc;
+
+  /*
+   * ORDER MATTERS. "Wedged" is checked before "have we got a helper", because a
+   * wedged helper leaves SanaHelperPort NULL and the two states would otherwise
+   * be indistinguishable -- which is exactly how an earlier revision fell back
+   * to a raw BeginIO() on a driver already proven to eat it.
+   */
+  /* The wedged test lives inside the lock below, with the port read, so the two
+   * cannot disagree. Testing it unlocked here as well would only re-introduce a
+   * window between the check and the capture. */
+  ack   = CreateMsgPort();
+  tport = CreateMsgPort();
+  treq  = tport ? (struct timerequest *)CreateIORequest(tport, sizeof(*treq)) : NULL;
+  if (treq != NULL &&
+      OpenDevice((STRPTR)"timer.device", UNIT_VBLANK, (struct IORequest *)treq, 0) != 0) {
+    DeleteIORequest((struct IORequest *)treq);
+    treq = NULL;
+  }
+  sub = (struct SanaSubmit *)AllocMem(sizeof(*sub), MEMF_PUBLIC | MEMF_CLEAR);
+
+  if (ack == NULL || treq == NULL || sub == NULL) {
+    if (sub)   FreeMem(sub, sizeof(*sub));
+    if (treq)  { CloseDevice((struct IORequest *)treq);
+		 DeleteIORequest((struct IORequest *)treq); }
+    if (tport) DeleteMsgPort(tport);
+    if (ack)   DeleteMsgPort(ack);
+    return -1;				/* caller submits directly, as before */
+  }
+
+  sub->ss_Msg.mn_Node.ln_Type = NT_MESSAGE;
+  sub->ss_Msg.mn_Length       = sizeof(*sub);
+  sub->ss_Msg.mn_ReplyPort    = ack;
+  sub->ss_Req                 = req;
+
+  treq->tr_node.io_Command = TR_ADDREQUEST;
+  treq->tr_time.tv_secs    = secs;
+  treq->tr_time.tv_micro   = 0;
+
+  /*
+   * THE HANDOFF, and only the handoff. Everything above was allocation and could
+   * be done unlocked; holding the lock across CreateMsgPort/OpenDevice/AllocMem
+   * made sana_deinit() -- the one path that must always finish -- queue behind
+   * another task's setup for no reason.
+   */
+  ObtainSemaphore(&SanaHelperSem);
+  /*
+   * One read, one local, and the send happens before the lock is dropped. This
+   * function is genuinely reachable from two Processes at once -- the interface
+   * bring-up path and ng_dhcp_task, which runs on its own Process -- so reading
+   * the global again at PutMsg time could hand PutMsg() a pointer another task
+   * had just cleared, and holding no lock at all could hand it a port whose task
+   * has since exited and had its stack freed underneath it.
+   */
+  hp = SanaHelperPort;
+  if (hp == NULL || SanaHelperWedged) {
+    int wedged = SanaHelperWedged;
+    ReleaseSemaphore(&SanaHelperSem);
+    FreeMem(sub, sizeof(*sub));
+    CloseDevice((struct IORequest *)treq);
+    DeleteIORequest((struct IORequest *)treq);
+    DeleteMsgPort(tport);
+    DeleteMsgPort(ack);
+    if (wedged) {
+      log(LOG_ERR, "%s: not issuing %s -- a driver already swallowed an earlier "
+	  "request and never returned it\n", ifname, what);
+      return 1;
+    }
+    if (!SanaHelperMoaned) {
+      SanaHelperMoaned = 1;
+      log(LOG_ERR, "%s: no SANA submit task -- issuing %s directly; a driver that "
+	  "hangs in BeginIO will take the stack with it\n", ifname, what);
+    }
+    return -1;
+  }
+  SendIO((struct IORequest *)treq);
+  PutMsg(hp, &sub->ss_Msg);		/* the captured port, never the global */
+  /*
+   * Handoff done: drop the lock BEFORE waiting. Holding it across the wait would
+   * mean a driver that never returns also blocks sana_helper_stop(), turning a
+   * contained failure into a teardown that can never finish.
+   */
+  ReleaseSemaphore(&SanaHelperSem);
+
+  ackmask = 1UL << ack->mp_SigBit;
+  timmask = 1UL << tport->mp_SigBit;
+
+  for (;;) {
+    got = Wait(ackmask | timmask);
+    if (GetMsg(ack) != NULL) { rc = 0; break; }	  /* BeginIO returned */
+    if (got & timmask)       { rc = 1; break; }	  /* it did not */
+  }
+
+  if (rc == 0) {
+    if (!CheckIO((struct IORequest *)treq))
+      AbortIO((struct IORequest *)treq);
+    WaitIO((struct IORequest *)treq);
+    CloseDevice((struct IORequest *)treq);
+    DeleteIORequest((struct IORequest *)treq);
+    DeleteMsgPort(tport);
+    FreeMem(sub, sizeof(*sub));
+    DeleteMsgPort(ack);
+    return 0;
+  }
+
+  /*
+   * Timed out INSIDE BeginIO. The helper is still in the driver and still owns
+   * sub; whenever (if ever) it returns it will ReplyMsg() sub to ack. So both
+   * are leaked ON PURPOSE -- freeing either is a write into freed memory later,
+   * and with no MMU that is not a crash anyone gets to debug. The timer is ours
+   * alone and is reaped normally.
+   */
+  WaitIO((struct IORequest *)treq);	/* it fired; collect it */
+  CloseDevice((struct IORequest *)treq);
+  DeleteIORequest((struct IORequest *)treq);
+  DeleteMsgPort(tport);
+
+  /*
+   * Declare the wedge -- but ONLY if the helper we submitted to is still the
+   * current one. This call may have been asleep in the wait above for the full
+   * timeout, and a stack restart (sana_deinit + sana_init) can have retired that
+   * helper and spawned a fresh one in the meantime. Writing the globals blind
+   * would unregister a perfectly healthy NEW helper, leak it (nothing can signal
+   * it to exit once its handle is gone) and refuse every later control command
+   * while blaming a driver from the previous stack instance.
+   */
+  ObtainSemaphore(&SanaHelperSem);
+  if (SanaHelperPort == hp) {
+    SanaHelperWedged = 1;
+    SanaHelperPort   = NULL;		/* it will never read its port again */
+    SanaHelperProc   = NULL;		/* abandoned; never reuse the handle */
+  }
+  ReleaseSemaphore(&SanaHelperSem);
+  log(LOG_ERR, "%s: driver did not return from BeginIO for %s within %ld seconds -- "
+      "abandoning it with the submit task rather than hanging the stack\n",
+      ifname, what, (long)secs);
+  return 1;
+}
+
 static LONG
 sana_doio_bounded(struct IOSana2Req *req, ULONG secs,
 		  const char *what, const char *ifname, int *abandoned)
@@ -1205,7 +1615,34 @@ sana_doio_bounded(struct IOSana2Req *req, ULONG secs,
    */
   req->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
   req->ios2_Req.io_Flags |= IOF_QUICK;
-  BeginIO((struct IORequest *)req);
+  {
+    /*
+     * Submitted by the helper process, not by us -- see the block comment above
+     * sana_helper_proc(). Everything after this point is unchanged: on success
+     * the request has been through a real BeginIO() with IOF_QUICK set, exactly
+     * as DoIO() would have done it, and IOF_QUICK still means what it meant.
+     */
+    int hb = sana_helper_begin(req, secs, what, ifname);
+
+    if (hb > 0) {
+      /*
+       * BeginIO() never returned. The driver -- and the helper task sitting
+       * inside it -- still own this request, so it must not be reaped, freed or
+       * waited for, and a late reply must not signal a caller that has moved on.
+       */
+      Forbid();
+      rport->mp_Flags   = PA_IGNORE;
+      rport->mp_SigTask = NULL;
+      Permit();
+      *abandoned = 1;
+      CloseDevice((struct IORequest *)treq);
+      DeleteIORequest((struct IORequest *)treq);
+      DeleteMsgPort(tport);
+      return IOERR_ABORTED;
+    }
+    if (hb < 0)
+      BeginIO((struct IORequest *)req);	/* no helper available: as it always was */
+  }
   if (req->ios2_Req.io_Flags & IOF_QUICK) {
     /* Satisfied inside BeginIO(). No reply was sent, so there is nothing to reap
      * and nothing to abort -- touching the reply port here would hang. */
